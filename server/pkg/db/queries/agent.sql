@@ -1317,79 +1317,92 @@ SET status = 'failed',
 WHERE runtime_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')
 RETURNING *;
 
--- name: FailStaleTasks :many
--- Fails tasks stuck in dispatched/running beyond the given thresholds.
+-- name: FailStaleDispatchedTasks :many
+-- Fails tasks stuck in 'dispatched' beyond the dispatch deadline. Split out of
+-- the former single-statement FailStaleTasks (which OR'd dispatched and running
+-- in one UPDATE) so each status can use its own partial index instead of
+-- forcing a full sequential scan of agent_task_queue: an OR across two
+-- different partial indexes cannot be combined by the planner (GH #7389).
 --
--- Each branch pairs a wall-clock deadline with a task-appropriate liveness
--- signal, so the sweeper only kills tasks whose owning daemon is no longer
--- proving it is alive:
---
---   * Dispatched: `prepare_lease_expires_at` is refreshed every 15s by the
---     daemon between claim and StartTask (see startTaskPrepareLeaseExtender).
---     A live lease excludes the row. An expired lease may fail immediately on
---     a healthy runtime, but a disconnected runtime gets the same reconnect
---     grace as a running task.
---
---   * Running: no per-task lease is renewed once StartTask fires, so we key
---     off the daemon-wide heartbeat instead — `agent_runtime.last_seen_at`,
---     which the daemon bumps every ~15s while it is up. A running task is not
---     killed until that heartbeat has been absent for the full reconnect
---     grace, even when its own wall-clock timeout elapsed earlier. This keeps
---     healthy multi-hour work alive through a network partition.
+-- `prepare_lease_expires_at` is refreshed every 15s by the daemon between claim
+-- and StartTask (see startTaskPrepareLeaseExtender). A live lease excludes the
+-- row. An expired lease may fail immediately on a healthy runtime, but a
+-- disconnected runtime gets the same reconnect grace as a running task.
 --
 -- The daemon-dead case is recovered immediately when that daemon restarts via
 -- RecoverOrphanedTasksForRuntime. Until then, this query and
 -- FailTasksForOfflineRuntimes share the same bounded reconnect grace.
 --
--- runtime_id IS NULL: a running row with no runtime is by definition not
--- proving liveness, so the wall clock is allowed to fire — same shape as
--- the legacy pure-wall-clock behavior for that (rare / historical) case.
---
--- waiting_local_directory rows are intentionally excluded: the daemon owns
--- the wait (with its own ctx-driven timeout) and a legitimate queue ahead
--- of this task can exceed the dispatch / running timeouts without being
--- "stuck". If the daemon dies, RecoverOrphanedTasksForRuntime reclaims
--- those rows at restart.
+-- started_at IS NULL is load-bearing in two ways: a dispatched row has not yet
+-- started, so it is always true here and never narrows the result; and stating
+-- it explicitly lets the predicate match the partial index
+-- idx_agent_task_queue_dispatched_reclaim_v2
+-- (WHERE status = 'dispatched' AND started_at IS NULL).
 UPDATE agent_task_queue
 SET status = 'failed', completed_at = now(), error = 'task timed out',
     failure_reason = 'timeout',
     prepare_lease_expires_at = NULL
-WHERE (
-    status = 'dispatched'
-    AND dispatched_at < now() - make_interval(secs => @dispatch_timeout_secs::double precision)
-    AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
-    AND (
-      runtime_id IS NULL
-      OR NOT EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-      )
-      OR EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-          AND (
-            (
-              r.status = 'online'
-              AND COALESCE(r.last_seen_at, r.updated_at) >=
-                  now() - make_interval(secs => @runtime_stale_secs::double precision)
-            )
-            OR COALESCE(r.last_seen_at, r.updated_at) <
-               now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+WHERE status = 'dispatched'
+  AND started_at IS NULL
+  AND dispatched_at < now() - make_interval(secs => @dispatch_timeout_secs::double precision)
+  AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
+  AND (
+    runtime_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
+        AND (
+          (
+            r.status = 'online'
+            AND COALESCE(r.last_seen_at, r.updated_at) >=
+                now() - make_interval(secs => @runtime_stale_secs::double precision)
           )
-      )
+          OR COALESCE(r.last_seen_at, r.updated_at) <
+             now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
+        )
     )
   )
-   OR (
-    status = 'running'
-    AND started_at < now() - make_interval(secs => @running_timeout_secs::double precision)
-    AND (
-      runtime_id IS NULL
-      OR NOT EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-          AND COALESCE(r.last_seen_at, r.updated_at) >=
-              now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
-      )
+RETURNING *;
+
+-- name: FailStaleRunningTasks :many
+-- Fails tasks stuck in 'running' beyond the running deadline. Split out of the
+-- former single-statement FailStaleTasks so this branch can use the partial
+-- index idx_agent_task_queue_running_started_at (WHERE status = 'running')
+-- instead of a full sequential scan (GH #7389).
+--
+-- No per-task lease is renewed once StartTask fires, so we key off the
+-- daemon-wide heartbeat instead — `agent_runtime.last_seen_at`, which the
+-- daemon bumps every ~15s while it is up. A running task is not killed until
+-- that heartbeat has been absent for the full reconnect grace, even when its
+-- own wall-clock timeout elapsed earlier. This keeps healthy multi-hour work
+-- alive through a network partition.
+--
+-- runtime_id IS NULL: a running row with no runtime is by definition not
+-- proving liveness, so the wall clock is allowed to fire — same shape as the
+-- legacy pure-wall-clock behavior for that (rare / historical) case.
+--
+-- waiting_local_directory rows are intentionally excluded (in both this and the
+-- dispatched query): the daemon owns the wait (with its own ctx-driven timeout)
+-- and a legitimate queue ahead of this task can exceed the dispatch / running
+-- timeouts without being "stuck". If the daemon dies,
+-- RecoverOrphanedTasksForRuntime reclaims those rows at restart.
+UPDATE agent_task_queue
+SET status = 'failed', completed_at = now(), error = 'task timed out',
+    failure_reason = 'timeout',
+    prepare_lease_expires_at = NULL
+WHERE status = 'running'
+  AND started_at < now() - make_interval(secs => @running_timeout_secs::double precision)
+  AND (
+    runtime_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
+        AND COALESCE(r.last_seen_at, r.updated_at) >=
+            now() - make_interval(secs => @runtime_reconnect_grace_secs::double precision)
     )
   )
 RETURNING *;

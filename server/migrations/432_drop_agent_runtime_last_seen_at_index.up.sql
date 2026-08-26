@@ -1,0 +1,19 @@
+-- Drop the plain btree index on agent_runtime.last_seen_at (migration 115).
+--
+-- The heartbeat hot path (TouchAgentRuntimesLastSeenBatch) updates only
+-- last_seen_at and deliberately leaves updated_at untouched to keep the row
+-- HOT-eligible. That intent never held: HOT requires that no indexed column
+-- change, and this index puts last_seen_at itself under an index, so every
+-- batch flush was non-HOT and rewrote all of the table's indexes. At fleet
+-- scale that drove continuous write amplification and autovacuum churn
+-- (MUL / GH #7389).
+--
+-- Removing this index restores HOT updates on the heartbeat path. The two
+-- sampler reads it used to serve (runtime_online, runtime_heartbeat_age) run
+-- at most a few times a minute behind an 8s cache against a table of ~18k
+-- rows, so a sequential scan of the now-compact table is an acceptable trade
+-- for eliminating the write-path cost.
+--
+-- Single-statement CONCURRENTLY per repo convention: DROP INDEX CONCURRENTLY
+-- cannot run inside a transaction or multi-command string.
+DROP INDEX CONCURRENTLY IF EXISTS idx_agent_runtime_last_seen_at;

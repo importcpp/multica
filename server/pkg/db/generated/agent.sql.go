@@ -3763,98 +3763,186 @@ func (q *Queries) FailExpiredRuntimeReconnectRetries(ctx context.Context, arg Fa
 	return items, nil
 }
 
-const failStaleTasks = `-- name: FailStaleTasks :many
+const failStaleDispatchedTasks = `-- name: FailStaleDispatchedTasks :many
 UPDATE agent_task_queue
 SET status = 'failed', completed_at = now(), error = 'task timed out',
     failure_reason = 'timeout',
     prepare_lease_expires_at = NULL
-WHERE (
-    status = 'dispatched'
-    AND dispatched_at < now() - make_interval(secs => $1::double precision)
-    AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
-    AND (
-      runtime_id IS NULL
-      OR NOT EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-      )
-      OR EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-          AND (
-            (
-              r.status = 'online'
-              AND COALESCE(r.last_seen_at, r.updated_at) >=
-                  now() - make_interval(secs => $2::double precision)
-            )
-            OR COALESCE(r.last_seen_at, r.updated_at) <
-               now() - make_interval(secs => $3::double precision)
-          )
-      )
+WHERE status = 'dispatched'
+  AND started_at IS NULL
+  AND dispatched_at < now() - make_interval(secs => $1::double precision)
+  AND (prepare_lease_expires_at IS NULL OR prepare_lease_expires_at < now())
+  AND (
+    runtime_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
     )
-  )
-   OR (
-    status = 'running'
-    AND started_at < now() - make_interval(secs => $4::double precision)
-    AND (
-      runtime_id IS NULL
-      OR NOT EXISTS (
-        SELECT 1 FROM agent_runtime r
-        WHERE r.id = agent_task_queue.runtime_id
-          AND COALESCE(r.last_seen_at, r.updated_at) >=
-              now() - make_interval(secs => $3::double precision)
-      )
+    OR EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
+        AND (
+          (
+            r.status = 'online'
+            AND COALESCE(r.last_seen_at, r.updated_at) >=
+                now() - make_interval(secs => $2::double precision)
+          )
+          OR COALESCE(r.last_seen_at, r.updated_at) <
+             now() - make_interval(secs => $3::double precision)
+        )
     )
   )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
 `
 
-type FailStaleTasksParams struct {
+type FailStaleDispatchedTasksParams struct {
 	DispatchTimeoutSecs       float64 `json:"dispatch_timeout_secs"`
 	RuntimeStaleSecs          float64 `json:"runtime_stale_secs"`
 	RuntimeReconnectGraceSecs float64 `json:"runtime_reconnect_grace_secs"`
-	RunningTimeoutSecs        float64 `json:"running_timeout_secs"`
 }
 
-// Fails tasks stuck in dispatched/running beyond the given thresholds.
+// Fails tasks stuck in 'dispatched' beyond the dispatch deadline. Split out of
+// the former single-statement FailStaleTasks (which OR'd dispatched and running
+// in one UPDATE) so each status can use its own partial index instead of
+// forcing a full sequential scan of agent_task_queue: an OR across two
+// different partial indexes cannot be combined by the planner (GH #7389).
 //
-// Each branch pairs a wall-clock deadline with a task-appropriate liveness
-// signal, so the sweeper only kills tasks whose owning daemon is no longer
-// proving it is alive:
-//
-//   - Dispatched: `prepare_lease_expires_at` is refreshed every 15s by the
-//     daemon between claim and StartTask (see startTaskPrepareLeaseExtender).
-//     A live lease excludes the row. An expired lease may fail immediately on
-//     a healthy runtime, but a disconnected runtime gets the same reconnect
-//     grace as a running task.
-//
-//   - Running: no per-task lease is renewed once StartTask fires, so we key
-//     off the daemon-wide heartbeat instead — `agent_runtime.last_seen_at`,
-//     which the daemon bumps every ~15s while it is up. A running task is not
-//     killed until that heartbeat has been absent for the full reconnect
-//     grace, even when its own wall-clock timeout elapsed earlier. This keeps
-//     healthy multi-hour work alive through a network partition.
+// `prepare_lease_expires_at` is refreshed every 15s by the daemon between claim
+// and StartTask (see startTaskPrepareLeaseExtender). A live lease excludes the
+// row. An expired lease may fail immediately on a healthy runtime, but a
+// disconnected runtime gets the same reconnect grace as a running task.
 //
 // The daemon-dead case is recovered immediately when that daemon restarts via
 // RecoverOrphanedTasksForRuntime. Until then, this query and
 // FailTasksForOfflineRuntimes share the same bounded reconnect grace.
 //
-// runtime_id IS NULL: a running row with no runtime is by definition not
-// proving liveness, so the wall clock is allowed to fire — same shape as
-// the legacy pure-wall-clock behavior for that (rare / historical) case.
+// started_at IS NULL is load-bearing in two ways: a dispatched row has not yet
+// started, so it is always true here and never narrows the result; and stating
+// it explicitly lets the predicate match the partial index
+// idx_agent_task_queue_dispatched_reclaim_v2
+// (WHERE status = 'dispatched' AND started_at IS NULL).
+func (q *Queries) FailStaleDispatchedTasks(ctx context.Context, arg FailStaleDispatchedTasksParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, failStaleDispatchedTasks, arg.DispatchTimeoutSecs, arg.RuntimeStaleSecs, arg.RuntimeReconnectGraceSecs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.RuntimeMcpOverlay,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+			&i.OriginatorUserID,
+			&i.RuntimeConnectedApps,
+			&i.CoalescedCommentIds,
+			&i.DeliveredCommentIds,
+			&i.ChatInputTaskID,
+			&i.ChatFinalizeDeferredAt,
+			&i.OriginatorSource,
+			&i.DelegatedFromTaskID,
+			&i.RetryOfTaskID,
+			&i.RerunOfTaskID,
+			&i.RuleVersionID,
+			&i.TriggerEvidenceKind,
+			&i.TriggerEvidenceRefID,
+			&i.AccountableUserID,
+			&i.SessionRolloutMissing,
+			&i.RetiredSessionID,
+			&i.QuickActionsDisabled,
+			&i.RegenerateQuickActionsFor,
+			&i.BranchName,
+			&i.DurableWorkDir,
+			&i.ChannelContextRevision,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const failStaleRunningTasks = `-- name: FailStaleRunningTasks :many
+UPDATE agent_task_queue
+SET status = 'failed', completed_at = now(), error = 'task timed out',
+    failure_reason = 'timeout',
+    prepare_lease_expires_at = NULL
+WHERE status = 'running'
+  AND started_at < now() - make_interval(secs => $1::double precision)
+  AND (
+    runtime_id IS NULL
+    OR NOT EXISTS (
+      SELECT 1 FROM agent_runtime r
+      WHERE r.id = agent_task_queue.runtime_id
+        AND COALESCE(r.last_seen_at, r.updated_at) >=
+            now() - make_interval(secs => $2::double precision)
+    )
+  )
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, branch_name, durable_work_dir, channel_context_revision
+`
+
+type FailStaleRunningTasksParams struct {
+	RunningTimeoutSecs        float64 `json:"running_timeout_secs"`
+	RuntimeReconnectGraceSecs float64 `json:"runtime_reconnect_grace_secs"`
+}
+
+// Fails tasks stuck in 'running' beyond the running deadline. Split out of the
+// former single-statement FailStaleTasks so this branch can use the partial
+// index idx_agent_task_queue_running_started_at (WHERE status = 'running')
+// instead of a full sequential scan (GH #7389).
 //
-// waiting_local_directory rows are intentionally excluded: the daemon owns
-// the wait (with its own ctx-driven timeout) and a legitimate queue ahead
-// of this task can exceed the dispatch / running timeouts without being
-// "stuck". If the daemon dies, RecoverOrphanedTasksForRuntime reclaims
-// those rows at restart.
-func (q *Queries) FailStaleTasks(ctx context.Context, arg FailStaleTasksParams) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, failStaleTasks,
-		arg.DispatchTimeoutSecs,
-		arg.RuntimeStaleSecs,
-		arg.RuntimeReconnectGraceSecs,
-		arg.RunningTimeoutSecs,
-	)
+// No per-task lease is renewed once StartTask fires, so we key off the
+// daemon-wide heartbeat instead — `agent_runtime.last_seen_at`, which the
+// daemon bumps every ~15s while it is up. A running task is not killed until
+// that heartbeat has been absent for the full reconnect grace, even when its
+// own wall-clock timeout elapsed earlier. This keeps healthy multi-hour work
+// alive through a network partition.
+//
+// runtime_id IS NULL: a running row with no runtime is by definition not
+// proving liveness, so the wall clock is allowed to fire — same shape as the
+// legacy pure-wall-clock behavior for that (rare / historical) case.
+//
+// waiting_local_directory rows are intentionally excluded (in both this and the
+// dispatched query): the daemon owns the wait (with its own ctx-driven timeout)
+// and a legitimate queue ahead of this task can exceed the dispatch / running
+// timeouts without being "stuck". If the daemon dies,
+// RecoverOrphanedTasksForRuntime reclaims those rows at restart.
+func (q *Queries) FailStaleRunningTasks(ctx context.Context, arg FailStaleRunningTasksParams) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, failStaleRunningTasks, arg.RunningTimeoutSecs, arg.RuntimeReconnectGraceSecs)
 	if err != nil {
 		return nil, err
 	}

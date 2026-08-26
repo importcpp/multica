@@ -506,18 +506,33 @@ func gcRuntime(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Qu
 // edge where a runtime row lingers online-with-stale-heartbeat past the
 // wall clock (MUL-4107).
 func sweepStaleTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, bus *events.Bus, reconnectGrace time.Duration) {
-	failedTasks, err := queries.FailStaleTasks(ctx, db.FailStaleTasksParams{
+	// Dispatched and running tasks are failed by two separate statements rather
+	// than one OR'd UPDATE so each can use its own partial index; an OR across
+	// idx_agent_task_queue_dispatched_reclaim_v2 and
+	// idx_agent_task_queue_running_started_at cannot be combined by the planner
+	// and forced a full sequential scan every tick (GH #7389).
+	dispatched, err := queries.FailStaleDispatchedTasks(ctx, db.FailStaleDispatchedTasksParams{
 		DispatchTimeoutSecs: dispatchTimeoutSeconds,
-		RunningTimeoutSecs:  runningTimeoutSeconds,
 		// Reuse the runtime stale window so the running-task backstop
 		// exactly matches what sweepStaleRuntimes considers "not alive".
 		RuntimeStaleSecs:          staleThresholdSeconds,
 		RuntimeReconnectGraceSecs: reconnectGrace.Seconds(),
 	})
 	if err != nil {
-		slog.Warn("task sweeper: failed to clean up stale tasks", "error", err)
+		slog.Warn("task sweeper: failed to clean up stale dispatched tasks", "error", err)
 		return
 	}
+
+	running, err := queries.FailStaleRunningTasks(ctx, db.FailStaleRunningTasksParams{
+		RunningTimeoutSecs:        runningTimeoutSeconds,
+		RuntimeReconnectGraceSecs: reconnectGrace.Seconds(),
+	})
+	if err != nil {
+		slog.Warn("task sweeper: failed to clean up stale running tasks", "error", err)
+		return
+	}
+
+	failedTasks := append(dispatched, running...)
 	if len(failedTasks) == 0 {
 		return
 	}

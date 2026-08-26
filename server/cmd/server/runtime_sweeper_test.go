@@ -12,6 +12,38 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
+// failStaleTasksParams mirrors the fields of the former single FailStaleTasks
+// query. Tests use it to exercise both the dispatched and running paths with
+// one call, matching how sweepStaleTasks fans out to the two split queries.
+type failStaleTasksParams struct {
+	DispatchTimeoutSecs       float64
+	RunningTimeoutSecs        float64
+	RuntimeStaleSecs          float64
+	RuntimeReconnectGraceSecs float64
+}
+
+// failStaleTasks runs both split queries and returns their combined result, so
+// existing tests keep asserting on the union of dispatched + running failures
+// exactly as the pre-split FailStaleTasks statement did.
+func failStaleTasks(ctx context.Context, q *db.Queries, p failStaleTasksParams) ([]db.AgentTaskQueue, error) {
+	dispatched, err := q.FailStaleDispatchedTasks(ctx, db.FailStaleDispatchedTasksParams{
+		DispatchTimeoutSecs:       p.DispatchTimeoutSecs,
+		RuntimeStaleSecs:          p.RuntimeStaleSecs,
+		RuntimeReconnectGraceSecs: p.RuntimeReconnectGraceSecs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	running, err := q.FailStaleRunningTasks(ctx, db.FailStaleRunningTasksParams{
+		RunningTimeoutSecs:        p.RunningTimeoutSecs,
+		RuntimeReconnectGraceSecs: p.RuntimeReconnectGraceSecs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return append(dispatched, running...), nil
+}
+
 // setupSweeperTestFixture creates an issue and a task in the given status with
 // timestamps old enough to trigger the sweeper. Returns (issueID, agentID, taskID).
 func setupSweeperTestFixture(t *testing.T, taskStatus string) (string, string, string) {
@@ -267,7 +299,7 @@ func TestSweepStaleTasksBroadcastsWithWorkspaceID(t *testing.T) {
 	})
 
 	// Use very short timeouts to trigger the sweep on our test task
-	failedTasks, err := queries.FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0, // 1 second — our task is 3 hours old
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -361,7 +393,7 @@ func TestSweepStaleTasksReconcileAgentStatus(t *testing.T) {
 	})
 
 	// Fail stale tasks with short timeout
-	failedTasks, err := queries.FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -424,7 +456,7 @@ func TestSweepDispatchedStaleTask(t *testing.T) {
 	})
 
 	// Fail stale tasks — dispatch timeout of 1 second (our task is 10 minutes old)
-	failedTasks, err := queries.FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), queries, failStaleTasksParams{
 		DispatchTimeoutSecs: 1.0,
 		RunningTimeoutSecs:  9000.0,
 		// RuntimeStaleSecs only affects the running branch — irrelevant for
@@ -495,7 +527,7 @@ func TestSweepDispatchedTaskWaitsThroughReconnectGrace(t *testing.T) {
 	t.Cleanup(func() { cleanupSweeperFixture(t, issueID, agentID) })
 	setAgentRuntimeOffline(t, agentID, 10*time.Minute)
 
-	failedTasks, err := db.New(testPool).FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), db.New(testPool), failStaleTasksParams{
 		DispatchTimeoutSecs:       1.0,
 		RunningTimeoutSecs:        9000.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -537,7 +569,7 @@ func TestSweepRunningTaskSkippedWhenRuntimeFresh(t *testing.T) {
 	// Task started_at is 3h ago; RunningTimeoutSecs=1s would kill on wall clock
 	// alone — but the runtime is proving liveness, so the sweeper must skip it.
 	queries := db.New(testPool)
-	failedTasks, err := queries.FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -573,7 +605,7 @@ func TestSweepRunningTaskWaitsThroughReconnectGrace(t *testing.T) {
 	t.Cleanup(func() { cleanupSweeperFixture(t, issueID, agentID) })
 	setAgentRuntimeOffline(t, agentID, 10*time.Minute)
 
-	failedTasks, err := db.New(testPool).FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), db.New(testPool), failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -610,7 +642,7 @@ func TestSweepRunningTaskKilledBeyondReconnectGrace(t *testing.T) {
 	ageOutAgentRuntime(t, agentID, defaultRuntimeReconnectGrace+time.Hour)
 
 	queries := db.New(testPool)
-	failedTasks, err := queries.FailStaleTasks(context.Background(), db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(context.Background(), queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -863,7 +895,7 @@ func TestSweepResetsInProgressIssueToTodo(t *testing.T) {
 	ageOutAgentRuntime(t, agentID, defaultRuntimeReconnectGrace+time.Hour)
 
 	// Fail the stale task (running timeout of 1 second — our task is 3 hours old).
-	failedTasks, err := queries.FailStaleTasks(ctx, db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(ctx, queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
@@ -952,7 +984,7 @@ func TestSweepDoesNotResetIssueAlreadyInReview(t *testing.T) {
 	// Runtime must be stale for the running-task wall clock to fire (MUL-4107).
 	ageOutAgentRuntime(t, agentID, defaultRuntimeReconnectGrace+time.Hour)
 
-	failedTasks, err := queries.FailStaleTasks(ctx, db.FailStaleTasksParams{
+	failedTasks, err := failStaleTasks(ctx, queries, failStaleTasksParams{
 		DispatchTimeoutSecs:       300.0,
 		RunningTimeoutSecs:        1.0,
 		RuntimeStaleSecs:          staleThresholdSeconds,
