@@ -263,8 +263,29 @@ func TestSlugifyKey(t *testing.T) {
 	if _, err := SlugifyKey("In Progress"); err == nil {
 		t.Error("a name slugifying to a built-in key should be rejected")
 	}
-	if _, err := SlugifyKey("客户"); err == nil {
-		t.Error("a name with no slug-able characters should be rejected")
+
+	// A name with no slug-able characters falls back to a stable content-derived
+	// key rather than being rejected: the settings form has no explicit-key
+	// field, so rejecting left entirely non-ASCII names uncreatable (#7627).
+	nonASCII, err := SlugifyKey("客户确认")
+	if err != nil {
+		t.Fatalf("SlugifyKey(non-ASCII) should fall back, got error: %v", err)
+	}
+	if !keyPattern.MatchString(nonASCII) {
+		t.Errorf("fallback key %q does not satisfy the storage pattern", nonASCII)
+	}
+	if IsBuiltIn(nonASCII) {
+		t.Errorf("fallback key %q collides with a built-in", nonASCII)
+	}
+	// Deterministic and case-insensitive, so recreating a status by the same
+	// name lands on the same key, matching the ASCII slug path.
+	again, _ := SlugifyKey("  客户确认  ")
+	if again != nonASCII {
+		t.Errorf("fallback key not stable across whitespace: %q vs %q", again, nonASCII)
+	}
+	// Distinct names yield distinct keys.
+	if other, _ := SlugifyKey("待审核"); other == nonASCII {
+		t.Errorf("distinct non-ASCII names collided on key %q", other)
 	}
 }
 

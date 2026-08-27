@@ -24,6 +24,8 @@ package issuestatus
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -132,7 +134,15 @@ func ValidateKey(key string) (string, error) {
 }
 
 // SlugifyKey derives a candidate key from a display name, for callers that let
-// an admin type only a name. Returns an error when nothing usable survives.
+// an admin type only a name.
+//
+// Keys are ASCII schema-level identifiers (see conventions: `todo`,
+// `in_progress`), so a name in a non-Latin script slugifies to nothing. Rather
+// than reject it — the settings form offers no explicit-key field, so that left
+// entirely non-ASCII names uncreatable (#7627) — fall back to a stable
+// content-derived key. The fallback is deterministic in the name, so recreating
+// a status by the same name (e.g. after archiving) lands on the same key,
+// matching the behavior of the ASCII path.
 func SlugifyKey(name string) (string, error) {
 	var b strings.Builder
 	lastUnderscore := false
@@ -151,9 +161,19 @@ func SlugifyKey(name string) (string, error) {
 		slug = strings.Trim(slug[:32], "_")
 	}
 	if slug == "" {
-		return "", errors.New("cannot derive a status key from that name; provide one explicitly")
+		slug = fallbackKey(name)
 	}
 	return ValidateKey(slug)
+}
+
+// fallbackKey derives a stable ASCII key from a display name that carries no
+// slug-able characters. The hash is over the trimmed, lower-cased name so it is
+// deterministic and case-insensitive, matching the ASCII slug path; the
+// `status_` prefix guarantees the leading-letter requirement of keyPattern and
+// can never collide with a built-in key.
+func fallbackKey(name string) string {
+	sum := sha256.Sum256([]byte(strings.ToLower(strings.TrimSpace(name))))
+	return "status_" + hex.EncodeToString(sum[:])[:12]
 }
 
 // Ensure idempotently seeds a workspace's 7 built-in statuses. Safe to call

@@ -369,6 +369,28 @@ func TestCreateIssueStatusIsNotGatedOnRollout(t *testing.T) {
 	dbfx.Cleanup(t, `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
 }
 
+// TestCreateIssueStatusFromNonASCIIName pins the #7627 fix: a display name with
+// no slug-able characters (e.g. `客户确认`) must create through the name-only
+// form, since the settings UI offers no explicit-key field. The derived key is
+// a valid ASCII schema identifier.
+func TestCreateIssueStatusFromNonASCIIName(t *testing.T) {
+	seedTestCatalog(t)
+
+	var created IssueStatusResponse
+	testutil.Call(t, testHandler.CreateIssueStatus,
+		newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+			"name": "客户确认", "category": issuestatus.InReview, "color": "#123456",
+		})).Want(http.StatusCreated).JSON(&created)
+	dbfx.Cleanup(t, `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+
+	if created.Name != "客户确认" {
+		t.Errorf("stored name = %q, want the Unicode display name", created.Name)
+	}
+	if _, err := issuestatus.ValidateKey(created.Key); err != nil {
+		t.Errorf("derived key %q is not a valid status key: %v", created.Key, err)
+	}
+}
+
 // TestIssueWriteStoresCanonicalStatusKey guards the 500 found in review:
 // resolution is case- and whitespace-insensitive, so writing the caller's raw
 // string back would store a value the column's format constraint rejects.
