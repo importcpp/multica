@@ -62,3 +62,20 @@ export function isImeComposing(event: {
   const e = event.nativeEvent ?? event;
   return Boolean(e.isComposing) || e.keyCode === 229;
 }
+
+/**
+ * Truncate `text` to at most `maxLength` characters, appending an ellipsis
+ * ("...") when it is shortened. Text at or under the limit is returned as-is.
+ *
+ * The result never exceeds `maxLength`: the ellipsis is counted toward the
+ * budget, so the text is sliced to `maxLength - 3` characters. When
+ * `maxLength` is smaller than the ellipsis itself the slice length is clamped
+ * to 0, yielding a leading run of dots trimmed to `maxLength`.
+ */
+export function truncateWithEllipsis(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 3))}...`.slice(0, Math.max(0, maxLength));
+}
