@@ -1242,7 +1242,7 @@ function AgentPickerItem({
             className={cn(
               "shrink-0 rounded p-0.5 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring",
               pinDisabled
-                ? "cursor-not-allowed text-muted-foreground/40"
+                ? "cursor-not-allowed text-faint-foreground"
                 : "cursor-pointer text-muted-foreground hover:bg-accent hover:text-foreground",
               // Always show the control for pinned rows; reveal on hover/focus
               // for unpinned rows so the row stays clean until acted on.
