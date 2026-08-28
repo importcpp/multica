@@ -481,8 +481,9 @@ func init() {
 	issueListCmd.Flags().String("assignee-id", "", "Filter by assignee UUID — member, agent, or squad (mutually exclusive with --assignee)")
 	issueListCmd.Flags().String("project", "", "Filter by project ID")
 	issueListCmd.Flags().StringSlice("metadata", nil, "Filter by metadata key=value (repeatable; combined with AND). Value is JSON-parsed: 'true'/'false' → bool, numbers → number, otherwise string. Wrap as '\"42\"' to force a string when the value would otherwise sniff as a number.")
-	issueListCmd.Flags().Int("limit", 50, "Maximum number of issues to return")
+	issueListCmd.Flags().Int("limit", 50, "Maximum number of issues to return in one page (the server caps a page at 100; pass --offset to page, or --all to fetch every page)")
 	issueListCmd.Flags().Int("offset", 0, "Number of issues to skip (for pagination)")
+	issueListCmd.Flags().Bool("all", false, "Fetch every issue by paging through the server (ignores --limit/--offset). Returns the full result set instead of a single capped page.")
 	issueListCmd.Flags().String("sort", "", "Sort column: position (default, manual board order), title, created_at, start_date, due_date, priority")
 	issueListCmd.Flags().String("direction", "", "Sort direction (asc or desc); requires --sort to be a non-position column (position is always ascending)")
 
@@ -631,14 +632,19 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 
 	params := url.Values{}
 	params.Set("workspace_id", client.WorkspaceID)
+	fetchAll, _ := cmd.Flags().GetBool("all")
 	if v, _ := cmd.Flags().GetString("status"); v != "" {
 		params.Set("status", v)
 	}
 	if v, _ := cmd.Flags().GetString("priority"); v != "" {
 		params.Set("priority", v)
 	}
-	if v, _ := cmd.Flags().GetInt("limit"); v > 0 {
-		params.Set("limit", fmt.Sprintf("%d", v))
+	// --limit/--offset are per-page controls; --all pages internally at the
+	// server's max page size, so it owns both and the flags are ignored.
+	if !fetchAll {
+		if v, _ := cmd.Flags().GetInt("limit"); v > 0 {
+			params.Set("limit", fmt.Sprintf("%d", v))
+		}
 	}
 	_, aID, hasAssignee, resolveErr := pickAssigneeFromFlags(ctx, client, cmd, "assignee", "assignee-id", issueAssigneeKinds)
 	if resolveErr != nil {
@@ -647,8 +653,10 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 	if hasAssignee {
 		params.Set("assignee_id", aID)
 	}
-	if v, _ := cmd.Flags().GetInt("offset"); v > 0 {
-		params.Set("offset", fmt.Sprintf("%d", v))
+	if !fetchAll {
+		if v, _ := cmd.Flags().GetInt("offset"); v > 0 {
+			params.Set("offset", fmt.Sprintf("%d", v))
+		}
 	}
 	if v, _ := cmd.Flags().GetString("project"); v != "" {
 		project, err := resolveProjectID(ctx, client, v)
@@ -693,24 +701,57 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 		params.Set("direction", d)
 	}
 
-	path := "/api/issues"
-	if len(params) > 0 {
-		path += "?" + params.Encode()
+	var issuesRaw []any
+	var total float64
+	if fetchAll {
+		// Page through at the server's max page size so the caller gets the
+		// full result set regardless of the 100/page ceiling. --limit/--offset
+		// are already excluded from params above.
+		pageParams := url.Values{}
+		for k, vs := range params {
+			pageParams[k] = vs
+		}
+		pageParams.Set("limit", "100")
+		offset := 0
+		for {
+			pageParams.Set("offset", fmt.Sprintf("%d", offset))
+			var page map[string]any
+			if err := client.GetJSON(ctx, "/api/issues?"+pageParams.Encode(), &page); err != nil {
+				return fmt.Errorf("list issues: %w", err)
+			}
+			pageIssues, _ := page["issues"].([]any)
+			issuesRaw = append(issuesRaw, pageIssues...)
+			total, _ = page["total"].(float64)
+			offset += len(pageIssues)
+			if len(pageIssues) == 0 || offset >= int(total) {
+				break
+			}
+		}
+	} else {
+		path := "/api/issues"
+		if len(params) > 0 {
+			path += "?" + params.Encode()
+		}
+		var result map[string]any
+		if err := client.GetJSON(ctx, path, &result); err != nil {
+			return fmt.Errorf("list issues: %w", err)
+		}
+		issuesRaw, _ = result["issues"].([]any)
+		total, _ = result["total"].(float64)
 	}
-
-	var result map[string]any
-	if err := client.GetJSON(ctx, path, &result); err != nil {
-		return fmt.Errorf("list issues: %w", err)
-	}
-
-	issuesRaw, _ := result["issues"].([]any)
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
-		total, _ := result["total"].(float64)
 		limit, _ := cmd.Flags().GetInt("limit")
 		offset, _ := cmd.Flags().GetInt("offset")
 		hasMore := offset+len(issuesRaw) < int(total)
+		if fetchAll {
+			// --all returns everything, so the pagination envelope reflects a
+			// single complete set rather than the ignored --limit/--offset.
+			limit = len(issuesRaw)
+			offset = 0
+			hasMore = false
+		}
 		wrapped := map[string]any{
 			"issues":   issuesRaw,
 			"total":    int(total),

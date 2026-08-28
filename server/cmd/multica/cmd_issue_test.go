@@ -2945,6 +2945,7 @@ func newIssueListTestCmd() *cobra.Command {
 	cmd.Flags().StringSlice("metadata", nil, "")
 	cmd.Flags().Int("limit", 50, "")
 	cmd.Flags().Int("offset", 0, "")
+	cmd.Flags().Bool("all", false, "")
 	cmd.Flags().String("sort", "", "")
 	cmd.Flags().String("direction", "", "")
 	return cmd
@@ -3223,6 +3224,75 @@ func TestRunIssueListSendsSortAndDirection(t *testing.T) {
 	}
 	if got := gotQuery.Get("direction"); got != "desc" {
 		t.Fatalf("direction query = %q, want desc (lower-cased)", got)
+	}
+}
+
+func TestRunIssueListAllPaginatesThroughEveryPage(t *testing.T) {
+	// A board larger than the server's 100/page ceiling: --all must page
+	// through and return the full set, not a single capped page.
+	const total = 146
+	var gotOffsets []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/issues" {
+			http.NotFound(w, r)
+			return
+		}
+		q := r.URL.Query()
+		if got := q.Get("limit"); got != "100" {
+			t.Errorf("limit = %q, want 100 (server max page) under --all", got)
+		}
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		gotOffsets = append(gotOffsets, offset)
+		issues := make([]any, 0, 100)
+		for i := offset; i < offset+100 && i < total; i++ {
+			issues = append(issues, map[string]any{
+				"id":         fmt.Sprintf("issue-%d", i),
+				"identifier": fmt.Sprintf("MUL-%d", i),
+				"title":      fmt.Sprintf("Issue %d", i),
+			})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"issues": issues, "total": total})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueListTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+	_ = cmd.Flags().Set("all", "true")
+	_ = cmd.Flags().Set("limit", "1000") // must be ignored under --all
+	out, err := captureStdout(t, func() error { return runIssueList(cmd, nil) })
+	if err != nil {
+		t.Fatalf("runIssueList --all: %v", err)
+	}
+
+	if want := []int{0, 100}; len(gotOffsets) != len(want) || gotOffsets[0] != want[0] || gotOffsets[1] != want[1] {
+		t.Fatalf("requested offsets = %v, want %v", gotOffsets, want)
+	}
+
+	var wrapped struct {
+		Issues  []map[string]any `json:"issues"`
+		Total   int              `json:"total"`
+		Limit   int              `json:"limit"`
+		Offset  int              `json:"offset"`
+		HasMore bool             `json:"has_more"`
+	}
+	if err := json.Unmarshal([]byte(out), &wrapped); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(wrapped.Issues) != total {
+		t.Fatalf("issues returned = %d, want %d (the full set)", len(wrapped.Issues), total)
+	}
+	if wrapped.Total != total {
+		t.Fatalf("total = %d, want %d", wrapped.Total, total)
+	}
+	if wrapped.HasMore {
+		t.Fatal("has_more = true, want false: --all returns everything")
+	}
+	if wrapped.Offset != 0 || wrapped.Limit != total {
+		t.Fatalf("envelope = {limit:%d offset:%d}, want {limit:%d offset:0}", wrapped.Limit, wrapped.Offset, total)
 	}
 }
 
