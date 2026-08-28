@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -492,43 +494,76 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	return h
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	// Marshal the body up front so we can advertise an accurate Content-Length
-	// header. Streaming straight into the ResponseWriter after WriteHeader forces
-	// net/http into chunked transfer encoding, which omits Content-Length; buffering
-	// first lets clients (and proxies) see the exact body size.
-	body, err := json.Marshal(v)
-	if err != nil {
-		// Fall back to a minimal, self-describing error payload rather than leaving
-		// the client with a half-written response.
-		body = []byte(`{"error":"failed to encode response"}`)
-		status = http.StatusInternalServerError
+// jsonBufPool recycles the encode buffers used by writeJSON / writeMeasuredJSON.
+// json.Marshal returns a length-exact slice, so the historical `append(body,
+// '\n')` reallocated and copied the whole body just to add one byte — costly on
+// large list responses. Encoding through a pooled bytes.Buffer with
+// json.Encoder (which writes the trailing newline itself) removes both that
+// realloc and the per-request marshal allocation.
+var jsonBufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+// maxPooledJSONBuf caps the buffer capacity we return to the pool. A one-off
+// large response (e.g. an unpaginated list) would otherwise pin megabytes in
+// the pool indefinitely; oversized buffers are dropped for the GC instead.
+const maxPooledJSONBuf = 1 << 20 // 1 MiB
+
+func putJSONBuf(buf *bytes.Buffer) {
+	if buf.Cap() > maxPooledJSONBuf {
+		return
 	}
-	// Match the trailing newline that json.Encoder.Encode historically appended.
-	body = append(body, '\n')
+	jsonBufPool.Put(buf)
+}
+
+// encodeJSONError is the body written when encoding fails: minimal and
+// self-describing, so a caller never gets a half-written response.
+var encodeJSONError = []byte(`{"error":"failed to encode response"}` + "\n")
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	// Buffer the body up front so we can advertise an accurate Content-Length.
+	// Streaming straight into the ResponseWriter after WriteHeader forces
+	// net/http into chunked transfer encoding, which omits Content-Length;
+	// buffering first lets clients (and proxies) see the exact body size.
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer putJSONBuf(buf)
+
+	// json.Encoder.Encode appends the trailing newline writeJSON historically
+	// added by hand, and matches json.Marshal's default HTML escaping.
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(encodeJSONError)))
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write(encodeJSONError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(status)
-	_, _ = w.Write(body)
+	_, _ = w.Write(buf.Bytes())
 }
 
 // writeMeasuredJSON behaves like writeJSON but returns the encoded body size so
 // callers can record payload bytes in slow-endpoint diagnostics. It measures the
 // uncompressed JSON length and is unrelated to transport compression.
 func writeMeasuredJSON(w http.ResponseWriter, status int, v any) (int, error) {
-	body, err := json.Marshal(v)
-	if err != nil {
+	buf := jsonBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer putJSONBuf(buf)
+
+	if err := json.NewEncoder(buf).Encode(v); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to encode response")
 		return 0, err
 	}
-	body = append(body, '\n')
+	n := buf.Len()
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Content-Length", strconv.Itoa(n))
 	w.WriteHeader(status)
-	if _, err := w.Write(body); err != nil {
-		return len(body), err
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		return n, err
 	}
-	return len(body), nil
+	return n, nil
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

@@ -2,9 +2,11 @@ package handler
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -12,11 +14,11 @@ import (
 // behind the F2 claim-observability patch: swapping writeJSON for writeMeasuredJSON
 // at the /tasks/claim response sites must not change a single byte on the wire.
 //
-// writeJSON encodes via json.NewEncoder(w).Encode (which appends a trailing
-// newline); writeMeasuredJSON marshals via json.Marshal and appends the newline
-// by hand. Both HTML-escape by default, so the emitted bytes must match for every
-// input. This table-driven test fails closed if that invariant ever drifts, so the
-// "no wire-behavior change" claim is provable rather than reasoned.
+// writeJSON and writeMeasuredJSON both encode via json.NewEncoder(buf).Encode
+// through a pooled buffer (which appends a trailing newline and HTML-escapes by
+// default), so the emitted bytes must match for every input. This table-driven
+// test fails closed if that invariant ever drifts, so the "no wire-behavior
+// change" claim is provable rather than reasoned.
 func TestWriteMeasuredJSONByteIdenticalToWriteJSON(t *testing.T) {
 	type skill struct {
 		Name        string            `json:"name"`
@@ -152,4 +154,81 @@ func TestWriteJSONSetsContentLength(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestWriteJSONTrailingNewline pins the trailing newline that json.Encoder.Encode
+// emits. writeJSON used to append it by hand; after switching to a pooled
+// bytes.Buffer + json.Encoder the newline must still be there, byte-for-byte, so
+// existing clients and golden-file tests see no change.
+func TestWriteJSONTrailingNewline(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]string{"hello": "world"})
+
+	body := rec.Body.Bytes()
+	if len(body) == 0 || body[len(body)-1] != '\n' {
+		t.Fatalf("writeJSON body must end in a newline, got %q", body)
+	}
+	// Exactly one trailing newline, not two.
+	if len(body) >= 2 && body[len(body)-2] == '\n' {
+		t.Fatalf("writeJSON emitted a double trailing newline: %q", body)
+	}
+	cl, _ := strconv.Atoi(rec.Header().Get("Content-Length"))
+	if cl != len(body) {
+		t.Fatalf("Content-Length %d excludes/miscounts the newline (body %d)", cl, len(body))
+	}
+}
+
+// TestWriteJSONEncodeErrorFallback covers the branch where json encoding fails
+// (a channel is unmarshalable). The response must be the self-describing error
+// body with a 500 and an accurate Content-Length, never a half-written payload.
+func TestWriteJSONEncodeErrorFallback(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]any{"bad": make(chan int)})
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if got, want := rec.Body.String(), `{"error":"failed to encode response"}`+"\n"; got != want {
+		t.Fatalf("fallback body = %q, want %q", got, want)
+	}
+	cl, err := strconv.Atoi(rec.Header().Get("Content-Length"))
+	if err != nil || cl != rec.Body.Len() {
+		t.Fatalf("Content-Length = %q, want %d", rec.Header().Get("Content-Length"), rec.Body.Len())
+	}
+
+	// writeMeasuredJSON reports zero bytes and surfaces the error on the same input.
+	recMeasured := httptest.NewRecorder()
+	n, err := writeMeasuredJSON(recMeasured, http.StatusOK, map[string]any{"bad": make(chan int)})
+	if err == nil {
+		t.Fatalf("writeMeasuredJSON should return an error for an unmarshalable value")
+	}
+	if n != 0 {
+		t.Fatalf("writeMeasuredJSON reported %d bytes on error, want 0", n)
+	}
+}
+
+// TestWriteJSONPoolReuseNoCorruption runs many concurrent writes with distinct
+// payloads through the shared buffer pool: each response must contain exactly its
+// own body, proving buffers are Reset on Get and never aliased across calls.
+func TestWriteJSONPoolReuseNoCorruption(t *testing.T) {
+	const n = 200
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			writeJSON(rec, http.StatusOK, map[string]int{"seq": i})
+
+			var got map[string]int
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Errorf("iter %d: body not valid JSON: %v (%q)", i, err, rec.Body.String())
+				return
+			}
+			if got["seq"] != i {
+				t.Errorf("iter %d: got seq=%d, buffer was reused without isolation", i, got["seq"])
+			}
+		}(i)
+	}
+	wg.Wait()
 }
