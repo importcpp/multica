@@ -719,14 +719,22 @@ func runIssueList(cmd *cobra.Command, _ []string) error {
 			if err := client.GetJSON(ctx, "/api/issues?"+pageParams.Encode(), &page); err != nil {
 				return fmt.Errorf("list issues: %w", err)
 			}
-			pageIssues, _ := page["issues"].([]any)
+			pageIssues, ok := page["issues"].([]any)
+			if !ok {
+				return fmt.Errorf("list issues: invalid response: issues must be an array")
+			}
 			issuesRaw = append(issuesRaw, pageIssues...)
-			total, _ = page["total"].(float64)
 			offset += len(pageIssues)
-			if len(pageIssues) == 0 || offset >= int(total) {
+			// A server whose count query fails can under-report total as the
+			// current page length. Only a short page proves that pagination is
+			// complete; a full page always requires another request.
+			if len(pageIssues) < 100 {
 				break
 			}
 		}
+		// The --all envelope describes the collection actually returned. Do not
+		// reuse a possibly stale or degraded server-side count.
+		total = float64(len(issuesRaw))
 	} else {
 		path := "/api/issues"
 		if len(params) > 0 {

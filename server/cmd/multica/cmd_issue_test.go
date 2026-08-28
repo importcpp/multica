@@ -3296,6 +3296,85 @@ func TestRunIssueListAllPaginatesThroughEveryPage(t *testing.T) {
 	}
 }
 
+func TestRunIssueListAllDoesNotTrustUnderreportedTotal(t *testing.T) {
+	// ListIssues deliberately falls back to the current page length when its
+	// count query fails. --all must keep paging after a full page even when that
+	// degraded total claims there is nothing left.
+	const total = 200
+	var gotOffsets []int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/issues" {
+			http.NotFound(w, r)
+			return
+		}
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		gotOffsets = append(gotOffsets, offset)
+		issues := make([]any, 0, 100)
+		for i := offset; i < offset+100 && i < total; i++ {
+			issues = append(issues, map[string]any{
+				"id":         fmt.Sprintf("issue-%d", i),
+				"identifier": fmt.Sprintf("MUL-%d", i),
+				"title":      fmt.Sprintf("Issue %d", i),
+			})
+		}
+		// Simulate the server's count-query fallback: total is only the size of
+		// this page, not the true size of the filtered collection.
+		json.NewEncoder(w).Encode(map[string]any{"issues": issues, "total": len(issues)})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueListTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+	_ = cmd.Flags().Set("all", "true")
+	out, err := captureStdout(t, func() error { return runIssueList(cmd, nil) })
+	if err != nil {
+		t.Fatalf("runIssueList --all: %v", err)
+	}
+
+	if want := []int{0, 100, 200}; len(gotOffsets) != len(want) || gotOffsets[0] != want[0] || gotOffsets[1] != want[1] || gotOffsets[2] != want[2] {
+		t.Fatalf("requested offsets = %v, want %v", gotOffsets, want)
+	}
+
+	var wrapped struct {
+		Issues  []map[string]any `json:"issues"`
+		Total   int              `json:"total"`
+		Limit   int              `json:"limit"`
+		HasMore bool             `json:"has_more"`
+	}
+	if err := json.Unmarshal([]byte(out), &wrapped); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	if len(wrapped.Issues) != total || wrapped.Total != total || wrapped.Limit != total || wrapped.HasMore {
+		t.Fatalf("envelope = {issues:%d total:%d limit:%d has_more:%v}, want {%d %d %d false}", len(wrapped.Issues), wrapped.Total, wrapped.Limit, wrapped.HasMore, total, total, total)
+	}
+}
+
+func TestRunIssueListAllRejectsPageWithoutIssuesArray(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"total": 146})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+
+	cmd := newIssueListTestCmd()
+	_ = cmd.Flags().Set("output", "json")
+	_ = cmd.Flags().Set("all", "true")
+	out, err := captureStdout(t, func() error { return runIssueList(cmd, nil) })
+	if err == nil || !strings.Contains(err.Error(), "issues must be an array") {
+		t.Fatalf("runIssueList --all error = %v, want invalid issues array error", err)
+	}
+	if out != "" {
+		t.Fatalf("stdout = %q, want empty output on malformed page", out)
+	}
+}
+
 func TestRunIssueListRejectsInvalidSortAndDirection(t *testing.T) {
 	t.Setenv("MULTICA_SERVER_URL", "http://127.0.0.1:0")
 	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
