@@ -1230,6 +1230,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Use(opts.HTTPMetrics.Middleware)
 	}
 	r.Use(chimw.Recoverer)
+	// Negotiate gzip for JSON responses while leaving WebSocket upgrades on the
+	// underlying connection.
+	r.Use(chimw.Compress(5, "application/json"))
 	r.Use(h.PluginSurfaceHostBoundary)
 	r.Use(middleware.ContentSecurityPolicy)
 
