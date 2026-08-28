@@ -6330,19 +6330,29 @@ func (s *TaskService) LoadAgentSkills(ctx context.Context, agentID pgtype.UUID) 
 		return nil
 	}
 
+	// Load every skill's files in one round trip instead of one query per
+	// skill (N+1 on the task-claim hot path). Group by skill_id in a single
+	// linear pass — the query orders by skill_id, path.
+	skillIDs := make([]pgtype.UUID, len(skills))
+	for i, sk := range skills {
+		skillIDs[i] = sk.ID
+	}
+	files, _ := s.Queries.ListSkillFilesBySkillIDs(ctx, skillIDs)
+	filesBySkill := make(map[string][]AgentSkillFileData, len(skills))
+	for _, f := range files {
+		id := util.UUIDToString(f.SkillID)
+		filesBySkill[id] = append(filesBySkill[id], AgentSkillFileData{Path: f.Path, Content: f.Content})
+	}
+
 	result := make([]AgentSkillData, 0, len(skills))
 	for _, sk := range skills {
-		data := AgentSkillData{
+		result = append(result, AgentSkillData{
 			ID:          util.UUIDToString(sk.ID),
 			Name:        sk.Name,
 			Description: sk.Description,
 			Content:     sk.Content,
-		}
-		files, _ := s.Queries.ListSkillFiles(ctx, sk.ID)
-		for _, f := range files {
-			data.Files = append(data.Files, AgentSkillFileData{Path: f.Path, Content: f.Content})
-		}
-		result = append(result, data)
+			Files:       filesBySkill[util.UUIDToString(sk.ID)],
+		})
 	}
 	return result
 }
