@@ -8,11 +8,12 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// RuntimeLookup is the only way production code reads a single agent_runtime
-// row by id (MUL-6884).
+// RuntimeLookup is the only way production code reads agent_runtime rows by id
+// (MUL-6884) — one row via Get, or many in one query via GetMany.
 //
 // The query itself is a primary-key point read and has never been the problem.
 // What is missing is attribution: daemon heartbeats, browser polling loops, and
@@ -44,6 +45,39 @@ func (l RuntimeLookup) Get(ctx context.Context, id pgtype.UUID) (db.AgentRuntime
 	rt, err := l.Queries.GetAgentRuntime(ctx, id)
 	l.Metrics.RecordAgentRuntimeLookup(l.Source, runtimeLookupResult(err))
 	return rt, err
+}
+
+// GetMany reads the requested agent_runtime rows in one query and keeps the
+// per-source attribution GetAgentRuntime callers get, without issuing N point
+// reads (MUL-6788). It returns the rows keyed by their canonical UUID string
+// so a differently-cased request id still resolves.
+//
+// Metric accounting mirrors N individual Get calls: a batch read error counts
+// one "error" per requested id (the whole lookup failed for each), and on
+// success each id is counted "ok" when its row came back and "not_found" when
+// it did not — so multica_agent_runtime_lookup_total keeps the same shape it
+// had before batching. The read error is returned untouched so callers can fail
+// closed instead of treating a hiccup as "every runtime is gone".
+func (l RuntimeLookup) GetMany(ctx context.Context, ids []pgtype.UUID) (map[string]db.AgentRuntime, error) {
+	rows, err := l.Queries.GetAgentRuntimes(ctx, ids)
+	if err != nil {
+		for range ids {
+			l.Metrics.RecordAgentRuntimeLookup(l.Source, obsmetrics.RuntimeLookupResultError)
+		}
+		return nil, err
+	}
+	byID := make(map[string]db.AgentRuntime, len(rows))
+	for _, rt := range rows {
+		byID[util.UUIDToString(rt.ID)] = rt
+	}
+	for _, id := range ids {
+		if _, ok := byID[util.UUIDToString(id)]; ok {
+			l.Metrics.RecordAgentRuntimeLookup(l.Source, obsmetrics.RuntimeLookupResultOK)
+		} else {
+			l.Metrics.RecordAgentRuntimeLookup(l.Source, obsmetrics.RuntimeLookupResultNotFound)
+		}
+	}
+	return byID, nil
 }
 
 func runtimeLookupResult(err error) string {
