@@ -34,6 +34,11 @@ import (
 // point App-authenticated calls at an httptest server without touching GitHub.
 var githubAPIBase = "https://api.github.com"
 
+// githubTokenHTTPClient is reused across installation-token exchanges (a hot
+// path against api.github.com) so they share one keep-alive connection pool
+// instead of building a throwaway client — and its idle connections — per call.
+var githubTokenHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
 const (
 	githubReturnToGitHub       = "github"
 	githubReturnToRepositories = "repositories"
@@ -824,7 +829,6 @@ func fetchGitHubInstallationRepositories(
 		return GitHubRepositoriesResponse{}, errors.New("github App JWT credentials unavailable")
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	tokenEndpoint := fmt.Sprintf(
 		"%s/app/installations/%d/access_tokens",
 		strings.TrimRight(githubAPIBase, "/"),
@@ -841,7 +845,7 @@ func fetchGitHubInstallationRepositories(
 	}
 	setGitHubAPIHeaders(tokenReq, appJWT)
 	tokenReq.Header.Set("Content-Type", "application/json")
-	tokenResp, err := client.Do(tokenReq)
+	tokenResp, err := githubTokenHTTPClient.Do(tokenReq)
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("create installation token: %w", err)
 	}
@@ -859,7 +863,7 @@ func fetchGitHubInstallationRepositories(
 	if tokenBody.Token == "" {
 		return GitHubRepositoriesResponse{}, errors.New("github returned an empty installation token")
 	}
-	defer revokeGitHubInstallationToken(client, tokenBody.Token)
+	defer revokeGitHubInstallationToken(githubTokenHTTPClient, tokenBody.Token)
 
 	repositoriesEndpoint := fmt.Sprintf(
 		"%s/installation/repositories?page=%d&per_page=%d",
@@ -872,7 +876,7 @@ func fetchGitHubInstallationRepositories(
 		return GitHubRepositoriesResponse{}, err
 	}
 	setGitHubAPIHeaders(repositoriesReq, tokenBody.Token)
-	repositoriesResp, err := client.Do(repositoriesReq)
+	repositoriesResp, err := githubTokenHTTPClient.Do(repositoriesReq)
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("list installation repositories: %w", err)
 	}

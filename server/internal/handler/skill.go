@@ -367,8 +367,7 @@ func (h *Handler) SearchSkills(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-	candidates, err := searchClawHubSkills(httpClient, query)
+	candidates, err := searchClawHubSkills(skillHTTPClient, query)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{
 			"code":  "upstream_unavailable",
@@ -789,6 +788,13 @@ func (s *importedSkill) addFile(path, content string) error {
 // --- ClawHub types ---
 
 var clawHubAPIBase = "https://clawhub.ai/api/v1"
+
+// skillHTTPClient is shared across the skill search / import / refresh paths so
+// they reuse one keep-alive connection pool instead of paying a fresh TCP+TLS
+// handshake per request. The per-request deadline is applied via context
+// (importFetchTimeout / the caller's request context), so this client-level
+// Timeout is only an outer safety bound.
+var skillHTTPClient = &http.Client{Timeout: 30 * time.Second}
 
 const clawHubSearchStatsLimit = 10
 
@@ -2301,8 +2307,6 @@ func (h *Handler) ImportSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
-
 	// Bound the whole server-side fetch under an overall deadline that is
 	// shorter than the reverse-proxy / CDN gateway timeout in front of the API.
 	// If an upstream is slow, the import returns a clear error instead of the
@@ -2314,11 +2318,11 @@ func (h *Handler) ImportSkill(w http.ResponseWriter, r *http.Request) {
 	var imported *importedSkill
 	switch source {
 	case sourceClawHub:
-		imported, err = fetchFromClawHub(ctx, httpClient, normalized)
+		imported, err = fetchFromClawHub(ctx, skillHTTPClient, normalized)
 	case sourceSkillsSh:
-		imported, err = fetchFromSkillsSh(ctx, httpClient, normalized)
+		imported, err = fetchFromSkillsSh(ctx, skillHTTPClient, normalized)
 	case sourceGitHub:
-		imported, err = fetchFromGitHub(ctx, httpClient, normalized)
+		imported, err = fetchFromGitHub(ctx, skillHTTPClient, normalized)
 	}
 	if err != nil {
 		status, msg := importFetchErrorResponse(ctx, err)

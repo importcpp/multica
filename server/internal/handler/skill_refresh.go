@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -148,11 +147,10 @@ func (h *Handler) RefreshSkill(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpClient := &http.Client{Timeout: 30 * time.Second}
 	ctx, cancel := context.WithTimeout(r.Context(), importFetchTimeout)
 	defer cancel()
 
-	imported, err := fetchImportedSkillFromOrigin(ctx, httpClient, origin)
+	imported, err := fetchImportedSkillFromOrigin(ctx, skillHTTPClient, origin)
 	if err != nil {
 		if errors.Is(err, errSkillNotRefreshable) {
 			writeError(w, http.StatusUnprocessableEntity, err.Error())
