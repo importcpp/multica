@@ -48,6 +48,12 @@ func (f *fakeBatchWriter) flushedIDs() []pgtype.UUID {
 	return out
 }
 
+func (f *fakeBatchWriter) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
 func uid(b byte) pgtype.UUID {
 	var u pgtype.UUID
 	u.Valid = true
@@ -60,7 +66,7 @@ func uid(b byte) pgtype.UUID {
 func newTestRecorder(w lastUsedBatchWriter) *BatchedPATLastUsedRecorder {
 	return &BatchedPATLastUsedRecorder{
 		queries:       w,
-		flushInterval: time.Hour, // we drive flushOnce directly
+		flushInterval: time.Hour, // we drive flushOnce directly unless overridden
 		maxPending:    4,
 		maxBatch:      2,
 		flushBudget:   time.Second,
@@ -81,7 +87,7 @@ func TestRecord_DedupsAndFlushes(t *testing.T) {
 	if got := len(r.pending); got != 2 {
 		t.Fatalf("pending = %d, want 2 (dup merged)", got)
 	}
-	r.flushOnce(context.Background(), time.Second)
+	r.flushOnce(time.Second)
 	if got := len(w.flushedIDs()); got != 2 {
 		t.Fatalf("flushed %d ids, want 2", got)
 	}
@@ -110,23 +116,41 @@ func TestFlush_ChunksByMaxBatch(t *testing.T) {
 	for i := byte(1); i <= 4; i++ {
 		r.Record(uid(i))
 	}
-	r.flushOnce(context.Background(), time.Second)
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if len(w.batches) != 2 {
-		t.Fatalf("got %d chunks, want 2 (4 ids / maxBatch 2)", len(w.batches))
+	r.flushOnce(time.Second)
+	if got := w.callCount(); got != 2 {
+		t.Fatalf("got %d chunks, want 2 (4 ids / maxBatch 2)", got)
 	}
 }
 
-func TestFlush_DBErrorStopsRoundNoPanic(t *testing.T) {
+// TestFlush_DBErrorStopsRound asserts the first DB error ends the round: the
+// writer is invoked exactly once even though there are two chunks.
+func TestFlush_DBErrorStopsRound(t *testing.T) {
 	w := &fakeBatchWriter{failNext: true}
+	r := newTestRecorder(w) // maxBatch=2
+	for i := byte(1); i <= 4; i++ {
+		r.Record(uid(i))
+	}
+	r.flushOnce(time.Second) // must not panic
+	if got := w.callCount(); got != 1 {
+		t.Fatalf("writer called %d times, want 1 (first error stops the round)", got)
+	}
+	if len(w.flushedIDs()) != 0 {
+		t.Fatalf("no ids should have been recorded on failure")
+	}
+}
+
+// TestFlush_WholeFlushBudgetSkipsRemaining pins that the deadline bounds the
+// ENTIRE flush: with an already-exhausted budget nothing is written, and the
+// writer is never called (all chunks skipped at the budget gate).
+func TestFlush_WholeFlushBudgetSkipsRemaining(t *testing.T) {
+	w := &fakeBatchWriter{}
 	r := newTestRecorder(w)
 	for i := byte(1); i <= 4; i++ {
 		r.Record(uid(i))
 	}
-	r.flushOnce(context.Background(), time.Second) // must not panic
-	if len(w.flushedIDs()) != 0 {
-		t.Fatalf("no ids should have been recorded on failure")
+	r.flushOnce(0) // zero budget: ctx is already expired on entry
+	if got := w.callCount(); got != 0 {
+		t.Fatalf("writer called %d times, want 0 (budget exhausted)", got)
 	}
 }
 
@@ -134,33 +158,94 @@ func TestFlush_PanicRecoveredWorkerSurvives(t *testing.T) {
 	w := &fakeBatchWriter{panicNow: true}
 	r := newTestRecorder(w)
 	r.Record(uid(1))
-	r.flushOnce(context.Background(), time.Second) // recovers, does not crash
+	r.flushOnce(time.Second) // recovers, does not crash
 
 	// Next round with a healthy writer still works.
 	w.mu.Lock()
 	w.panicNow = false
 	w.mu.Unlock()
 	r.Record(uid(2))
-	r.flushOnce(context.Background(), time.Second)
+	r.flushOnce(time.Second)
 	if len(w.flushedIDs()) != 1 {
 		t.Fatalf("worker did not recover for the next round")
 	}
 }
 
-func TestStop_FinalFlushUsesIndependentContext(t *testing.T) {
+// gateWriter blocks each write until release is closed OR its ctx is cancelled,
+// returning ctx.Err() in the latter case. It signals (once) when the first
+// write has begun. This lets a test interleave a sweepCtx cancel with a write
+// that is already in flight.
+type gateWriter struct {
+	startedOnce sync.Once
+	started     chan struct{}
+	release     chan struct{}
+	mu          sync.Mutex
+	written     []pgtype.UUID
+}
+
+func newGateWriter() *gateWriter {
+	return &gateWriter{started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *gateWriter) UpdatePersonalAccessTokensLastUsed(ctx context.Context, ids []pgtype.UUID) error {
+	g.startedOnce.Do(func() { close(g.started) })
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	g.mu.Lock()
+	g.written = append(g.written, ids...)
+	g.mu.Unlock()
+	return nil
+}
+
+func (g *gateWriter) writtenCount() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.written)
+}
+
+// TestShutdown_InFlightPeriodicFlushNotLost is the P1a regression. A periodic
+// flush swaps the pending set out and is mid-write when sweepCtx is cancelled.
+// Because the flush DB deadline is rooted in Background (not sweepCtx), the
+// in-flight write must still complete rather than being aborted and dropped.
+// With the old sweepCtx-rooted deadline this write would return context
+// canceled, the batch would be dropped, and Stop's final flush (pending now
+// empty) could not recover it.
+func TestShutdown_InFlightPeriodicFlushNotLost(t *testing.T) {
+	g := newGateWriter()
+	r := newTestRecorder(g)
+	r.flushInterval = 5 * time.Millisecond
+
+	r.Record(uid(7))
+	ctx, cancel := context.WithCancel(context.Background())
+	go r.Run(ctx)
+
+	<-g.started // a periodic flush has swapped pending and is now blocked in the write
+	cancel()    // sweepCancel() lands mid-flush
+	close(g.release)
+	r.Stop()
+
+	if got := g.writtenCount(); got != 1 {
+		t.Fatalf("in-flight batch lost on shutdown: wrote %d ids, want 1", got)
+	}
+}
+
+func TestStop_FinalFlushRunsAfterCancel(t *testing.T) {
 	w := &fakeBatchWriter{}
 	r := newTestRecorder(w)
 
-	// Simulate main.go: cancel the worker ctx, THEN Stop. The final flush
-	// must still write despite the worker ctx being dead.
+	// Cancel the worker ctx, THEN Stop. The final flush must still write
+	// despite the worker ctx being dead (it is rooted in Background).
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.Run(ctx)
 	r.Record(uid(7))
-	cancel() // sweepCancel() equivalent — worker ctx now cancelled
-	r.Stop() // final flush must not derive from the cancelled ctx
+	cancel()
+	r.Stop()
 
 	if got := len(w.flushedIDs()); got != 1 {
-		t.Fatalf("final flush wrote %d ids, want 1 (independent ctx)", got)
+		t.Fatalf("final flush wrote %d ids, want 1", got)
 	}
 }
 
@@ -169,6 +254,26 @@ func TestStop_Idempotent(t *testing.T) {
 	r := newTestRecorder(w)
 	r.Stop()
 	r.Stop() // must not panic / double-close
+}
+
+// TestStop_WithoutRunReturnsPromptly asserts Stop does not spend the join
+// budget waiting for a Run that was never started.
+func TestStop_WithoutRunReturnsPromptly(t *testing.T) {
+	w := &fakeBatchWriter{}
+	r := newTestRecorder(w)
+	r.shutdownDur = 5 * time.Second // would be a long wait if we joined a non-running Run
+	r.Record(uid(1))
+
+	done := make(chan struct{})
+	go func() { r.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked waiting for a Run that never started")
+	}
+	if len(w.flushedIDs()) != 1 {
+		t.Fatalf("final flush wrote %d ids, want 1", len(w.flushedIDs()))
+	}
 }
 
 func TestNoopRecorder(t *testing.T) {

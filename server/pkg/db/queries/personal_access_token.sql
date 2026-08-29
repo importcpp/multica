@@ -21,11 +21,6 @@ SET revoked = TRUE
 WHERE id = $1 AND user_id = $2
 RETURNING token_hash;
 
--- name: UpdatePersonalAccessTokenLastUsed :exec
-UPDATE personal_access_token
-SET last_used_at = now()
-WHERE id = $1;
-
 -- name: ExtendPersonalAccessTokenExpiry :one
 -- In-place renew: only bumps expires_at when the token is still valid
 -- (not revoked, not already expired) AND the existing expires_at is
@@ -48,9 +43,9 @@ WHERE id = sqlc.arg(id)
 RETURNING expires_at;
 
 -- name: UpdatePersonalAccessTokensLastUsed :exec
--- Batch form of UpdatePersonalAccessTokenLastUsed, called by the background
--- PATLastUsedRecorder. now() records flush time, not exact use time; the ~30s
--- flush window makes the skew irrelevant for a display-only timestamp.
+-- Batch last_used_at refresh, called by the background PATLastUsedRecorder.
+-- now() records flush time, not exact use time; the ~30s flush window makes
+-- the skew irrelevant for a display-only timestamp.
 UPDATE personal_access_token
 SET last_used_at = now()
 WHERE id = ANY(@ids::uuid[]);

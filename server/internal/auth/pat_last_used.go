@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -56,9 +57,9 @@ const (
 	// defaultFlushBudget bounds an ENTIRE periodic flush (all chunks), not
 	// each chunk — so a slow DB cannot stall the worker for chunks*timeout.
 	defaultFlushBudget = 5 * time.Second
-	// defaultShutdownBudget bounds the final flush on Stop. It derives from
-	// context.Background(), NOT the worker ctx, because main() cancels the
-	// worker ctx immediately before calling Stop (see wiring notes).
+	// defaultShutdownBudget bounds the WHOLE of Stop (join + final flush). It
+	// is independent of the worker ctx, which main() cancels immediately before
+	// calling Stop, so the final flush still runs.
 	defaultShutdownBudget = 10 * time.Second
 )
 
@@ -76,6 +77,7 @@ type BatchedPATLastUsedRecorder struct {
 	mu      sync.Mutex
 	pending map[pgtype.UUID]struct{}
 
+	started  atomic.Bool // true once Run has begun
 	stopOnce sync.Once
 	stopped  chan struct{} // closed when Run has exited
 	done     chan struct{} // closed by Stop to request shutdown
@@ -132,16 +134,22 @@ func (b *BatchedPATLastUsedRecorder) Record(tokenID pgtype.UUID) {
 		return
 	}
 	b.pending[tokenID] = struct{}{}
-	n := len(b.pending)
+	// Gauge is set under the lock so it can never lose a race with flushOnce's
+	// reset-to-0 and get stuck reporting a stale value while ids are pending.
+	b.metrics.setPending(len(b.pending))
 	b.mu.Unlock()
 	b.metrics.recorded()
-	b.metrics.setPending(n)
 }
 
 // Run drives periodic flushes until ctx is cancelled or Stop is called. Call
-// once, in a goroutine. The worker ctx (main.go's sweepCtx) is used for the
-// PERIODIC flushes only; the final flush in Stop uses its own Background ctx.
+// once, in a goroutine. ctx (main.go's sweepCtx) governs SCHEDULING only —
+// it decides when to stop ticking. It is deliberately NOT threaded into the DB
+// write: once a periodic flush has swapped the pending set out, its write must
+// run to completion under its own budget, otherwise a sweepCancel() landing
+// mid-flush would abort the query and silently drop that already-detached
+// batch (Stop's final flush could not recover it — pending is already empty).
 func (b *BatchedPATLastUsedRecorder) Run(ctx context.Context) {
+	b.started.Store(true)
 	defer close(b.stopped)
 	ticker := time.NewTicker(b.flushInterval)
 	defer ticker.Stop()
@@ -152,34 +160,43 @@ func (b *BatchedPATLastUsedRecorder) Run(ctx context.Context) {
 		case <-b.done:
 			return
 		case <-ticker.C:
-			b.flushOnce(ctx, b.flushBudget)
+			b.flushOnce(b.flushBudget)
 		}
 	}
 }
 
-// Stop requests shutdown, waits (bounded) for Run to exit, then performs one
-// final flush of whatever remains. Idempotent and safe to call even if Run was
-// never started. The final flush derives from context.Background — NOT the
-// worker ctx — because callers cancel the worker ctx immediately before Stop.
+// Stop requests shutdown and, under a single total deadline, waits for Run to
+// exit and then flushes whatever remains. Idempotent and safe to call even if
+// Run was never started (no wait in that case). The whole method — join plus
+// final flush — is bounded by shutdownDur, so it can never hold shutdown open
+// longer than that.
 func (b *BatchedPATLastUsedRecorder) Stop() {
 	b.stopOnce.Do(func() {
 		close(b.done)
-		// Wait, bounded, for Run to stop touching the pending map.
-		select {
-		case <-b.stopped:
-		case <-time.After(b.shutdownDur):
-			slog.Warn("pat last_used: worker did not exit before shutdown deadline; flushing anyway")
+		deadline := time.Now().Add(b.shutdownDur)
+		// Only wait for Run to exit if it was actually started; otherwise
+		// there is nothing to join and blocking would just burn the budget
+		// (and log a spurious "worker did not exit" warning).
+		if b.started.Load() {
+			select {
+			case <-b.stopped:
+			case <-time.After(time.Until(deadline)):
+				slog.Warn("pat last_used: worker did not exit before shutdown deadline; flushing anyway")
+			}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), b.shutdownDur)
-		defer cancel()
-		b.flushOnce(ctx, b.shutdownDur)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		b.flushOnce(remaining)
 	})
 }
 
 // flushOnce atomically swaps out the pending set, then writes it in bounded
-// chunks under a single whole-flush deadline. Marks recorded during the flush
-// land in the next round — never lost, never blocked.
-func (b *BatchedPATLastUsedRecorder) flushOnce(parent context.Context, budget time.Duration) {
+// chunks under a single whole-flush deadline rooted in context.Background.
+// Rooting in Background (not a caller ctx) is intentional: see Run. Marks
+// recorded during the flush land in the next round — never lost, never blocked.
+func (b *BatchedPATLastUsedRecorder) flushOnce(budget time.Duration) {
 	b.mu.Lock()
 	if len(b.pending) == 0 {
 		b.mu.Unlock()
@@ -187,15 +204,15 @@ func (b *BatchedPATLastUsedRecorder) flushOnce(parent context.Context, budget ti
 	}
 	batch := b.pending
 	b.pending = make(map[pgtype.UUID]struct{})
-	b.mu.Unlock()
 	b.metrics.setPending(0)
+	b.mu.Unlock()
 
 	ids := make([]pgtype.UUID, 0, len(batch))
 	for id := range batch {
 		ids = append(ids, id)
 	}
 
-	ctx, cancel := context.WithTimeout(parent, budget)
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 
 	for start := 0; start < len(ids); start += b.maxBatch {
