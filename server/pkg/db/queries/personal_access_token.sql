@@ -46,3 +46,11 @@ WHERE id = sqlc.arg(id)
   AND expires_at > now()
   AND expires_at <= sqlc.arg(renew_threshold_at)
 RETURNING expires_at;
+
+-- name: UpdatePersonalAccessTokensLastUsed :exec
+-- Batch form of UpdatePersonalAccessTokenLastUsed, called by the background
+-- PATLastUsedRecorder. now() records flush time, not exact use time; the ~30s
+-- flush window makes the skew irrelevant for a display-only timestamp.
+UPDATE personal_access_token
+SET last_used_at = now()
+WHERE id = ANY(@ids::uuid[]);

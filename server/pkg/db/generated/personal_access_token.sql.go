@@ -173,3 +173,14 @@ func (q *Queries) UpdatePersonalAccessTokenLastUsed(ctx context.Context, id pgty
 	_, err := q.db.Exec(ctx, updatePersonalAccessTokenLastUsed, id)
 	return err
 }
+
+const updatePersonalAccessTokensLastUsed = `-- name: UpdatePersonalAccessTokensLastUsed :exec
+UPDATE personal_access_token
+SET last_used_at = now()
+WHERE id = ANY($1::uuid[])
+`
+
+func (q *Queries) UpdatePersonalAccessTokensLastUsed(ctx context.Context, ids []pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, updatePersonalAccessTokensLastUsed, ids)
+	return err
+}
