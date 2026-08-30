@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS uq_external_issue_sync_run_active;

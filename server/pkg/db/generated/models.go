@@ -632,6 +632,92 @@ type DingtalkGroupRoute struct {
 	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
 }
 
+type ExternalIssueLink struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	Provider          string             `json:"provider"`
+	InstanceKey       string             `json:"instance_key"`
+	ExternalIssueID   string             `json:"external_issue_id"`
+	SourceID          pgtype.UUID        `json:"source_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
+	DisplayNumber     int64              `json:"display_number"`
+	ExternalHtmlUrl   string             `json:"external_html_url"`
+	RemoteState       string             `json:"remote_state"`
+	RemoteUpdatedAt   pgtype.Timestamptz `json:"remote_updated_at"`
+	TitleBaselineHash string             `json:"title_baseline_hash"`
+	BodyBaselineHash  string             `json:"body_baseline_hash"`
+	TitleConflict     bool               `json:"title_conflict"`
+	BodyConflict      bool               `json:"body_conflict"`
+	TitleLocalOwned   bool               `json:"title_local_owned"`
+	BodyLocalOwned    bool               `json:"body_local_owned"`
+	Moved             bool               `json:"moved"`
+	LocalDeletedAt    pgtype.Timestamptz `json:"local_deleted_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ExternalIssueSource struct {
+	ID                   pgtype.UUID        `json:"id"`
+	WorkspaceID          pgtype.UUID        `json:"workspace_id"`
+	Provider             string             `json:"provider"`
+	InstanceKey          string             `json:"instance_key"`
+	CredentialID         pgtype.UUID        `json:"credential_id"`
+	RepositoryExternalID string             `json:"repository_external_id"`
+	RepositoryFullPath   string             `json:"repository_full_path"`
+	TargetProjectID      pgtype.UUID        `json:"target_project_id"`
+	Filter               []byte             `json:"filter"`
+	Mode                 string             `json:"mode"`
+	State                string             `json:"state"`
+	ConfiguredByUserID   pgtype.UUID        `json:"configured_by_user_id"`
+	LastReconciledAt     pgtype.Timestamptz `json:"last_reconciled_at"`
+	NextReconcileAt      pgtype.Timestamptz `json:"next_reconcile_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ExternalIssueSyncEvent struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	SourceID        pgtype.UUID        `json:"source_id"`
+	DeliveryID      string             `json:"delivery_id"`
+	ExternalIssueID string             `json:"external_issue_id"`
+	RemoteUpdatedAt pgtype.Timestamptz `json:"remote_updated_at"`
+	State           string             `json:"state"`
+	Attempt         int32              `json:"attempt"`
+	WorkerID        string             `json:"worker_id"`
+	LeaseExpiresAt  pgtype.Timestamptz `json:"lease_expires_at"`
+	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ExternalIssueSyncRun struct {
+	ID              pgtype.UUID        `json:"id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	SourceID        pgtype.UUID        `json:"source_id"`
+	Kind            string             `json:"kind"`
+	State           string             `json:"state"`
+	FilterSnapshot  []byte             `json:"filter_snapshot"`
+	Cutoff          pgtype.Timestamptz `json:"cutoff"`
+	Cursor          string             `json:"cursor"`
+	ImportedCount   int64              `json:"imported_count"`
+	UpdatedCount    int64              `json:"updated_count"`
+	ConflictCount   int64              `json:"conflict_count"`
+	SkippedCount    int64              `json:"skipped_count"`
+	FailedCount     int64              `json:"failed_count"`
+	TotalSeen       int64              `json:"total_seen"`
+	ErrorSample     []byte             `json:"error_sample"`
+	Attempt         int32              `json:"attempt"`
+	WorkerID        string             `json:"worker_id"`
+	LeaseExpiresAt  pgtype.Timestamptz `json:"lease_expires_at"`
+	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
+	CancelRequested bool               `json:"cancel_requested"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	StartedAt       pgtype.Timestamptz `json:"started_at"`
+	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+}
+
 type Feedback struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`
