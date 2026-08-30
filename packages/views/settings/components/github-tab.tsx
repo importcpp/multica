@@ -32,6 +32,7 @@ import { AppLink, useNavigation } from "../../navigation";
 import { useT } from "../../i18n";
 import { SettingsTab } from "./settings-layout";
 import { GitHubMark } from "./github-mark";
+import { GitHubImportIssuesDialog } from "./github-import-issues-dialog";
 
 type SettingsKey =
   | "github_enabled"
@@ -209,13 +210,19 @@ export function GitHubTab() {
                     // Disconnect must stay reachable even when the master switch
                     // is off — disconnect is a separate intent (revoke the App
                     // grant) from hiding the feature.
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => setDisconnectTarget(primaryInstallation.id)}
-                    >
-                      {t(($) => $.github.disconnect)}
-                    </Button>
+                    <>
+                      <GitHubImportIssuesDialog
+                        workspaceId={wsId}
+                        installationId={primaryInstallation.id}
+                      />
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setDisconnectTarget(primaryInstallation.id)}
+                      >
+                        {t(($) => $.github.disconnect)}
+                      </Button>
+                    </>
                   ) : (
                     <Button
                       size="sm"

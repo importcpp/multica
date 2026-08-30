@@ -739,7 +739,27 @@
     "section_repositories": "リポジトリ",
     "repositories_shortcut_label": "リポジトリ URL はリポジトリタブにあります",
     "repositories_shortcut_link": "リポジトリを管理 →",
-    "toast_failed": "GitHub 設定を更新できませんでした"
+    "toast_failed": "GitHub 設定を更新できませんでした",
+    "import_issues": {
+      "trigger": "Issue をインポート",
+      "title": "GitHub から Issue をインポート",
+      "description": "接続済みリポジトリの Issue をこのワークスペースに取り込みます。プルリクエストはスキップされ、再実行すると既存の Issue を更新し、重複は作成しません。",
+      "repo_label": "リポジトリ",
+      "repo_placeholder": "owner/repo",
+      "state_label": "対象の Issue",
+      "state_open": "オープンのみ",
+      "state_closed": "クローズのみ",
+      "state_all": "すべて",
+      "close": "閉じる",
+      "submit": "インポート",
+      "submitting": "インポート中…",
+      "summary": "{{imported}} 件作成 · {{updated}} 件更新 · {{conflicts}} 件競合 · {{skipped}} 件スキップ · {{failed}} 件失敗",
+      "truncated_note": "バッチ上限に達しました。残りをインポートするには再実行してください。",
+      "toast_complete": "インポート完了：{{summary}}",
+      "toast_truncated": "最初のバッチをインポートしました（{{summary}}）。続けるには再実行してください。",
+      "toast_permission": "この GitHub インストールには Issues の読み取り権限がありません。アプリを再認可してから再試行してください。",
+      "toast_failed": "インポートに失敗しました"
+    }
   },
   "vcs": {
     "section_title": "Git providers (self-hosted)",

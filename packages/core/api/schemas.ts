@@ -62,6 +62,7 @@ import type {
   ListIssuesResponse,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
+  ImportGitHubIssuesResponse,
   ListLabelsResponse,
   ListWebhookDeliveriesResponse,
   IssueStatusEntry,
@@ -388,6 +389,30 @@ export const EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE: ListGitHubRepositoriesResp
   repositories: [],
   total_count: 0,
   next_page: null,
+};
+
+export const ImportGitHubIssuesResponseSchema = z.object({
+  source_id: z.string().optional().default(""),
+  run_id: z.string().optional().default(""),
+  imported: z.number().optional().default(0),
+  updated: z.number().optional().default(0),
+  conflicts: z.number().optional().default(0),
+  skipped: z.number().optional().default(0),
+  failed: z.number().optional().default(0),
+  total: z.number().optional().default(0),
+  truncated: z.boolean().optional().default(false),
+}).loose();
+
+export const EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE: ImportGitHubIssuesResponse = {
+  source_id: "",
+  run_id: "",
+  imported: 0,
+  updated: 0,
+  conflicts: 0,
+  skipped: 0,
+  failed: 0,
+  total: 0,
+  truncated: false,
 };
 
 export const GitHubPullRequestSchema = z.object({

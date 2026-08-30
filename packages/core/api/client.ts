@@ -165,6 +165,7 @@ import type {
   GitHubPullRequest,
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
+  ImportGitHubIssuesResponse,
   GitHubConnectResponse,
   ListVCSConnectionsResponse,
   ConnectVCSRequest,
@@ -407,9 +408,11 @@ import {
   GitHubConnectResponseSchema,
   ListGitHubInstallationsResponseSchema,
   ListGitHubRepositoriesResponseSchema,
+  ImportGitHubIssuesResponseSchema,
   EMPTY_GITHUB_CONNECT_RESPONSE,
   EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE,
   EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
+  EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
   RuntimeModelListRequestSchema,
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   SkillSchema,
@@ -4329,6 +4332,23 @@ export class ApiClient {
       ListGitHubRepositoriesResponseSchema,
       EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
       { endpoint: "GET /api/workspaces/:id/github/installations/:installationId/repositories" },
+    );
+  }
+
+  async importGitHubIssues(
+    workspaceId: string,
+    installationId: string,
+    body: { owner: string; repo: string; state?: string; project_id?: string },
+  ): Promise<ImportGitHubIssuesResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/github/installations/${installationId}/import-issues`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    return parseWithFallback(
+      raw,
+      ImportGitHubIssuesResponseSchema,
+      EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
+      { endpoint: "POST /api/workspaces/:id/github/installations/:installationId/import-issues" },
     );
   }
 

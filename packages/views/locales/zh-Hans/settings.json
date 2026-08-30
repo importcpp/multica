@@ -739,7 +739,27 @@
     "section_repositories": "代码仓库",
     "repositories_shortcut_label": "仓库 URL 仍在\"代码仓库\"标签页中管理",
     "repositories_shortcut_link": "前往管理 →",
-    "toast_failed": "更新 GitHub 设置失败"
+    "toast_failed": "更新 GitHub 设置失败",
+    "import_issues": {
+      "trigger": "导入 Issue",
+      "title": "从 GitHub 导入 Issue",
+      "description": "把已连接仓库的 Issue 拉取到本工作区。Pull Request 会被跳过；重复运行会更新已有 Issue，而不是重复创建。",
+      "repo_label": "仓库",
+      "repo_placeholder": "owner/repo",
+      "state_label": "导入范围",
+      "state_open": "仅开启的",
+      "state_closed": "仅关闭的",
+      "state_all": "全部",
+      "close": "关闭",
+      "submit": "导入",
+      "submitting": "导入中…",
+      "summary": "新建 {{imported}} · 更新 {{updated}} · 冲突 {{conflicts}} · 跳过 {{skipped}} · 失败 {{failed}}",
+      "truncated_note": "已达单次批量上限——再次运行以继续导入其余部分。",
+      "toast_complete": "导入完成：{{summary}}",
+      "toast_truncated": "已导入第一批（{{summary}}）。再次运行以继续。",
+      "toast_permission": "该 GitHub 安装尚未授予 Issues 读取权限。请重新授权应用后再试。",
+      "toast_failed": "导入失败"
+    }
   },
   "vcs": {
     "section_title": "Git 代码托管（自托管）",

@@ -153,3 +153,16 @@ export interface ListGitHubRepositoriesResponse {
   total_count: number;
   next_page: number | null;
 }
+
+export interface ImportGitHubIssuesResponse {
+  source_id: string;
+  run_id: string;
+  imported: number;
+  updated: number;
+  conflicts: number;
+  skipped: number;
+  failed: number;
+  total: number;
+  /** True when the import hit its page bound; a follow-up sync continues it. */
+  truncated: boolean;
+}

@@ -739,7 +739,27 @@
     "section_repositories": "저장소",
     "repositories_shortcut_label": "저장소 URL은 저장소 탭에 있습니다",
     "repositories_shortcut_link": "저장소 관리 →",
-    "toast_failed": "GitHub 설정을 업데이트하지 못했습니다"
+    "toast_failed": "GitHub 설정을 업데이트하지 못했습니다",
+    "import_issues": {
+      "trigger": "이슈 가져오기",
+      "title": "GitHub에서 이슈 가져오기",
+      "description": "연결된 저장소의 이슈를 이 워크스페이스로 가져옵니다. 풀 리퀘스트는 건너뛰며, 다시 실행하면 중복 생성 없이 기존 이슈를 업데이트합니다.",
+      "repo_label": "저장소",
+      "repo_placeholder": "owner/repo",
+      "state_label": "가져올 이슈",
+      "state_open": "열린 항목만",
+      "state_closed": "닫힌 항목만",
+      "state_all": "전체",
+      "close": "닫기",
+      "submit": "가져오기",
+      "submitting": "가져오는 중…",
+      "summary": "{{imported}}개 생성 · {{updated}}개 업데이트 · {{conflicts}}개 충돌 · {{skipped}}개 건너뜀 · {{failed}}개 실패",
+      "truncated_note": "일괄 처리 한도에 도달했습니다. 나머지를 가져오려면 다시 실행하세요.",
+      "toast_complete": "가져오기 완료: {{summary}}",
+      "toast_truncated": "첫 번째 배치를 가져왔습니다({{summary}}). 계속하려면 다시 실행하세요.",
+      "toast_permission": "이 GitHub 설치에 Issues 읽기 권한이 없습니다. 앱을 다시 승인한 후 다시 시도하세요.",
+      "toast_failed": "가져오기 실패"
+    }
   },
   "vcs": {
     "section_title": "Git providers (self-hosted)",

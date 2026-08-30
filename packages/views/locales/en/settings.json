@@ -741,7 +741,27 @@
     "section_repositories": "Repositories",
     "repositories_shortcut_label": "Repository URLs live in the Repositories tab",
     "repositories_shortcut_link": "Manage repositories →",
-    "toast_failed": "Failed to update GitHub settings"
+    "toast_failed": "Failed to update GitHub settings",
+    "import_issues": {
+      "trigger": "Import issues",
+      "title": "Import issues from GitHub",
+      "description": "Pull issues from a connected repository into this workspace. Pull requests are skipped; re-running updates existing issues instead of creating duplicates.",
+      "repo_label": "Repository",
+      "repo_placeholder": "owner/repo",
+      "state_label": "Which issues",
+      "state_open": "Open only",
+      "state_closed": "Closed only",
+      "state_all": "All",
+      "close": "Close",
+      "submit": "Import",
+      "submitting": "Importing…",
+      "summary": "{{imported}} imported · {{updated}} updated · {{conflicts}} conflicts · {{skipped}} skipped · {{failed}} failed",
+      "truncated_note": "Reached the batch limit — run again to import the rest.",
+      "toast_complete": "Import complete: {{summary}}",
+      "toast_truncated": "Imported a first batch ({{summary}}). Run again to continue.",
+      "toast_permission": "This GitHub installation has not granted Issues read access. Re-authorize the app, then try again.",
+      "toast_failed": "Import failed"
+    }
   },
   "vcs": {
     "section_title": "Git providers (self-hosted)",
