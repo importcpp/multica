@@ -233,3 +233,12 @@ func For(kind string) (Provider, bool) {
 	p, ok := registry[Kind(kind)]
 	return p, ok
 }
+
+// SetGitHubAPIBaseForTest points the GitHub adapter at base (e.g. an httptest
+// server) and returns a restore func. Test-only seam for callers in other
+// packages; production always uses the real api.github.com default.
+func SetGitHubAPIBaseForTest(base string) (restore func()) {
+	prev := apiBase
+	apiBase = base
+	return func() { apiBase = prev }
+}

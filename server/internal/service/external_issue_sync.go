@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/issueposition"
 	"github.com/multica-ai/multica/server/internal/util"
@@ -32,10 +33,26 @@ type ExternalIssueSyncService struct {
 	TxStarter TxStarter
 	Bus       *events.Bus
 	Issues    *IssueService
+	// Entitlements supplies the workspace issue-count policy so an import
+	// respects the same quota as any other create. Nil is the self-hosted
+	// unlimited path.
+	Entitlements entitlement.Provider
 }
 
 func NewExternalIssueSyncService(q *db.Queries, tx TxStarter, bus *events.Bus, issues *IssueService) *ExternalIssueSyncService {
-	return &ExternalIssueSyncService{Queries: q, TxStarter: tx, Bus: bus, Issues: issues}
+	svc := &ExternalIssueSyncService{Queries: q, TxStarter: tx, Bus: bus, Issues: issues}
+	if issues != nil {
+		svc.Entitlements = issues.Entitlements
+	}
+	return svc
+}
+
+// IsQuotaError reports whether err is the workspace issue-limit error, so the
+// worker can move a run to quota_blocked (preserving cursor) instead of marking
+// every remaining issue as failed.
+func IsQuotaError(err error) bool {
+	var e *IssueLimitReachedError
+	return errors.As(err, &e)
 }
 
 // ApplyOutcome is what Apply did with one remote issue, for run counters.
@@ -175,7 +192,7 @@ func (s *ExternalIssueSyncService) createBoundIssue(ctx context.Context, tx pgx.
 		}
 	}
 
-	number, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, IssueCountPolicy{})
+	number, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, ResolveIssueCountPolicy(ctx, s.Entitlements, p.WorkspaceID))
 	if err != nil {
 		return OutcomeFailed, db.Issue{}, db.Workspace{}, fmt.Errorf("allocate issue number: %w", err)
 	}

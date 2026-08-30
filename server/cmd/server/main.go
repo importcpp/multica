@@ -623,6 +623,9 @@ func main() {
 	if h.SeatCapacityWorker != nil {
 		go h.SeatCapacityWorker.Run(sweepCtx)
 	}
+	if h.ExternalIssueSyncWorker != nil {
+		go h.ExternalIssueSyncWorker.Run(sweepCtx)
+	}
 	if h.TelegramOutbound != nil {
 		h.TelegramOutbound.Start(sweepCtx)
 	}

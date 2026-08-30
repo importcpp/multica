@@ -18,18 +18,12 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// importIssuesMaxPages bounds one synchronous import so a huge repository cannot
-// hold an HTTP request (or the API rate budget) open indefinitely. Each page is
-// up to 100 issues. A run persists its cursor, so a follow-up sync resumes where
-// this one stopped rather than restarting — the async worker (PR6) removes the
-// bound entirely.
-const importIssuesMaxPages = 20
-
 // mintGitHubIssuesReadToken exchanges the App JWT for an installation token
 // scoped to issues:read + metadata:read. It reuses the same signing/header/
 // revoke helpers as the repository-browse path in github.go rather than copying
-// a third auth implementation.
-func mintGitHubIssuesReadToken(ctx context.Context, installationID int64) (string, func(), error) {
+// a third auth implementation. It is a package var so worker tests can inject a
+// fake token without a real GitHub App key.
+var mintGitHubIssuesReadToken = func(ctx context.Context, installationID int64) (string, func(), error) {
 	appJWT, err := signGitHubAppJWT(time.Now())
 	if err != nil {
 		return "", func() {}, err
@@ -94,21 +88,17 @@ type importGitHubIssuesRequest struct {
 }
 
 type importGitHubIssuesResponse struct {
-	SourceID  string `json:"source_id"`
-	RunID     string `json:"run_id"`
-	Imported  int64  `json:"imported"`
-	Updated   int64  `json:"updated"`
-	Conflicts int64  `json:"conflicts"`
-	Skipped   int64  `json:"skipped"`
-	Failed    int64  `json:"failed"`
-	Total     int64  `json:"total"`
-	Truncated bool   `json:"truncated"`
+	SourceID string `json:"source_id"`
+	RunID    string `json:"run_id"`
+	State    string `json:"state"`
 }
 
-// ImportGitHubIssues resolves the installation + repository, creates (or reuses)
-// a sync source and a run, and drives a bounded synchronous backfill through the
-// provider-neutral externalissue adapter and the atomic Apply. Admin-gated at
-// the router.
+// ImportGitHubIssues validates the installation + repository, creates (or
+// reuses) a provider-neutral sync source and a QUEUED run, then returns 202 so
+// a persistent worker drains the backfill out of band. It never paginates to
+// completion inside the request: a large repository would otherwise hold the
+// connection open, and a rate-limit or restart mid-import would lose progress.
+// The worker resumes from the run's cursor. Admin-gated at the router.
 func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 	workspaceUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
 	if !ok {
@@ -160,6 +150,10 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		projectID = pid
 	}
 
+	// Resolve the repo up front (fast, single call) so the source is keyed on a
+	// stable external ID and owner/repo is proven to belong to this
+	// installation before we queue any work. The token is discarded here; the
+	// worker mints its own per-claim from the stored installation credential.
 	token, revoke, err := mintGitHubIssuesReadToken(r.Context(), row.InstallationID)
 	if err != nil {
 		if errors.Is(err, errGitHubIssuesPermission) {
@@ -170,25 +164,27 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "failed to authenticate with github")
 		return
 	}
-	defer revoke()
-
 	provider, ok := externalissue.For("github")
 	if !ok {
+		revoke()
 		writeError(w, http.StatusInternalServerError, "github provider unavailable")
 		return
 	}
-	creds := externalissue.Credentials{Token: token}
-	repo, err := provider.ResolveRepository(r.Context(), creds, externalissue.RepositoryRef{FullPath: req.Owner + "/" + req.Repo})
+	repo, err := provider.ResolveRepository(r.Context(), externalissue.Credentials{Token: token},
+		externalissue.RepositoryRef{FullPath: req.Owner + "/" + req.Repo})
+	revoke()
 	if err != nil {
 		writeError(w, mapExternalIssueStatus(err), "failed to resolve repository")
 		return
 	}
 
-	// Create or reuse the source (dedup on stable identity).
+	// Create or reuse the source (dedup on stable identity). credential_id holds
+	// the installation UUID so the worker can mint a fresh token per claim.
 	source, err := h.Queries.UpsertExternalIssueSource(r.Context(), db.UpsertExternalIssueSourceParams{
 		WorkspaceID:          workspaceUUID,
 		Provider:             "github",
 		InstanceKey:          repo.InstanceKey,
+		CredentialID:         installationUUID,
 		RepositoryExternalID: repo.ExternalID,
 		RepositoryFullPath:   repo.FullPath,
 		TargetProjectID:      projectID,
@@ -202,98 +198,117 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A source allows only one active run (partial unique index). If one is
+	// already queued/running, report it instead of failing the request.
 	run, err := h.Queries.CreateExternalIssueSyncRun(r.Context(), db.CreateExternalIssueSyncRunParams{
 		WorkspaceID:    workspaceUUID,
 		SourceID:       source.ID,
 		Kind:           "backfill",
-		State:          "running",
+		State:          "queued",
 		FilterSnapshot: []byte(fmt.Sprintf(`{"state":%q}`, state)),
 	})
 	if err != nil {
+		if existing, ok := h.activeRunForSource(r.Context(), workspaceUUID, source.ID); ok {
+			writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
+				SourceID: util.UUIDToString(source.ID),
+				RunID:    util.UUIDToString(existing.ID),
+				State:    existing.State,
+			})
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to create import run")
 		return
 	}
 
-	resp := importGitHubIssuesResponse{
+	if h.ExternalIssueSyncWorker != nil {
+		h.ExternalIssueSyncWorker.Notify()
+	}
+	writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
 		SourceID: util.UUIDToString(source.ID),
 		RunID:    util.UUIDToString(run.ID),
-	}
-
-	var cursor externalissue.Cursor
-	filter := externalissue.IssueFilter{State: state}
-	for page := 0; page < importIssuesMaxPages; page++ {
-		result, err := provider.ListIssues(r.Context(), creds, repo, filter, cursor)
-		if err != nil {
-			_ = h.finishRun(r.Context(), run.ID, "failed", err.Error())
-			writeError(w, mapExternalIssueStatus(err), "failed to list issues")
-			return
-		}
-		for _, iss := range result.Issues {
-			resp.Total++
-			outcome, applyErr := h.ExternalIssueSync.Apply(r.Context(), service.ApplyParams{
-				WorkspaceID: workspaceUUID,
-				SourceID:    source.ID,
-				ProjectID:   projectID,
-				CreatorID:   actingUserID(r),
-				Remote:      toRemoteIssue(iss, repo),
-			})
-			if applyErr != nil {
-				resp.Failed++
-				continue
-			}
-			switch outcome {
-			case service.OutcomeImported:
-				resp.Imported++
-			case service.OutcomeUpdated:
-				resp.Updated++
-			case service.OutcomeConflict:
-				resp.Conflicts++
-			case service.OutcomeSkipped:
-				resp.Skipped++
-			default:
-				resp.Failed++
-			}
-		}
-		cursor = result.NextCursor
-		if cursor == "" {
-			break
-		}
-		if page == importIssuesMaxPages-1 {
-			resp.Truncated = true
-		}
-	}
-
-	finalState := "succeeded"
-	if resp.Truncated {
-		finalState = "partial"
-	}
-	_ = h.Queries.AdvanceExternalIssueSyncRun(r.Context(), db.AdvanceExternalIssueSyncRunParams{
-		ID:            run.ID,
-		Cursor:        string(cursor),
-		ImportedCount: resp.Imported,
-		UpdatedCount:  resp.Updated,
-		ConflictCount: resp.Conflicts,
-		SkippedCount:  resp.Skipped,
-		FailedCount:   resp.Failed,
-		TotalSeen:     resp.Total,
+		State:    "queued",
 	})
-	_ = h.finishRun(r.Context(), run.ID, finalState, "")
-
-	writeJSON(w, http.StatusOK, resp)
 }
 
-func (h *Handler) finishRun(ctx context.Context, runID pgtype.UUID, state, errMsg string) error {
-	sample := []byte("[]")
-	if errMsg != "" {
-		if b, err := json.Marshal([]string{errMsg}); err == nil {
-			sample = b
+// activeRunForSource returns the source's single active (queued/running) run.
+func (h *Handler) activeRunForSource(ctx context.Context, workspaceID, sourceID pgtype.UUID) (db.ExternalIssueSyncRun, bool) {
+	runs, err := h.Queries.ListExternalIssueSyncRunsBySource(ctx, db.ListExternalIssueSyncRunsBySourceParams{
+		SourceID: sourceID, Limit: 5,
+	})
+	if err != nil {
+		return db.ExternalIssueSyncRun{}, false
+	}
+	for _, run := range runs {
+		if run.WorkspaceID == workspaceID && (run.State == "queued" || run.State == "running") {
+			return run, true
 		}
 	}
-	return h.Queries.FinishExternalIssueSyncRun(ctx, db.FinishExternalIssueSyncRunParams{
-		ID:          runID,
-		State:       state,
-		ErrorSample: sample,
+	return db.ExternalIssueSyncRun{}, false
+}
+
+type syncRunStatusResponse struct {
+	RunID     string `json:"run_id"`
+	SourceID  string `json:"source_id"`
+	State     string `json:"state"`
+	Imported  int64  `json:"imported"`
+	Updated   int64  `json:"updated"`
+	Conflicts int64  `json:"conflicts"`
+	Skipped   int64  `json:"skipped"`
+	Failed    int64  `json:"failed"`
+	Total     int64  `json:"total"`
+	Cancel    bool   `json:"cancel_requested"`
+}
+
+// GetSyncRun returns one run's progress so the UI can poll created/updated/
+// conflict/failed and the terminal state. Admin-gated at the router.
+func (h *Handler) GetSyncRun(w http.ResponseWriter, r *http.Request) {
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
+	if !ok {
+		return
+	}
+	runUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runId"), "runId")
+	if !ok {
+		return
+	}
+	run, err := h.Queries.GetExternalIssueSyncRun(r.Context(), db.GetExternalIssueSyncRunParams{
+		ID: runUUID, WorkspaceID: workspaceUUID,
 	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "sync run not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, syncRunStatusResponse{
+		RunID:     util.UUIDToString(run.ID),
+		SourceID:  util.UUIDToString(run.SourceID),
+		State:     run.State,
+		Imported:  run.ImportedCount,
+		Updated:   run.UpdatedCount,
+		Conflicts: run.ConflictCount,
+		Skipped:   run.SkippedCount,
+		Failed:    run.FailedCount,
+		Total:     run.TotalSeen,
+		Cancel:    run.CancelRequested,
+	})
+}
+
+// CancelSyncRun requests cooperative cancellation; the worker stops at its next
+// page boundary and finalizes the run as cancelled. Admin-gated at the router.
+func (h *Handler) CancelSyncRun(w http.ResponseWriter, r *http.Request) {
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
+	if !ok {
+		return
+	}
+	runUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "runId"), "runId")
+	if !ok {
+		return
+	}
+	if err := h.Queries.RequestExternalIssueSyncRunCancel(r.Context(), db.RequestExternalIssueSyncRunCancelParams{
+		ID: runUUID, WorkspaceID: workspaceUUID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to request cancellation")
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func toRemoteIssue(iss externalissue.Issue, repo externalissue.Repository) service.RemoteIssue {

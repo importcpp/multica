@@ -173,19 +173,20 @@ type DaemonPendingWorkNotifier interface {
 }
 
 type Handler struct {
-	Queries                *db.Queries
-	DB                     dbExecutor
-	TxStarter              txStarter
-	Hub                    *realtime.Hub
-	DaemonHub              *daemonws.Hub
-	DaemonProfileRefresh   RuntimeProfileRefreshNotifier
-	DaemonWorkspaceRefresh WorkspaceSetRefreshNotifier
-	Bus                    *events.Bus
-	TaskService            *service.TaskService
-	PluginService          *service.PluginService
-	IssueService           *service.IssueService
-	ExternalIssueSync      *service.ExternalIssueSyncService
-	AutopilotService       *service.AutopilotService
+	Queries                 *db.Queries
+	DB                      dbExecutor
+	TxStarter               txStarter
+	Hub                     *realtime.Hub
+	DaemonHub               *daemonws.Hub
+	DaemonProfileRefresh    RuntimeProfileRefreshNotifier
+	DaemonWorkspaceRefresh  WorkspaceSetRefreshNotifier
+	Bus                     *events.Bus
+	TaskService             *service.TaskService
+	PluginService           *service.PluginService
+	IssueService            *service.IssueService
+	ExternalIssueSync       *service.ExternalIssueSyncService
+	ExternalIssueSyncWorker *ExternalIssueSyncWorker
+	AutopilotService        *service.AutopilotService
 	// Entitlements supplies workspace-scoped commercial gates. A nil provider
 	// preserves self-hosted behavior without extra reads.
 	Entitlements entitlement.Provider
@@ -493,6 +494,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	// External-issue sync (import issues from GitHub/GitLab). Reuses the shared
 	// IssueService create/update core through its own atomic Apply.
 	h.ExternalIssueSync = service.NewExternalIssueSyncService(queries, txStarter, bus, h.IssueService)
+	h.ExternalIssueSyncWorker = NewExternalIssueSyncWorker(h)
 
 	return h
 }
