@@ -169,6 +169,9 @@ SET last_used_at = now()
 WHERE id = ANY($1::uuid[])
 `
 
+// Batch last_used_at refresh, called by the background PATLastUsedRecorder.
+// now() records flush time, not exact use time; the ~30s flush window makes
+// the skew irrelevant for a display-only timestamp.
 func (q *Queries) UpdatePersonalAccessTokensLastUsed(ctx context.Context, ids []pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, updatePersonalAccessTokensLastUsed, ids)
 	return err
