@@ -166,6 +166,7 @@ import type {
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
   ImportGitHubIssuesResponse,
+  SyncRunStatus,
   GitHubConnectResponse,
   ListVCSConnectionsResponse,
   ConnectVCSRequest,
@@ -409,10 +410,12 @@ import {
   ListGitHubInstallationsResponseSchema,
   ListGitHubRepositoriesResponseSchema,
   ImportGitHubIssuesResponseSchema,
+  SyncRunStatusSchema,
   EMPTY_GITHUB_CONNECT_RESPONSE,
   EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE,
   EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
   EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
+  EMPTY_SYNC_RUN_STATUS,
   RuntimeModelListRequestSchema,
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   SkillSchema,
@@ -4349,6 +4352,22 @@ export class ApiClient {
       ImportGitHubIssuesResponseSchema,
       EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
       { endpoint: "POST /api/workspaces/:id/github/installations/:installationId/import-issues" },
+    );
+  }
+
+  async getExternalIssueSyncRun(workspaceId: string, runId: string): Promise<SyncRunStatus> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/external-issue-sync-runs/${runId}`,
+    );
+    return parseWithFallback(raw, SyncRunStatusSchema, EMPTY_SYNC_RUN_STATUS, {
+      endpoint: "GET /api/workspaces/:id/external-issue-sync-runs/:runId",
+    });
+  }
+
+  async cancelExternalIssueSyncRun(workspaceId: string, runId: string): Promise<void> {
+    await this.fetch(
+      `/api/workspaces/${workspaceId}/external-issue-sync-runs/${runId}/cancel`,
+      { method: "POST" },
     );
   }
 

@@ -157,12 +157,20 @@ export interface ListGitHubRepositoriesResponse {
 export interface ImportGitHubIssuesResponse {
   source_id: string;
   run_id: string;
+  /** Run state at enqueue time: "queued" (or an existing active run's state). */
+  state: string;
+}
+
+export interface SyncRunStatus {
+  run_id: string;
+  source_id: string;
+  /** queued | running | succeeded | partial | failed | cancelled | quota_blocked | needs_reauth */
+  state: string;
   imported: number;
   updated: number;
   conflicts: number;
   skipped: number;
   failed: number;
   total: number;
-  /** True when the import hit its page bound; a follow-up sync continues it. */
-  truncated: boolean;
+  cancel_requested: boolean;
 }

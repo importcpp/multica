@@ -754,13 +754,23 @@
       "state_all": "All",
       "close": "Close",
       "submit": "Import",
-      "submitting": "Importing…",
       "summary": "{{imported}} imported · {{updated}} updated · {{conflicts}} conflicts · {{skipped}} skipped · {{failed}} failed",
-      "truncated_note": "Reached the batch limit — run again to import the rest.",
-      "toast_complete": "Import complete: {{summary}}",
-      "toast_truncated": "Imported a first batch ({{summary}}). Run again to continue.",
       "toast_permission": "This GitHub installation has not granted Issues read access. Re-authorize the app, then try again.",
-      "toast_failed": "Import failed"
+      "toast_failed": "Import failed",
+      "toast_queued": "Import queued. Progress will update below.",
+      "toast_started": "Import started",
+      "state_label_progress": "Progress",
+      "cancel": "Cancel import",
+      "cancelling": "Cancelling…",
+      "state_queued": "Queued…",
+      "state_running": "Importing…",
+      "state_succeeded": "Import complete",
+      "state_partial": "Partially imported",
+      "state_failed": "Import failed",
+      "state_cancelled": "Import cancelled",
+      "state_quota_blocked": "Stopped: workspace issue limit reached",
+      "state_needs_reauth": "Re-authorize the GitHub app to continue",
+      "toast_cancel_requested": "Cancellation requested"
     }
   },
   "vcs": {

@@ -752,13 +752,23 @@
       "state_all": "全部",
       "close": "关闭",
       "submit": "导入",
-      "submitting": "导入中…",
       "summary": "新建 {{imported}} · 更新 {{updated}} · 冲突 {{conflicts}} · 跳过 {{skipped}} · 失败 {{failed}}",
-      "truncated_note": "已达单次批量上限——再次运行以继续导入其余部分。",
-      "toast_complete": "导入完成：{{summary}}",
-      "toast_truncated": "已导入第一批（{{summary}}）。再次运行以继续。",
       "toast_permission": "该 GitHub 安装尚未授予 Issues 读取权限。请重新授权应用后再试。",
-      "toast_failed": "导入失败"
+      "toast_failed": "导入失败",
+      "toast_queued": "导入已排队，进度将在下方更新。",
+      "toast_started": "导入已开始",
+      "state_label_progress": "进度",
+      "cancel": "取消导入",
+      "cancelling": "取消中…",
+      "state_queued": "排队中…",
+      "state_running": "导入中…",
+      "state_succeeded": "导入完成",
+      "state_partial": "部分导入",
+      "state_failed": "导入失败",
+      "state_cancelled": "导入已取消",
+      "state_quota_blocked": "已停止：达到工作区 Issue 上限",
+      "state_needs_reauth": "请重新授权 GitHub 应用以继续",
+      "toast_cancel_requested": "已请求取消"
     }
   },
   "vcs": {

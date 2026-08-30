@@ -63,6 +63,7 @@ import type {
   ListGitHubInstallationsResponse,
   ListGitHubRepositoriesResponse,
   ImportGitHubIssuesResponse,
+  SyncRunStatus,
   ListLabelsResponse,
   ListWebhookDeliveriesResponse,
   IssueStatusEntry,
@@ -394,25 +395,39 @@ export const EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE: ListGitHubRepositoriesResp
 export const ImportGitHubIssuesResponseSchema = z.object({
   source_id: z.string().optional().default(""),
   run_id: z.string().optional().default(""),
+  state: z.string().optional().default(""),
+}).loose();
+
+export const EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE: ImportGitHubIssuesResponse = {
+  source_id: "",
+  run_id: "",
+  state: "",
+};
+
+export const SyncRunStatusSchema = z.object({
+  run_id: z.string().optional().default(""),
+  source_id: z.string().optional().default(""),
+  state: z.string().optional().default(""),
   imported: z.number().optional().default(0),
   updated: z.number().optional().default(0),
   conflicts: z.number().optional().default(0),
   skipped: z.number().optional().default(0),
   failed: z.number().optional().default(0),
   total: z.number().optional().default(0),
-  truncated: z.boolean().optional().default(false),
+  cancel_requested: z.boolean().optional().default(false),
 }).loose();
 
-export const EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE: ImportGitHubIssuesResponse = {
-  source_id: "",
+export const EMPTY_SYNC_RUN_STATUS: SyncRunStatus = {
   run_id: "",
+  source_id: "",
+  state: "",
   imported: 0,
   updated: 0,
   conflicts: 0,
   skipped: 0,
   failed: 0,
   total: 0,
-  truncated: false,
+  cancel_requested: false,
 };
 
 export const GitHubPullRequestSchema = z.object({

@@ -752,13 +752,23 @@
       "state_all": "전체",
       "close": "닫기",
       "submit": "가져오기",
-      "submitting": "가져오는 중…",
       "summary": "{{imported}}개 생성 · {{updated}}개 업데이트 · {{conflicts}}개 충돌 · {{skipped}}개 건너뜀 · {{failed}}개 실패",
-      "truncated_note": "일괄 처리 한도에 도달했습니다. 나머지를 가져오려면 다시 실행하세요.",
-      "toast_complete": "가져오기 완료: {{summary}}",
-      "toast_truncated": "첫 번째 배치를 가져왔습니다({{summary}}). 계속하려면 다시 실행하세요.",
       "toast_permission": "이 GitHub 설치에 Issues 읽기 권한이 없습니다. 앱을 다시 승인한 후 다시 시도하세요.",
-      "toast_failed": "가져오기 실패"
+      "toast_failed": "가져오기 실패",
+      "toast_queued": "가져오기가 대기열에 추가되었습니다. 진행 상황이 아래에 표시됩니다.",
+      "toast_started": "가져오기를 시작했습니다",
+      "state_label_progress": "진행 상황",
+      "cancel": "가져오기 취소",
+      "cancelling": "취소 중…",
+      "state_queued": "대기 중…",
+      "state_running": "가져오는 중…",
+      "state_succeeded": "가져오기 완료",
+      "state_partial": "일부 가져옴",
+      "state_failed": "가져오기 실패",
+      "state_cancelled": "가져오기 취소됨",
+      "state_quota_blocked": "중지됨: 워크스페이스 이슈 한도 도달",
+      "state_needs_reauth": "계속하려면 GitHub 앱을 다시 승인하세요",
+      "toast_cancel_requested": "취소를 요청했습니다"
     }
   },
   "vcs": {

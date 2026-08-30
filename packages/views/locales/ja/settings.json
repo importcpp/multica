@@ -752,13 +752,23 @@
       "state_all": "すべて",
       "close": "閉じる",
       "submit": "インポート",
-      "submitting": "インポート中…",
       "summary": "{{imported}} 件作成 · {{updated}} 件更新 · {{conflicts}} 件競合 · {{skipped}} 件スキップ · {{failed}} 件失敗",
-      "truncated_note": "バッチ上限に達しました。残りをインポートするには再実行してください。",
-      "toast_complete": "インポート完了：{{summary}}",
-      "toast_truncated": "最初のバッチをインポートしました（{{summary}}）。続けるには再実行してください。",
       "toast_permission": "この GitHub インストールには Issues の読み取り権限がありません。アプリを再認可してから再試行してください。",
-      "toast_failed": "インポートに失敗しました"
+      "toast_failed": "インポートに失敗しました",
+      "toast_queued": "インポートをキューに追加しました。進捗は下に表示されます。",
+      "toast_started": "インポートを開始しました",
+      "state_label_progress": "進捗",
+      "cancel": "インポートを取消",
+      "cancelling": "取消中…",
+      "state_queued": "キュー待ち…",
+      "state_running": "インポート中…",
+      "state_succeeded": "インポート完了",
+      "state_partial": "一部インポート",
+      "state_failed": "インポート失敗",
+      "state_cancelled": "インポートを取消しました",
+      "state_quota_blocked": "停止：ワークスペースの Issue 上限に達しました",
+      "state_needs_reauth": "続行するには GitHub アプリを再認可してください",
+      "toast_cancel_requested": "取消をリクエストしました"
     }
   },
   "vcs": {
