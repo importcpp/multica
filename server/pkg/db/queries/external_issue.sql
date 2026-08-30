@@ -68,6 +68,17 @@ UPDATE external_issue_source SET
     updated_at = now()
 WHERE workspace_id = $1 AND target_project_id = $2;
 
+-- name: PauseExternalIssueSourcesByProviderInstance :exec
+-- Disconnecting a provider account (e.g. removing a GitHub installation) pauses
+-- that provider/instance's sources for the workspace without deleting them or
+-- their imported issues, so a reconnect + re-import stays idempotent. Provenance
+-- (links) is preserved.
+UPDATE external_issue_source SET
+    credential_id = NULL,
+    state = 'needs_reauth',
+    updated_at = now()
+WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3;
+
 -- name: DeleteExternalIssueSourcesByWorkspace :exec
 DELETE FROM external_issue_source WHERE workspace_id = $1;
 

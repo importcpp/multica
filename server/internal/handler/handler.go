@@ -184,6 +184,7 @@ type Handler struct {
 	TaskService            *service.TaskService
 	PluginService          *service.PluginService
 	IssueService           *service.IssueService
+	ExternalIssueSync      *service.ExternalIssueSyncService
 	AutopilotService       *service.AutopilotService
 	// Entitlements supplies workspace-scoped commercial gates. A nil provider
 	// preserves self-hosted behavior without extra reads.
@@ -488,6 +489,10 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		slog.Warn("github: PR snapshot pipeline disabled (invalid App private key)", "err", err)
 	}
 	h.PRRefresh = ghsnapshot.NewManager(ghClient, queries, txStarter, h.broadcastPRSnapshotApplied)
+
+	// External-issue sync (import issues from GitHub/GitLab). Reuses the shared
+	// IssueService create/update core through its own atomic Apply.
+	h.ExternalIssueSync = service.NewExternalIssueSyncService(queries, txStarter, bus, h.IssueService)
 
 	return h
 }

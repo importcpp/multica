@@ -486,6 +486,18 @@ deleted_lark_user_bindings AS (
 ),
 deleted_lark_binding_tokens AS (
     DELETE FROM lark_binding_token WHERE workspace_id = $1
+),
+deleted_external_issue_events AS (
+    DELETE FROM external_issue_sync_event WHERE workspace_id = $1
+),
+deleted_external_issue_runs AS (
+    DELETE FROM external_issue_sync_run WHERE workspace_id = $1
+),
+deleted_external_issue_links AS (
+    DELETE FROM external_issue_link WHERE workspace_id = $1
+),
+deleted_external_issue_sources AS (
+    DELETE FROM external_issue_source WHERE workspace_id = $1
 )
 -- Keep the two-system cleanup ledger until object storage has been settled.
 -- Moving every row out of pending also prevents a concurrent media bind from

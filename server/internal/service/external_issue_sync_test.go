@@ -216,16 +216,29 @@ func TestApplyTombstoneNotResurrected(t *testing.T) {
 	if _, err := f.svc.Apply(ctx, f.params(f.remote("400", 4, "T", "B", t0))); err != nil {
 		t.Fatalf("import: %v", err)
 	}
-	// Simulate a local delete: clear the binding, stamp tombstone.
-	if _, err := pool.Exec(ctx, `
-		UPDATE external_issue_link SET issue_id = NULL, local_deleted_at = now()
-		WHERE workspace_id = $1 AND external_issue_id = '400'`, f.workspaceID); err != nil {
-		t.Fatalf("tombstone: %v", err)
+	// Delete the issue through the real DeleteIssue query, which must tombstone
+	// the link (clear issue_id, stamp local_deleted_at) rather than drop it.
+	link, err := f.queries.GetExternalIssueLinkByIdentity(ctx, db.GetExternalIssueLinkByIdentityParams{
+		WorkspaceID: f.workspaceID, Provider: "github", InstanceKey: "github.com", ExternalIssueID: "400",
+	})
+	if err != nil {
+		t.Fatalf("get link: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `DELETE FROM issue WHERE workspace_id = $1`, f.workspaceID); err != nil {
+	if err := f.queries.DeleteIssue(ctx, db.DeleteIssueParams{ID: link.IssueID, WorkspaceID: f.workspaceID}); err != nil {
 		t.Fatalf("delete issue: %v", err)
 	}
+	// The link must survive as a tombstone.
+	link, err = f.queries.GetExternalIssueLinkByIdentity(ctx, db.GetExternalIssueLinkByIdentityParams{
+		WorkspaceID: f.workspaceID, Provider: "github", InstanceKey: "github.com", ExternalIssueID: "400",
+	})
+	if err != nil {
+		t.Fatalf("link should survive delete as a tombstone: %v", err)
+	}
+	if link.IssueID.Valid || !link.LocalDeletedAt.Valid {
+		t.Fatalf("link should be tombstoned (issue_id cleared, local_deleted_at set): %+v", link)
+	}
 
+	// A later sync must NOT resurrect the deleted issue.
 	out, err := f.svc.Apply(ctx, f.params(f.remote("400", 4, "T", "B", t0.Add(time.Minute))))
 	if err != nil || out != OutcomeSkipped {
 		t.Fatalf("tombstoned apply = (%v, %v), want skipped", out, err)

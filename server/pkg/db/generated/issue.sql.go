@@ -377,6 +377,16 @@ WITH target AS (
 ),
 cleared_vcs_pr_links AS (
     DELETE FROM issue_vcs_pull_request WHERE issue_id IN (SELECT target.id FROM target)
+),
+tombstoned_import_links AS (
+    -- external_issue_link (migration 443) has no FK to issue. A local delete
+    -- must NOT drop the link, or the next reconcile would re-create the issue:
+    -- clear the binding and stamp a tombstone so sync treats it as ignored
+    -- until the user explicitly re-imports. Workspace-scoped through target for
+    -- the same cross-tenant safety as the PR-link sweep above.
+    UPDATE external_issue_link
+    SET issue_id = NULL, local_deleted_at = now(), updated_at = now()
+    WHERE issue_id IN (SELECT target.id FROM target)
 )
 DELETE FROM issue WHERE issue.id IN (SELECT target.id FROM target)
 `

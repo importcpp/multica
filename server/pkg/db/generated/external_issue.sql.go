@@ -855,6 +855,29 @@ func (q *Queries) PauseExternalIssueSourcesByCredential(ctx context.Context, arg
 	return err
 }
 
+const pauseExternalIssueSourcesByProviderInstance = `-- name: PauseExternalIssueSourcesByProviderInstance :exec
+UPDATE external_issue_source SET
+    credential_id = NULL,
+    state = 'needs_reauth',
+    updated_at = now()
+WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3
+`
+
+type PauseExternalIssueSourcesByProviderInstanceParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Provider    string      `json:"provider"`
+	InstanceKey string      `json:"instance_key"`
+}
+
+// Disconnecting a provider account (e.g. removing a GitHub installation) pauses
+// that provider/instance's sources for the workspace without deleting them or
+// their imported issues, so a reconnect + re-import stays idempotent. Provenance
+// (links) is preserved.
+func (q *Queries) PauseExternalIssueSourcesByProviderInstance(ctx context.Context, arg PauseExternalIssueSourcesByProviderInstanceParams) error {
+	_, err := q.db.Exec(ctx, pauseExternalIssueSourcesByProviderInstance, arg.WorkspaceID, arg.Provider, arg.InstanceKey)
+	return err
+}
+
 const requestExternalIssueSyncRunCancel = `-- name: RequestExternalIssueSyncRunCancel :exec
 UPDATE external_issue_sync_run SET
     cancel_requested = true,
