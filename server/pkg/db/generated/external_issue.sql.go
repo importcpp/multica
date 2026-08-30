@@ -102,38 +102,63 @@ func (q *Queries) BindExternalIssueLinkIssue(ctx context.Context, arg BindExtern
 const claimExternalIssueLink = `-- name: ClaimExternalIssueLink :one
 INSERT INTO external_issue_link (
     workspace_id, provider, instance_key, external_issue_id,
-    source_id, issue_id, display_number, external_html_url,
-    remote_state, remote_updated_at, title_baseline_hash, body_baseline_hash
+    source_id, display_number, external_html_url,
+    remote_state, remote_updated_at
 ) VALUES (
     $1, $2, $3, $4,
-    $10, $11, $5, $6,
-    $7, $12, $8, $9
+    $8, $5, $6,
+    $7, $9
 )
 ON CONFLICT (workspace_id, provider, instance_key, external_issue_id) DO UPDATE SET
     updated_at = now()
-RETURNING id, workspace_id, provider, instance_key, external_issue_id, source_id, issue_id, display_number, external_html_url, remote_state, remote_updated_at, title_baseline_hash, body_baseline_hash, title_conflict, body_conflict, title_local_owned, body_local_owned, moved, local_deleted_at, created_at, updated_at
+RETURNING id, workspace_id, provider, instance_key, external_issue_id, source_id, issue_id, display_number, external_html_url, remote_state, remote_updated_at, title_baseline_hash, body_baseline_hash, title_conflict, body_conflict, title_local_owned, body_local_owned, moved, local_deleted_at, created_at, updated_at, (xmax = 0) AS inserted
 `
 
 type ClaimExternalIssueLinkParams struct {
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	Provider        string             `json:"provider"`
+	InstanceKey     string             `json:"instance_key"`
+	ExternalIssueID string             `json:"external_issue_id"`
+	DisplayNumber   int64              `json:"display_number"`
+	ExternalHtmlUrl string             `json:"external_html_url"`
+	RemoteState     string             `json:"remote_state"`
+	SourceID        pgtype.UUID        `json:"source_id"`
+	RemoteUpdatedAt pgtype.Timestamptz `json:"remote_updated_at"`
+}
+
+type ClaimExternalIssueLinkRow struct {
+	ID                pgtype.UUID        `json:"id"`
 	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
 	Provider          string             `json:"provider"`
 	InstanceKey       string             `json:"instance_key"`
 	ExternalIssueID   string             `json:"external_issue_id"`
+	SourceID          pgtype.UUID        `json:"source_id"`
+	IssueID           pgtype.UUID        `json:"issue_id"`
 	DisplayNumber     int64              `json:"display_number"`
 	ExternalHtmlUrl   string             `json:"external_html_url"`
 	RemoteState       string             `json:"remote_state"`
+	RemoteUpdatedAt   pgtype.Timestamptz `json:"remote_updated_at"`
 	TitleBaselineHash string             `json:"title_baseline_hash"`
 	BodyBaselineHash  string             `json:"body_baseline_hash"`
-	SourceID          pgtype.UUID        `json:"source_id"`
-	IssueID           pgtype.UUID        `json:"issue_id"`
-	RemoteUpdatedAt   pgtype.Timestamptz `json:"remote_updated_at"`
+	TitleConflict     bool               `json:"title_conflict"`
+	BodyConflict      bool               `json:"body_conflict"`
+	TitleLocalOwned   bool               `json:"title_local_owned"`
+	BodyLocalOwned    bool               `json:"body_local_owned"`
+	Moved             bool               `json:"moved"`
+	LocalDeletedAt    pgtype.Timestamptz `json:"local_deleted_at"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	Inserted          bool               `json:"inserted"`
 }
 
-// Race-safe claim of a remote issue on stable identity. The winner inserts and
-// binds issue_id; a concurrent claimer conflicts on the unique identity index
-// and reads back the existing row (issue_id may be NULL if a tombstone). The
-// caller decides create-vs-update from whether issue_id came back set.
-func (q *Queries) ClaimExternalIssueLink(ctx context.Context, arg ClaimExternalIssueLinkParams) (ExternalIssueLink, error) {
+// Race-safe claim of a remote issue on stable identity. Two concurrent
+// claimers both reach ON CONFLICT, but only the row that was actually INSERTED
+// has xmax = 0; the conflicter gets the existing row with inserted = false. The
+// caller creates a Multica issue only when inserted = true, so a manual import
+// racing a webhook can never create two issues for one remote issue. On a
+// conflict the existing binding (issue_id, tombstone) is returned unchanged so
+// the caller can route to the update / ignored path.
+func (q *Queries) ClaimExternalIssueLink(ctx context.Context, arg ClaimExternalIssueLinkParams) (ClaimExternalIssueLinkRow, error) {
 	row := q.db.QueryRow(ctx, claimExternalIssueLink,
 		arg.WorkspaceID,
 		arg.Provider,
@@ -142,13 +167,10 @@ func (q *Queries) ClaimExternalIssueLink(ctx context.Context, arg ClaimExternalI
 		arg.DisplayNumber,
 		arg.ExternalHtmlUrl,
 		arg.RemoteState,
-		arg.TitleBaselineHash,
-		arg.BodyBaselineHash,
 		arg.SourceID,
-		arg.IssueID,
 		arg.RemoteUpdatedAt,
 	)
-	var i ExternalIssueLink
+	var i ClaimExternalIssueLinkRow
 	err := row.Scan(
 		&i.ID,
 		&i.WorkspaceID,
@@ -171,6 +193,7 @@ func (q *Queries) ClaimExternalIssueLink(ctx context.Context, arg ClaimExternalI
 		&i.LocalDeletedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.Inserted,
 	)
 	return i, err
 }

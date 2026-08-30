@@ -84,22 +84,25 @@ SELECT * FROM external_issue_link
 WHERE workspace_id = $1 AND issue_id = $2;
 
 -- name: ClaimExternalIssueLink :one
--- Race-safe claim of a remote issue on stable identity. The winner inserts and
--- binds issue_id; a concurrent claimer conflicts on the unique identity index
--- and reads back the existing row (issue_id may be NULL if a tombstone). The
--- caller decides create-vs-update from whether issue_id came back set.
+-- Race-safe claim of a remote issue on stable identity. Two concurrent
+-- claimers both reach ON CONFLICT, but only the row that was actually INSERTED
+-- has xmax = 0; the conflicter gets the existing row with inserted = false. The
+-- caller creates a Multica issue only when inserted = true, so a manual import
+-- racing a webhook can never create two issues for one remote issue. On a
+-- conflict the existing binding (issue_id, tombstone) is returned unchanged so
+-- the caller can route to the update / ignored path.
 INSERT INTO external_issue_link (
     workspace_id, provider, instance_key, external_issue_id,
-    source_id, issue_id, display_number, external_html_url,
-    remote_state, remote_updated_at, title_baseline_hash, body_baseline_hash
+    source_id, display_number, external_html_url,
+    remote_state, remote_updated_at
 ) VALUES (
     $1, $2, $3, $4,
-    sqlc.narg('source_id'), sqlc.narg('issue_id'), $5, $6,
-    $7, sqlc.narg('remote_updated_at'), $8, $9
+    sqlc.narg('source_id'), $5, $6,
+    $7, sqlc.narg('remote_updated_at')
 )
 ON CONFLICT (workspace_id, provider, instance_key, external_issue_id) DO UPDATE SET
     updated_at = now()
-RETURNING *;
+RETURNING *, (xmax = 0) AS inserted;
 
 -- name: BindExternalIssueLinkIssue :exec
 -- Bind a freshly created Multica issue to a link the winner claimed.
