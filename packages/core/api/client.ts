@@ -4371,6 +4371,19 @@ export class ApiClient {
     );
   }
 
+  async resumeExternalIssueSyncRun(workspaceId: string, runId: string): Promise<ImportGitHubIssuesResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/external-issue-sync-runs/${runId}/resume`,
+      { method: "POST" },
+    );
+    return parseWithFallback(
+      raw,
+      ImportGitHubIssuesResponseSchema,
+      EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
+      { endpoint: "POST /api/workspaces/:id/external-issue-sync-runs/:runId/resume" },
+    );
+  }
+
   async deleteGitHubInstallation(workspaceId: string, installationId: string): Promise<void> {
     await this.fetch(`/api/workspaces/${workspaceId}/github/installations/${installationId}`, {
       method: "DELETE",

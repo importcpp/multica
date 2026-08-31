@@ -33,6 +33,13 @@ const TERMINAL_STATES = new Set([
   "needs_reauth",
 ]);
 
+// States a user can resume from (re-queues the SAME run from its saved cursor).
+const RESUMABLE_STATES = new Set(["quota_blocked", "needs_reauth", "failed"]);
+
+// Cap for the empty/garbage-state poll: if the server keeps returning an empty
+// state (drift), stop after this many ticks instead of polling forever.
+const MAX_EMPTY_POLLS = 20;
+
 interface GitHubImportIssuesDialogProps {
   workspaceId: string;
   installationId: string;
@@ -61,10 +68,12 @@ export function GitHubImportIssuesDialog({
   const [status, setStatus] = useState<SyncRunStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const parsed = splitOwnerRepo(fullPath);
   const isRunning = runId !== null && !(status && TERMINAL_STATES.has(status.state));
   const canSubmit = parsed !== null && !starting && !isRunning;
+  const canResume = status !== null && RESUMABLE_STATES.has(status.state) && !resuming;
 
   // Localized label for a run state. Unknown/in-flight states fall back to the
   // running label (server-driven enum: always has a default branch).
@@ -96,20 +105,29 @@ export function GitHubImportIssuesDialog({
   useEffect(() => {
     if (!runId) return;
     let stopped = false;
+    let emptyPolls = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
     async function tick() {
       try {
         const s = await api.getExternalIssueSyncRun(workspaceId, runId!);
         if (stopped) return;
-        // Guard against a drift/garbage status (empty state) causing an
-        // infinite poll: treat it as still running but keep polling only while
-        // the run id is real.
         setStatus(s);
         if (s.state && TERMINAL_STATES.has(s.state)) {
           stopped = true;
           void qc.invalidateQueries({ queryKey: issueKeys.all(workspaceId) });
           void qc.invalidateQueries({ queryKey: githubKeys.all(workspaceId) });
           return;
+        }
+        // A persistently empty state means backend drift, not progress: stop
+        // after a bounded number of ticks instead of polling forever.
+        if (!s.state) {
+          emptyPolls++;
+          if (emptyPolls >= MAX_EMPTY_POLLS) {
+            stopped = true;
+            return;
+          }
+        } else {
+          emptyPolls = 0;
         }
       } catch {
         // Transient poll failure: fall through and retry on the next tick.
@@ -123,6 +141,27 @@ export function GitHubImportIssuesDialog({
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, workspaceId]);
+
+  async function handleResume() {
+    if (!runId) return;
+    setResuming(true);
+    try {
+      const res = await api.resumeExternalIssueSyncRun(workspaceId, runId);
+      if (!res.run_id) {
+        toast.error(t(($) => $.github.import_issues.toast_failed));
+        return;
+      }
+      // Resume returns the same run id; reset status so the poll loop restarts
+      // and the UI shows progress again.
+      setStatus(null);
+      setRunId(res.run_id);
+      toast.success(t(($) => $.github.import_issues.toast_resumed));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : t(($) => $.github.import_issues.toast_failed));
+    } finally {
+      setResuming(false);
+    }
+  }
 
   async function handleStart() {
     if (!parsed) return;
@@ -246,9 +285,17 @@ export function GitHubImportIssuesDialog({
               {t(($) => $.github.import_issues.close)}
             </Button>
           )}
-          <Button onClick={handleStart} disabled={!canSubmit}>
-            {t(($) => $.github.import_issues.submit)}
-          </Button>
+          {canResume ? (
+            <Button onClick={handleResume} disabled={resuming}>
+              {resuming
+                ? t(($) => $.github.import_issues.resuming)
+                : t(($) => $.github.import_issues.resume)}
+            </Button>
+          ) : (
+            <Button onClick={handleStart} disabled={!canSubmit}>
+              {t(($) => $.github.import_issues.submit)}
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

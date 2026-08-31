@@ -768,7 +768,10 @@
       "state_cancelled": "インポートを取消しました",
       "state_quota_blocked": "停止：ワークスペースの Issue 上限に達しました",
       "state_needs_reauth": "続行するには GitHub アプリを再認可してください",
-      "toast_cancel_requested": "取消をリクエストしました"
+      "toast_cancel_requested": "取消をリクエストしました",
+      "resume": "再開",
+      "resuming": "再開中…",
+      "toast_resumed": "インポートを再開しました"
     }
   },
   "vcs": {

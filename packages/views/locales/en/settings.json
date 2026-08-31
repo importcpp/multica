@@ -770,7 +770,10 @@
       "state_cancelled": "Import cancelled",
       "state_quota_blocked": "Stopped: workspace issue limit reached",
       "state_needs_reauth": "Re-authorize the GitHub app to continue",
-      "toast_cancel_requested": "Cancellation requested"
+      "toast_cancel_requested": "Cancellation requested",
+      "resume": "Resume",
+      "resuming": "Resuming…",
+      "toast_resumed": "Import resumed"
     }
   },
   "vcs": {
