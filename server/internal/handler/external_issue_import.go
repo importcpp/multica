@@ -373,6 +373,9 @@ type syncRunStatusResponse struct {
 	Failed    int64  `json:"failed"`
 	Total     int64  `json:"total"`
 	Cancel    bool   `json:"cancel_requested"`
+	// Errors is a bounded sample of per-issue failure diagnostics so a partial
+	// run tells the user which issues failed and why, not just a count.
+	Errors []string `json:"errors"`
 }
 
 // GetSyncRun returns one run's progress so the UI can poll created/updated/
@@ -404,6 +407,7 @@ func (h *Handler) GetSyncRun(w http.ResponseWriter, r *http.Request) {
 		Failed:    run.FailedCount,
 		Total:     run.TotalSeen,
 		Cancel:    run.CancelRequested,
+		Errors:    decodeErrorSamples(run.ErrorSample),
 	})
 }
 
@@ -463,19 +467,41 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "reconnect the GitHub installation before resuming")
 		return
 	}
-	// Preserve the run's original filter state (from its input snapshot) while
-	// refreshing credential/project/repo identity from the live source.
-	prevSnap, _ := decodeRunInput(existing.InputSnapshot)
-	state := prevSnap.State
-	if state == "" {
-		state = filterStateFromSourceFilter(source.Filter)
+	// Preserve the run's ORIGINAL execution semantics — target project, filter,
+	// configured actor, repo identity — from its immutable snapshot. Only the
+	// credential is refreshed (a reconnect after needs_reauth mints a new
+	// installation UUID). We validate the refreshed credential still points at
+	// the SAME stable repository the run was importing, so a source that was
+	// repointed at a different repo cannot silently hijack the run.
+	prevSnap, err := decodeRunInput(existing.InputSnapshot)
+	if err != nil {
+		writeError(w, http.StatusConflict, "run has no valid input snapshot")
+		return
+	}
+	if source.RepositoryExternalID != prevSnap.RepositoryExternalID {
+		writeError(w, http.StatusConflict,
+			"the import source now points at a different repository; start a new import instead of resuming")
+		return
+	}
+	// If the run's original target project was deleted, require an explicit
+	// reselect rather than silently redirecting to wherever the source points now.
+	if prevSnap.TargetProjectID.Valid {
+		if _, err := h.Queries.GetProjectInWorkspace(r.Context(), db.GetProjectInWorkspaceParams{
+			ID: prevSnap.TargetProjectID, WorkspaceID: workspaceUUID,
+		}); err != nil {
+			writeError(w, http.StatusConflict,
+				"the run's target project no longer exists; reselect a project and start a new import")
+			return
+		}
 	}
 	repo := externalissue.Repository{
-		InstanceKey: source.InstanceKey,
-		ExternalID:  source.RepositoryExternalID,
-		FullPath:    source.RepositoryFullPath,
+		InstanceKey: prevSnap.InstanceKey,
+		ExternalID:  prevSnap.RepositoryExternalID,
+		FullPath:    prevSnap.RepositoryFullPath,
 	}
-	freshSnapshot := buildRunInputSnapshot(source.CredentialID, repo, source.TargetProjectID, source.ConfiguredByUserID, state)
+	// Rebuild the snapshot from the ORIGINAL project/filter/actor, swapping in
+	// only the freshly validated credential.
+	freshSnapshot := buildRunInputSnapshot(source.CredentialID, repo, prevSnap.TargetProjectID, prevSnap.ConfiguredByUserID, prevSnap.State)
 
 	run, err := h.Queries.ResumeExternalIssueSyncRun(r.Context(), db.ResumeExternalIssueSyncRunParams{
 		ID:            runUUID,
@@ -496,23 +522,6 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 		RunID:    util.UUIDToString(run.ID),
 		State:    run.State,
 	})
-}
-
-// filterStateFromSourceFilter reads {"state":...} from a source's filter JSON,
-// defaulting to open.
-func filterStateFromSourceFilter(filter []byte) string {
-	var f struct {
-		State string `json:"state"`
-	}
-	if len(filter) > 0 {
-		_ = json.Unmarshal(filter, &f)
-	}
-	switch f.State {
-	case "open", "closed", "all":
-		return f.State
-	default:
-		return "open"
-	}
 }
 
 // buildRunInputSnapshot serializes the immutable execution inputs stored on a

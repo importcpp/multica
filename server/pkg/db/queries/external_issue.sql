@@ -343,3 +343,71 @@ WHERE id = $1;
 
 -- name: DeleteExternalIssueSyncEventsByWorkspace :exec
 DELETE FROM external_issue_sync_event WHERE workspace_id = $1;
+
+-- =====================
+-- External Issue Sync Run Item ledger (identity-based accounting)
+-- =====================
+
+-- name: LockExternalIssueSyncRunForApply :one
+-- Fence the Apply transaction on run ownership: take the run row FOR UPDATE and
+-- return it only when this worker still owns a live, non-cancelled lease. A
+-- caller that gets pgx.ErrNoRows rolls the whole tx back and creates nothing, so
+-- a stolen lease / cancellation lands atomically with the issue create instead
+-- of drifting until the next heartbeat.
+SELECT * FROM external_issue_sync_run
+WHERE id = $1
+  AND worker_id = sqlc.arg('worker_id')
+  AND state = 'running'
+  AND cancel_requested = false
+  AND (lease_expires_at IS NULL OR lease_expires_at > now())
+FOR UPDATE;
+
+-- name: UpsertExternalIssueSyncRunItem :one
+-- Record (run, remote issue) -> outcome on stable identity. inserted=true only
+-- when this is the first time the issue was accounted in this run, so the caller
+-- bumps counts exactly once even if a re-fetched page replays the issue. On
+-- replay the outcome is kept STICKY by precedence (failed < skipped < conflict <
+-- updated < imported): an already-imported issue re-seen as a skipped no-op on
+-- resume keeps "imported", and a prior "failed" can be upgraded on retry —
+-- neither double-counts nor reclassifies a committed create as a skip.
+INSERT INTO external_issue_sync_run_item (run_id, workspace_id, external_issue_id, outcome)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (run_id, external_issue_id) DO UPDATE SET
+    outcome = CASE
+        WHEN array_position(ARRAY['failed','skipped','conflict','updated','imported'], EXCLUDED.outcome)
+           > array_position(ARRAY['failed','skipped','conflict','updated','imported'], external_issue_sync_run_item.outcome)
+        THEN EXCLUDED.outcome
+        ELSE external_issue_sync_run_item.outcome
+    END
+RETURNING (xmax = 0) AS inserted;
+
+-- name: CountExternalIssueSyncRunItems :one
+-- Derive run counts by aggregating the ledger, so counts never depend on a
+-- page position. Returns imported/updated/conflict/skipped/failed/total.
+SELECT
+    COUNT(*) FILTER (WHERE outcome = 'imported')  AS imported,
+    COUNT(*) FILTER (WHERE outcome = 'updated')   AS updated,
+    COUNT(*) FILTER (WHERE outcome = 'conflict')  AS conflicts,
+    COUNT(*) FILTER (WHERE outcome = 'skipped')   AS skipped,
+    COUNT(*) FILTER (WHERE outcome = 'failed')    AS failed,
+    COUNT(*)                                       AS total
+FROM external_issue_sync_run_item
+WHERE run_id = $1;
+
+-- name: ExternalIssueSyncRunItemExists :one
+SELECT EXISTS (
+    SELECT 1 FROM external_issue_sync_run_item
+    WHERE run_id = $1 AND external_issue_id = $2
+) AS exists;
+
+-- name: DeleteExternalIssueSyncRunItemsByWorkspace :exec
+DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1;
+
+-- name: SetExternalIssueSyncRunErrorSample :execrows
+-- Persist the accumulated error sample mid-run (page checkpoint), fenced on
+-- worker_id so a reclaimed run isn't written by its former owner. Kept separate
+-- from advance so the sample survives a page-budget requeue into the next claim.
+UPDATE external_issue_sync_run SET
+    error_sample = $2,
+    updated_at = now()
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');

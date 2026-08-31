@@ -286,6 +286,8 @@ var concurrentIndexCleanups = map[string]string{
 	"456_external_issue_link_pkey_index":                        "external_issue_link_pkey_uidx",
 	"458_external_issue_sync_run_pkey_index":                    "external_issue_sync_run_pkey_uidx",
 	"460_external_issue_sync_event_pkey_index":                  "external_issue_sync_event_pkey_uidx",
+	"464_external_issue_sync_run_item_pkey_index":               "external_issue_sync_run_item_pkey_uidx",
+	"466_external_issue_sync_run_item_identity_index":           "uq_external_issue_sync_run_item_identity",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction

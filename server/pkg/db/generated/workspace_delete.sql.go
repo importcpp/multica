@@ -470,6 +470,9 @@ deleted_lark_binding_tokens AS (
 deleted_external_issue_events AS (
     DELETE FROM external_issue_sync_event WHERE workspace_id = $1
 ),
+deleted_external_issue_run_items AS (
+    DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1
+),
 deleted_external_issue_runs AS (
     DELETE FROM external_issue_sync_run WHERE workspace_id = $1
 ),

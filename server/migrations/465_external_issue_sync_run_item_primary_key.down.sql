@@ -1,0 +1,1 @@
+ALTER TABLE external_issue_sync_run_item DROP CONSTRAINT IF EXISTS external_issue_sync_run_item_pkey;

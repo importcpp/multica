@@ -206,32 +206,21 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	}
 	filter := externalissue.IssueFilter{State: snap.State}
 
-	counts := runCounts{
-		imported:  run.ImportedCount,
-		updated:   run.UpdatedCount,
-		conflicts: run.ConflictCount,
-		skipped:   run.SkippedCount,
-		failed:    run.FailedCount,
-		total:     run.TotalSeen,
-	}
+	// errorSamples accumulates ACROSS claims: seed from the run's persisted
+	// sample so a failure in an earlier claim survives into the final state.
+	errorSamples := decodeErrorSamples(run.ErrorSample)
 	cursor := externalissue.Cursor(run.Cursor)
-	// pageOffset is how many items of the FIRST page this claim processes were
-	// already applied+accounted by a prior claim that stopped mid-page (quota).
-	// We re-fetch that page and skip them so counts stay exact on resume. It only
-	// applies to the first page of this claim; subsequent pages start at 0.
-	pageOffset := int(run.PageOffset)
-	// errorSamples collects a bounded diagnostic for failed items so a partial
-	// run tells the user which issues failed and why, not just a count.
-	var errorSamples []string
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
 		if fresh, err := w.h.Queries.GetExternalIssueSyncRun(ctx, db.GetExternalIssueSyncRunParams{
 			ID: run.ID, WorkspaceID: run.WorkspaceID,
 		}); err == nil && fresh.CancelRequested {
-			// Checkpoint must commit before we finalize; if the lease was
-			// stolen, stop without finishing.
-			if err := w.advance(ctx, run, cursor, counts, 0); err != nil {
+			counts, cerr := w.ledgerCounts(ctx, run.ID)
+			if cerr != nil {
+				return cerr
+			}
+			if err := w.advance(ctx, run, cursor, counts); err != nil {
 				return err
 			}
 			return w.finishRun(ctx, run, "cancelled", errorSamples)
@@ -241,64 +230,73 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		if listErr != nil {
 			return w.handleListError(ctx, run, listErr)
 		}
-		accounted := 0 // items of THIS page already committed to counts
 		for i, iss := range result.Issues {
-			// Skip items a prior claim already accounted on this exact page.
-			if i < pageOffset {
-				continue
-			}
 			// In-page heartbeat: renew the lease periodically so a healthy but
-			// slow page is not reclaimed, and detect a steal immediately instead
-			// of drifting to the page boundary. A lost lease aborts the page
-			// before any further Apply side effects.
-			if accounted%syncHeartbeatEvery == 0 {
+			// slow page is not reclaimed. The authoritative ownership check is
+			// inside Apply's own transaction (fence), so this is only a liveness
+			// signal — a stolen lease is caught atomically by Apply, not here.
+			if i%syncHeartbeatEvery == 0 {
 				if err := w.renewLease(ctx, run); err != nil {
 					return err
 				}
 			}
-			counts.total++
 			outcome, applyErr := w.h.ExternalIssueSync.Apply(ctx, service.ApplyParams{
 				WorkspaceID: run.WorkspaceID,
 				SourceID:    run.SourceID,
 				ProjectID:   snap.TargetProjectID,
 				CreatorID:   snap.ConfiguredByUserID,
 				Remote:      toRemoteIssue(iss, repo),
+				RunID:       run.ID,
+				WorkerID:    w.id,
 			})
 			if applyErr != nil {
+				if errors.Is(applyErr, service.ErrRunFenced) {
+					// The run's lease was stolen or it was cancelled; Apply rolled
+					// back and wrote nothing. Stop this claim — the new owner (or
+					// the cancel finalizer) drives the run.
+					return errLeaseLost
+				}
 				if service.IsQuotaError(applyErr) {
-					// Roll back the total bump for the item that hit quota (it was
-					// not accounted) and persist the PAGE-START cursor plus the
-					// count of items accounted on this page, so a resume re-fetches
-					// this page and skips exactly the accounted prefix.
-					counts.total--
-					if err := w.advance(ctx, run, cursor, counts, pageOffset+accounted); err != nil {
+					// This item was NOT accounted (its tx rolled back). Persist the
+					// PAGE-START cursor; resume re-fetches this page and the ledger
+					// (keyed on stable issue id) skips exactly the already-accounted
+					// items regardless of any membership shift.
+					counts, cerr := w.ledgerCounts(ctx, run.ID)
+					if cerr != nil {
+						return cerr
+					}
+					if err := w.advance(ctx, run, cursor, counts); err != nil {
 						return err
 					}
 					return w.finishRun(ctx, run, "quota_blocked", errorSamples)
 				}
-				counts.failed++
-				accounted++
+				// A per-item failure is recorded in the ledger (via Apply's failed
+				// outcome path) — but Apply returns the error without recording for
+				// non-outcome failures, so record it here and sample it.
+				if err := w.recordFailedItem(ctx, run, iss.ExternalID); err != nil {
+					return err
+				}
 				if len(errorSamples) < syncMaxErrorSamples {
 					errorSamples = append(errorSamples, fmt.Sprintf("issue #%d: %v", iss.Number, applyErr))
 				}
 				continue
 			}
-			counts.tally(outcome)
-			accounted++
+			_ = outcome // accounting is in the ledger, not a local counter
 		}
 		cursor = result.NextCursor
-		pageOffset = 0 // only the first page of this claim carries a resume offset
-		// Checkpoint the page. A failed checkpoint (lost lease or DB error) MUST
-		// abort: continuing would let the issues we just applied be reprocessed
-		// (or the run be marked succeeded with an unsaved cursor). page_offset is
-		// reset to 0 because a full page just committed.
-		if err := w.advance(ctx, run, cursor, counts, 0); err != nil {
+		// Checkpoint the page from the ledger-derived counts. A failed checkpoint
+		// (lost lease or DB error) MUST abort.
+		counts, cerr := w.ledgerCounts(ctx, run.ID)
+		if cerr != nil {
+			return cerr
+		}
+		if err := w.advance(ctx, run, cursor, counts); err != nil {
+			return err
+		}
+		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
 			return err
 		}
 		if cursor == "" {
-			// Terminal state is decided by the CUMULATIVE failed count persisted
-			// across claims, not a per-claim bool: a failure in an earlier claim
-			// must still make the final run partial.
 			state := "succeeded"
 			if counts.failed > 0 {
 				state = "partial"
@@ -362,21 +360,6 @@ type runCounts struct {
 	imported, updated, conflicts, skipped, failed, total int64
 }
 
-func (c *runCounts) tally(o service.ApplyOutcome) {
-	switch o {
-	case service.OutcomeImported:
-		c.imported++
-	case service.OutcomeUpdated:
-		c.updated++
-	case service.OutcomeConflict:
-		c.conflicts++
-	case service.OutcomeSkipped:
-		c.skipped++
-	default:
-		c.failed++
-	}
-}
-
 // errLeaseLost signals the run's lease was reclaimed by another worker between
 // claim and this write. The caller stops touching the run; the new owner drives
 // it. It is not surfaced as a processing error.
@@ -386,7 +369,7 @@ var errLeaseLost = errors.New("external-issue sync run lease lost")
 // worker's id. A zero-row update means the lease was stolen (or the run was
 // cancelled/finished elsewhere): return errLeaseLost so the caller aborts
 // WITHOUT finalizing — never mark succeeded on an unsaved cursor.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, pageOffset int) error {
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
 		ID:             run.ID,
@@ -399,7 +382,9 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 		FailedCount:    c.failed,
 		TotalSeen:      c.total,
 		LeaseExpiresAt: lease,
-		PageOffset:     int32(pageOffset),
+		// page_offset is retained for schema compatibility but no longer drives
+		// resume — the run-item ledger (keyed on stable issue id) does.
+		PageOffset: 0,
 	})
 	if err != nil {
 		return fmt.Errorf("advance run: %w", err)
@@ -407,6 +392,68 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 	if rows == 0 {
 		slog.Warn("external-issue sync worker: lease lost on advance", "run_id", util.UUIDToString(run.ID))
 		return errLeaseLost
+	}
+	return nil
+}
+
+// ledgerCounts derives the run's counts by aggregating the run-item ledger, so
+// counts reflect stable-identity accounting rather than a page position.
+func (w *ExternalIssueSyncWorker) ledgerCounts(ctx context.Context, runID pgtype.UUID) (runCounts, error) {
+	row, err := w.h.Queries.CountExternalIssueSyncRunItems(ctx, runID)
+	if err != nil {
+		return runCounts{}, fmt.Errorf("count ledger: %w", err)
+	}
+	return runCounts{
+		imported:  row.Imported,
+		updated:   row.Updated,
+		conflicts: row.Conflicts,
+		skipped:   row.Skipped,
+		failed:    row.Failed,
+		total:     row.Total,
+	}, nil
+}
+
+// recordFailedItem records a failed outcome in the ledger for a remote issue
+// whose Apply returned a non-fenced, non-quota error (so Apply's own tx rolled
+// back without writing a ledger row). Its own tiny transaction is fine: a
+// duplicate failed record just upserts.
+func (w *ExternalIssueSyncWorker) recordFailedItem(ctx context.Context, run db.ExternalIssueSyncRun, externalID string) error {
+	if _, err := w.h.Queries.UpsertExternalIssueSyncRunItem(ctx, db.UpsertExternalIssueSyncRunItemParams{
+		RunID:           run.ID,
+		WorkspaceID:     run.WorkspaceID,
+		ExternalIssueID: externalID,
+		Outcome:         "failed",
+	}); err != nil {
+		return fmt.Errorf("record failed ledger item: %w", err)
+	}
+	return nil
+}
+
+// decodeErrorSamples reads the persisted JSON error_sample array so samples
+// accumulate across claims instead of resetting each claim.
+func decodeErrorSamples(raw []byte) []string {
+	var out []string
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return out
+}
+
+// persistErrorSamples writes the accumulated sample at a page checkpoint (fenced)
+// so it survives a page-budget requeue into the next claim; a lost lease is a
+// no-op here (advance already returned errLeaseLost in that case).
+func (w *ExternalIssueSyncWorker) persistErrorSamples(ctx context.Context, run db.ExternalIssueSyncRun, samples []string) error {
+	if samples == nil {
+		samples = []string{}
+	}
+	b, err := json.Marshal(samples)
+	if err != nil {
+		return nil
+	}
+	if _, err := w.h.Queries.SetExternalIssueSyncRunErrorSample(ctx, db.SetExternalIssueSyncRunErrorSampleParams{
+		ID: run.ID, WorkerID: w.id, ErrorSample: b,
+	}); err != nil {
+		return fmt.Errorf("persist error sample: %w", err)
 	}
 	return nil
 }

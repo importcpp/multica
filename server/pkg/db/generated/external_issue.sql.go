@@ -366,6 +366,43 @@ func (q *Queries) ClearExternalIssueSourceProject(ctx context.Context, arg Clear
 	return err
 }
 
+const countExternalIssueSyncRunItems = `-- name: CountExternalIssueSyncRunItems :one
+SELECT
+    COUNT(*) FILTER (WHERE outcome = 'imported')  AS imported,
+    COUNT(*) FILTER (WHERE outcome = 'updated')   AS updated,
+    COUNT(*) FILTER (WHERE outcome = 'conflict')  AS conflicts,
+    COUNT(*) FILTER (WHERE outcome = 'skipped')   AS skipped,
+    COUNT(*) FILTER (WHERE outcome = 'failed')    AS failed,
+    COUNT(*)                                       AS total
+FROM external_issue_sync_run_item
+WHERE run_id = $1
+`
+
+type CountExternalIssueSyncRunItemsRow struct {
+	Imported  int64 `json:"imported"`
+	Updated   int64 `json:"updated"`
+	Conflicts int64 `json:"conflicts"`
+	Skipped   int64 `json:"skipped"`
+	Failed    int64 `json:"failed"`
+	Total     int64 `json:"total"`
+}
+
+// Derive run counts by aggregating the ledger, so counts never depend on a
+// page position. Returns imported/updated/conflict/skipped/failed/total.
+func (q *Queries) CountExternalIssueSyncRunItems(ctx context.Context, runID pgtype.UUID) (CountExternalIssueSyncRunItemsRow, error) {
+	row := q.db.QueryRow(ctx, countExternalIssueSyncRunItems, runID)
+	var i CountExternalIssueSyncRunItemsRow
+	err := row.Scan(
+		&i.Imported,
+		&i.Updated,
+		&i.Conflicts,
+		&i.Skipped,
+		&i.Failed,
+		&i.Total,
+	)
+	return i, err
+}
+
 const createExternalIssueSyncRun = `-- name: CreateExternalIssueSyncRun :one
 
 INSERT INTO external_issue_sync_run (
@@ -458,6 +495,15 @@ func (q *Queries) DeleteExternalIssueSyncEventsByWorkspace(ctx context.Context, 
 	return err
 }
 
+const deleteExternalIssueSyncRunItemsByWorkspace = `-- name: DeleteExternalIssueSyncRunItemsByWorkspace :exec
+DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1
+`
+
+func (q *Queries) DeleteExternalIssueSyncRunItemsByWorkspace(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteExternalIssueSyncRunItemsByWorkspace, workspaceID)
+	return err
+}
+
 const deleteExternalIssueSyncRunsByWorkspace = `-- name: DeleteExternalIssueSyncRunsByWorkspace :exec
 DELETE FROM external_issue_sync_run WHERE workspace_id = $1
 `
@@ -516,6 +562,25 @@ func (q *Queries) EnqueueExternalIssueSyncEvent(ctx context.Context, arg Enqueue
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const externalIssueSyncRunItemExists = `-- name: ExternalIssueSyncRunItemExists :one
+SELECT EXISTS (
+    SELECT 1 FROM external_issue_sync_run_item
+    WHERE run_id = $1 AND external_issue_id = $2
+) AS exists
+`
+
+type ExternalIssueSyncRunItemExistsParams struct {
+	RunID           pgtype.UUID `json:"run_id"`
+	ExternalIssueID string      `json:"external_issue_id"`
+}
+
+func (q *Queries) ExternalIssueSyncRunItemExists(ctx context.Context, arg ExternalIssueSyncRunItemExistsParams) (bool, error) {
+	row := q.db.QueryRow(ctx, externalIssueSyncRunItemExists, arg.RunID, arg.ExternalIssueID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
 }
 
 const finishExternalIssueSyncEvent = `-- name: FinishExternalIssueSyncEvent :exec
@@ -886,6 +951,64 @@ func (q *Queries) ListExternalIssueSyncRunsBySource(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const lockExternalIssueSyncRunForApply = `-- name: LockExternalIssueSyncRunForApply :one
+
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset FROM external_issue_sync_run
+WHERE id = $1
+  AND worker_id = $2
+  AND state = 'running'
+  AND cancel_requested = false
+  AND (lease_expires_at IS NULL OR lease_expires_at > now())
+FOR UPDATE
+`
+
+type LockExternalIssueSyncRunForApplyParams struct {
+	ID       pgtype.UUID `json:"id"`
+	WorkerID string      `json:"worker_id"`
+}
+
+// =====================
+// External Issue Sync Run Item ledger (identity-based accounting)
+// =====================
+// Fence the Apply transaction on run ownership: take the run row FOR UPDATE and
+// return it only when this worker still owns a live, non-cancelled lease. A
+// caller that gets pgx.ErrNoRows rolls the whole tx back and creates nothing, so
+// a stolen lease / cancellation lands atomically with the issue create instead
+// of drifting until the next heartbeat.
+func (q *Queries) LockExternalIssueSyncRunForApply(ctx context.Context, arg LockExternalIssueSyncRunForApplyParams) (ExternalIssueSyncRun, error) {
+	row := q.db.QueryRow(ctx, lockExternalIssueSyncRunForApply, arg.ID, arg.WorkerID)
+	var i ExternalIssueSyncRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SourceID,
+		&i.Kind,
+		&i.State,
+		&i.FilterSnapshot,
+		&i.Cutoff,
+		&i.Cursor,
+		&i.ImportedCount,
+		&i.UpdatedCount,
+		&i.ConflictCount,
+		&i.SkippedCount,
+		&i.FailedCount,
+		&i.TotalSeen,
+		&i.ErrorSample,
+		&i.Attempt,
+		&i.WorkerID,
+		&i.LeaseExpiresAt,
+		&i.NextAttemptAt,
+		&i.CancelRequested,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.InputSnapshot,
+		&i.PageOffset,
+	)
+	return i, err
+}
+
 const markExternalIssueLinkMoved = `-- name: MarkExternalIssueLinkMoved :exec
 UPDATE external_issue_link SET moved = true, updated_at = now()
 WHERE id = $1
@@ -1097,6 +1220,30 @@ func (q *Queries) SetExternalIssueSourceState(ctx context.Context, arg SetExtern
 	return err
 }
 
+const setExternalIssueSyncRunErrorSample = `-- name: SetExternalIssueSyncRunErrorSample :execrows
+UPDATE external_issue_sync_run SET
+    error_sample = $2,
+    updated_at = now()
+WHERE id = $1 AND worker_id = $3
+`
+
+type SetExternalIssueSyncRunErrorSampleParams struct {
+	ID          pgtype.UUID `json:"id"`
+	ErrorSample []byte      `json:"error_sample"`
+	WorkerID    string      `json:"worker_id"`
+}
+
+// Persist the accumulated error sample mid-run (page checkpoint), fenced on
+// worker_id so a reclaimed run isn't written by its former owner. Kept separate
+// from advance so the sample survives a page-budget requeue into the next claim.
+func (q *Queries) SetExternalIssueSyncRunErrorSample(ctx context.Context, arg SetExternalIssueSyncRunErrorSampleParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setExternalIssueSyncRunErrorSample, arg.ID, arg.ErrorSample, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateExternalIssueLinkSync = `-- name: UpdateExternalIssueLinkSync :exec
 UPDATE external_issue_link SET
     display_number = $2,
@@ -1248,4 +1395,43 @@ func (q *Queries) UpsertExternalIssueSource(ctx context.Context, arg UpsertExter
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertExternalIssueSyncRunItem = `-- name: UpsertExternalIssueSyncRunItem :one
+INSERT INTO external_issue_sync_run_item (run_id, workspace_id, external_issue_id, outcome)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (run_id, external_issue_id) DO UPDATE SET
+    outcome = CASE
+        WHEN array_position(ARRAY['failed','skipped','conflict','updated','imported'], EXCLUDED.outcome)
+           > array_position(ARRAY['failed','skipped','conflict','updated','imported'], external_issue_sync_run_item.outcome)
+        THEN EXCLUDED.outcome
+        ELSE external_issue_sync_run_item.outcome
+    END
+RETURNING (xmax = 0) AS inserted
+`
+
+type UpsertExternalIssueSyncRunItemParams struct {
+	RunID           pgtype.UUID `json:"run_id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	ExternalIssueID string      `json:"external_issue_id"`
+	Outcome         string      `json:"outcome"`
+}
+
+// Record (run, remote issue) -> outcome on stable identity. inserted=true only
+// when this is the first time the issue was accounted in this run, so the caller
+// bumps counts exactly once even if a re-fetched page replays the issue. On
+// replay the outcome is kept STICKY by precedence (failed < skipped < conflict <
+// updated < imported): an already-imported issue re-seen as a skipped no-op on
+// resume keeps "imported", and a prior "failed" can be upgraded on retry —
+// neither double-counts nor reclassifies a committed create as a skip.
+func (q *Queries) UpsertExternalIssueSyncRunItem(ctx context.Context, arg UpsertExternalIssueSyncRunItemParams) (bool, error) {
+	row := q.db.QueryRow(ctx, upsertExternalIssueSyncRunItem,
+		arg.RunID,
+		arg.WorkspaceID,
+		arg.ExternalIssueID,
+		arg.Outcome,
+	)
+	var inserted bool
+	err := row.Scan(&inserted)
+	return inserted, err
 }

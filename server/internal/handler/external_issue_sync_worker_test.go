@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/entitlement"
@@ -71,10 +73,23 @@ func seedSyncWorkerFixture(t *testing.T, pages [][]map[string]any) (workspaceID,
 		"eis-worker", "eis-worker-"+suffix+"@test.local").Scan(&userID); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
+	// Register cleanup immediately after each successful insert so a later insert
+	// failing (e.g. missing table on an un-migrated DB) can't leak this row.
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
 	if err := testPool.QueryRow(ctx, `INSERT INTO workspace (name, slug, description) VALUES ($1,$2,'') RETURNING id`,
-		"eis-worker-ws", "eis-w-"+suffix[:8]).Scan(&workspaceID); err != nil {
+		"eis-worker-ws", "eis-w-"+suffix).Scan(&workspaceID); err != nil {
 		t.Fatalf("seed workspace: %v", err)
 	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run_item WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
 	var installationID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO github_installation (workspace_id, installation_id, account_login, account_type, connected_by_id)
@@ -89,17 +104,6 @@ func seedSyncWorkerFixture(t *testing.T, pages [][]map[string]any) (workspaceID,
 		RETURNING id`, workspaceID, installationID, userID).Scan(&sourceID); err != nil {
 		t.Fatalf("seed source: %v", err)
 	}
-
-	t.Cleanup(func() {
-		c := context.Background()
-		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run WHERE workspace_id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
-		_, _ = testPool.Exec(c, `DELETE FROM "user" WHERE id=$1`, userID)
-	})
 
 	var counter int64
 	hits = &counter
@@ -312,46 +316,52 @@ func TestSyncWorkerHonorsCancel(t *testing.T) {
 
 // A worker whose lease was stolen must not advance/finish the run: its fenced
 // writes update zero rows and it aborts without corrupting the new owner's run.
-func TestSyncWorkerLeaseFencingStopsStaleWriter(t *testing.T) {
-	// Enough pages that one claim yields (requeues) rather than finishing, so we
-	// can steal the lease between the stale worker's pages.
-	var pages [][]map[string]any
-	for i := 1; i <= syncRunPagesPerClaim+2; i++ {
-		pages = append(pages, []map[string]any{issue(i, i, fmt.Sprintf("i%d", i))})
-	}
-	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+// A stale worker whose lease was stolen (or whose run was cancelled) must not
+// create any issue: the fence lives INSIDE Apply's transaction, so an Apply from
+// the former owner rolls back and returns ErrRunFenced, creating nothing. This
+// is the real takeover codex56's P0 reproduction exercised — not a direct
+// advance() call.
+func TestSyncWorkerApplyFenceStopsStaleWriter(t *testing.T) {
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, [][]map[string]any{{issue(1, 1, "a")}})
 	withFakeToken(t)
 	runID := queueRun(t, workspaceID, sourceID)
 
 	stale := NewExternalIssueSyncWorker(testHandler)
-	// Claim as the stale worker.
-	claimed, err := stale.h.Queries.ClaimNextExternalIssueSyncRun(context.Background(),
-		claimParams(stale))
+	claimed, err := stale.h.Queries.ClaimNextExternalIssueSyncRun(context.Background(), claimParams(stale))
 	if err != nil {
 		t.Fatalf("stale claim: %v", err)
 	}
-	// A new owner steals the lease (simulating reclaim after lease expiry).
+	// New owner steals the lease AND the run is cancelled — the two conditions
+	// the fence must catch, applied between claim and the first Apply.
 	if _, err := testPool.Exec(context.Background(),
-		`UPDATE external_issue_sync_run SET worker_id = 'new-owner' WHERE id=$1`, runID); err != nil {
-		t.Fatalf("steal lease: %v", err)
+		`UPDATE external_issue_sync_run SET worker_id='new-owner', cancel_requested=true WHERE id=$1`, runID); err != nil {
+		t.Fatalf("steal lease + cancel: %v", err)
 	}
-	// The stale worker's fenced advance must report a lost lease and change nothing.
-	advErr := stale.advance(context.Background(), claimed, "", runCounts{imported: 999}, 0)
-	if !errorsIs(advErr, errLeaseLost) {
-		t.Fatalf("stale advance err = %v, want errLeaseLost", advErr)
+	// The stale worker's Apply must be fenced and create nothing.
+	_, applyErr := testHandler.ExternalIssueSync.Apply(context.Background(), service.ApplyParams{
+		WorkspaceID: claimed.WorkspaceID,
+		SourceID:    claimed.SourceID,
+		Remote: service.RemoteIssue{
+			ExternalID: "1", Provider: "github", InstanceKey: "github.com",
+			Number: 1, Title: "a", State: "open",
+		},
+		RunID:    claimed.ID,
+		WorkerID: stale.id,
+	})
+	if !errorsIs(applyErr, service.ErrRunFenced) {
+		t.Fatalf("stale Apply err = %v, want ErrRunFenced", applyErr)
 	}
-	var imported int64
-	var owner string
+	if n := countWsIssues(t, workspaceID); n != 0 {
+		t.Fatalf("fenced Apply must create nothing, got %d issues", n)
+	}
+	// Ledger stayed empty too (nothing accounted).
+	var items int
 	if err := testPool.QueryRow(context.Background(),
-		`SELECT imported_count, worker_id FROM external_issue_sync_run WHERE id=$1`, runID).
-		Scan(&imported, &owner); err != nil {
-		t.Fatalf("read run: %v", err)
+		`SELECT count(*) FROM external_issue_sync_run_item WHERE run_id=$1`, runID).Scan(&items); err != nil {
+		t.Fatalf("count ledger: %v", err)
 	}
-	if imported == 999 {
-		t.Fatal("stale worker's counts must not overwrite the reclaimed run")
-	}
-	if owner != "new-owner" {
-		t.Fatalf("worker_id = %q, want new-owner (stale writer must not touch it)", owner)
+	if items != 0 {
+		t.Fatalf("fenced Apply must not write a ledger row, got %d", items)
 	}
 }
 
@@ -486,5 +496,166 @@ func TestSyncWorkerReauthResumeRebindsCredential(t *testing.T) {
 	}
 	if st, imported, _ := runState(t, runID); st != "succeeded" || imported != 1 {
 		t.Fatalf("after reauth resume: state=%q imported=%d, want succeeded/1 (rebound credential)", st, imported)
+	}
+}
+
+// Mutable page membership across a resume: page [A,B] with quota=1 imports A,
+// hits quota on B; during the pause A leaves the result set and the page becomes
+// [B,C]. Positional skipping would drop B; the identity ledger keys on the stable
+// external id, so resume imports B and C and never skips an unprocessed issue.
+// Regression for codex56's P0-2 reproduction.
+func TestSyncWorkerMutablePageResumeNoSkip(t *testing.T) {
+	// A dynamic fake whose page contents we can change between drains.
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"eis-mut", "eis-mut-"+suffix+"@test.local").Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"eis-mut-ws", "eis-mut-"+suffix[:8]).Scan(&workspaceID); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run_item WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationID); err != nil {
+		t.Fatalf("seed installation: %v", err)
+	}
+	var sourceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_source
+		(workspace_id,provider,instance_key,credential_id,repository_external_id,repository_full_path,configured_by_user_id,filter)
+		VALUES($1,'github','github.com',$2,'555','acme/widgets',$3,'{"state":"open"}') RETURNING id`,
+		workspaceID, installationID, userID).Scan(&sourceID); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+
+	// Page contents flip after the first drain: [A,B] -> [B,C].
+	pageFirst := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if pageFirst {
+			writeIssuesJSON(w, []map[string]any{issue(101, 101, "A"), issue(102, 102, "B")})
+		} else {
+			writeIssuesJSON(w, []map[string]any{issue(102, 102, "B"), issue(103, 103, "C")})
+		}
+	}))
+	defer srv.Close()
+	defer externalissue.SetGitHubAPIBaseForTest(srv.URL)()
+	withFakeToken(t)
+
+	runID := queueRun(t, workspaceID, sourceID)
+
+	q := db.New(testPool)
+	bus := events.New()
+	issues := &service.IssueService{Queries: q, TxStarter: testPool, Bus: bus, Entitlements: limitProvider{limit: 1}}
+	sync := service.NewExternalIssueSyncService(q, testPool, bus, issues)
+	h := &Handler{Queries: q, ExternalIssueSync: sync}
+	w := NewExternalIssueSyncWorker(h)
+
+	// First drain: import A, quota on B.
+	if _, err := w.ProcessNext(ctx); err != nil {
+		t.Fatalf("first drain: %v", err)
+	}
+	if st, imported, _ := runState(t, runID); st != "quota_blocked" || imported != 1 {
+		t.Fatalf("after quota: state=%q imported=%d, want quota_blocked/1", st, imported)
+	}
+
+	// A leaves the set; page becomes [B,C]. Raise limit, resume.
+	pageFirst = false
+	issues.Entitlements = limitProvider{limit: 100}
+	sync.Entitlements = limitProvider{limit: 100}
+	if _, err := q.ResumeExternalIssueSyncRun(ctx, resumeParamsForSource(workspaceID, runID, sourceID)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := w.ProcessNext(ctx); err != nil {
+			t.Fatalf("resume drain: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" {
+			break
+		}
+	}
+	// B must NOT be skipped: A, B, C all imported (3 issues), state succeeded.
+	if n := countWsIssues(t, workspaceID); n != 3 {
+		t.Fatalf("issue rows = %d, want 3 (A,B,C — B not skipped by position)", n)
+	}
+	if st, imported, _ := runState(t, runID); st != "succeeded" || imported != 3 {
+		t.Fatalf("final: state=%q imported=%d, want succeeded/3", st, imported)
+	}
+}
+
+// Resume must preserve the run's ORIGINAL target project even when the source
+// was repointed at a different project between pause and resume — driven through
+// the real ResumeSyncRun handler (not raw params). Regression for codex56 P0-3.
+func TestResumeSyncRunPreservesOriginalProject(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, [][]map[string]any{{issue(1, 1, "a")}})
+
+	// Two projects: A (the run's original target) and B (source repointed later).
+	var projA, projB string
+	if err := testPool.QueryRow(ctx, `INSERT INTO project(workspace_id,title) VALUES($1,'A') RETURNING id`, workspaceID).Scan(&projA); err != nil {
+		t.Fatalf("seed project A: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `INSERT INTO project(workspace_id,title) VALUES($1,'B') RETURNING id`, workspaceID).Scan(&projB); err != nil {
+		t.Fatalf("seed project B: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM project WHERE workspace_id=$1`, workspaceID)
+	})
+
+	// A quota_blocked run whose snapshot targets project A.
+	var credentialID, configuredBy string
+	_ = testPool.QueryRow(ctx, `SELECT credential_id::text, configured_by_user_id::text FROM external_issue_source WHERE id=$1`, sourceID).Scan(&credentialID, &configuredBy)
+	snap := fmt.Sprintf(`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":"555","repository_full_path":"acme/widgets","target_project_id":%q,"configured_by_user_id":%q,"state":"open"}`, credentialID, projA, configuredBy)
+	var runID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_sync_run(workspace_id,source_id,kind,state,filter_snapshot,input_snapshot,cursor)
+		VALUES($1,$2,'backfill','quota_blocked','{"state":"open"}',$3::jsonb,'saved') RETURNING id`,
+		workspaceID, sourceID, snap).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	// The source is repointed at project B after the run paused.
+	if _, err := testPool.Exec(ctx, `UPDATE external_issue_source SET target_project_id=$2 WHERE id=$1`, sourceID, projB); err != nil {
+		t.Fatalf("repoint source: %v", err)
+	}
+
+	// Drive the real handler.
+	req := httptest.NewRequest("POST", "/api/workspaces/"+workspaceID+"/external-issue-sync-runs/"+runID+"/resume", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", workspaceID)
+	rctx.URLParams.Add("runId", runID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	testHandler.ResumeSyncRun(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("resume status = %d, body=%s, want 202", rec.Code, rec.Body.String())
+	}
+
+	// The resumed run's snapshot must still target project A, not B.
+	var newSnap string
+	if err := testPool.QueryRow(ctx, `SELECT input_snapshot::text FROM external_issue_sync_run WHERE id=$1`, runID).Scan(&newSnap); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if !strings.Contains(newSnap, projA) || strings.Contains(newSnap, projB) {
+		t.Fatalf("resume must preserve original project A (%s), not adopt B (%s); snapshot=%s", projA, projB, newSnap)
 	}
 }

@@ -720,6 +720,15 @@ type ExternalIssueSyncRun struct {
 	PageOffset      int32              `json:"page_offset"`
 }
 
+type ExternalIssueSyncRunItem struct {
+	ID              pgtype.UUID        `json:"id"`
+	RunID           pgtype.UUID        `json:"run_id"`
+	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
+	ExternalIssueID string             `json:"external_issue_id"`
+	Outcome         string             `json:"outcome"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type Feedback struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`

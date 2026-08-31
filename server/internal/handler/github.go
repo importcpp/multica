@@ -945,23 +945,35 @@ func (h *Handler) DeleteGitHubInstallation(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	if err := h.Queries.DeleteGitHubInstallation(r.Context(), db.DeleteGitHubInstallationParams{
+	// Delete the installation and pause its bound import sources ATOMICALLY: a
+	// pause failure must not leave a deleted installation with sources still
+	// pointing at a dead credential. Pausing (not deleting) preserves issues +
+	// links so a reconnect + re-import stays idempotent; only THIS credential's
+	// sources are touched, so another installation keeps working.
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to remove installation")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	if err := qtx.DeleteGitHubInstallation(r.Context(), db.DeleteGitHubInstallationParams{
 		ID:          idUUID,
 		WorkspaceID: wsUUID,
 	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to remove installation")
 		return
 	}
-	// Disconnecting this installation pauses only the import sources bound to it
-	// (credential_id = this installation), not every GitHub source in the
-	// workspace: another installation's sources must keep working. Issues and
-	// links are preserved so a reconnect + re-import stays idempotent.
-	if err := h.Queries.PauseExternalIssueSourcesByCredential(r.Context(), db.PauseExternalIssueSourcesByCredentialParams{
+	if err := qtx.PauseExternalIssueSourcesByCredential(r.Context(), db.PauseExternalIssueSourcesByCredentialParams{
 		WorkspaceID:  wsUUID,
 		CredentialID: idUUID,
 	}); err != nil {
-		slog.Warn("github: failed to pause issue-import sources after installation delete",
-			"workspace_id", workspaceID, "error", err)
+		writeError(w, http.StatusInternalServerError, "failed to pause import sources")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to remove installation")
+		return
 	}
 	h.publish(protocol.EventGitHubInstallationDeleted, workspaceID, "system", "", map[string]any{
 		"id": id,

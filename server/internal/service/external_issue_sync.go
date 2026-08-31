@@ -86,7 +86,20 @@ type ApplyParams struct {
 	ProjectID   pgtype.UUID // target project; may be invalid
 	CreatorID   pgtype.UUID // the source's configured_by member; may be invalid
 	Remote      RemoteIssue
+	// RunID + WorkerID fence the Apply transaction to the owning run: when RunID
+	// is valid, Apply locks the run FOR UPDATE requiring this worker still owns a
+	// live, non-cancelled lease, and records the outcome in the run-item ledger
+	// (keyed on the remote issue's stable id) in the SAME transaction. A stolen
+	// lease or a cancellation therefore rolls the whole create/update back —
+	// nothing is written — instead of drifting to the next heartbeat.
+	RunID    pgtype.UUID
+	WorkerID string
 }
+
+// ErrRunFenced means the owning run's lease was lost or it was cancelled between
+// claim and this Apply, so the transaction was rolled back without any write.
+// The worker treats it as "stop this claim", not a per-issue failure.
+var ErrRunFenced = errors.New("external-issue sync run fence lost")
 
 func contentHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
@@ -108,6 +121,21 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 	}
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
+
+	// Fence on run ownership INSIDE this transaction. If the lease was stolen or
+	// the run cancelled, the lock returns no row and we abort before creating
+	// anything — the create/update and its accounting are all-or-nothing with the
+	// ownership check.
+	if p.RunID.Valid {
+		if _, err := qtx.LockExternalIssueSyncRunForApply(ctx, db.LockExternalIssueSyncRunForApplyParams{
+			ID: p.RunID, WorkerID: p.WorkerID,
+		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return OutcomeFailed, ErrRunFenced
+			}
+			return OutcomeFailed, fmt.Errorf("fence run: %w", err)
+		}
+	}
 
 	var remoteUpdated pgtype.Timestamptz
 	if !r.UpdatedAt.IsZero() {
@@ -134,6 +162,9 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 
 	// A tombstoned link (locally deleted) must not be resurrected by sync.
 	if link.LocalDeletedAt.Valid {
+		if err := s.recordLedger(ctx, qtx, p, "skipped"); err != nil {
+			return OutcomeFailed, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return OutcomeFailed, fmt.Errorf("commit tombstone no-op: %w", err)
 		}
@@ -143,6 +174,9 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 	if link.Inserted {
 		outcome, issue, ws, err := s.createBoundIssue(ctx, tx, qtx, p, link)
 		if err != nil {
+			return OutcomeFailed, err
+		}
+		if err := s.recordLedger(ctx, qtx, p, ledgerOutcome(outcome)); err != nil {
 			return OutcomeFailed, err
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -156,6 +190,9 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 	if !link.IssueID.Valid {
 		// Claimed by a concurrent create that has not yet bound its issue, or a
 		// prior create that failed after claiming. Leave it for the next pass.
+		if err := s.recordLedger(ctx, qtx, p, "skipped"); err != nil {
+			return OutcomeFailed, err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return OutcomeFailed, fmt.Errorf("commit unbound no-op: %w", err)
 		}
@@ -165,6 +202,9 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 	if err != nil {
 		return OutcomeFailed, err
 	}
+	if err := s.recordLedger(ctx, qtx, p, ledgerOutcome(outcome)); err != nil {
+		return OutcomeFailed, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return OutcomeFailed, fmt.Errorf("commit update: %w", err)
 	}
@@ -172,6 +212,40 @@ func (s *ExternalIssueSyncService) Apply(ctx context.Context, p ApplyParams) (Ap
 		s.publishUpdated(ctx, issue, ws)
 	}
 	return outcome, nil
+}
+
+// recordLedger upserts the (run, remote issue) ledger row inside the Apply tx so
+// run counts are derived from stable identity, not a page position. A no-op when
+// there is no run (e.g. the direct-import path in tests).
+func (s *ExternalIssueSyncService) recordLedger(ctx context.Context, qtx *db.Queries, p ApplyParams, outcome string) error {
+	if !p.RunID.Valid {
+		return nil
+	}
+	if _, err := qtx.UpsertExternalIssueSyncRunItem(ctx, db.UpsertExternalIssueSyncRunItemParams{
+		RunID:           p.RunID,
+		WorkspaceID:     p.WorkspaceID,
+		ExternalIssueID: p.Remote.ExternalID,
+		Outcome:         outcome,
+	}); err != nil {
+		return fmt.Errorf("record ledger item: %w", err)
+	}
+	return nil
+}
+
+// ledgerOutcome maps an ApplyOutcome to its ledger string.
+func ledgerOutcome(o ApplyOutcome) string {
+	switch o {
+	case OutcomeImported:
+		return "imported"
+	case OutcomeUpdated:
+		return "updated"
+	case OutcomeConflict:
+		return "conflict"
+	case OutcomeSkipped:
+		return "skipped"
+	default:
+		return "failed"
+	}
 }
 
 // createBoundIssue creates a Multica issue for a freshly claimed link and binds
