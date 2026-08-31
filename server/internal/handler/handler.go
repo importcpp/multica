@@ -28,6 +28,7 @@ import (
 	composio "github.com/multica-ai/multica/server/internal/integrations/composio"
 	"github.com/multica-ai/multica/server/internal/integrations/dingtalk"
 	"github.com/multica-ai/multica/server/internal/integrations/ghsnapshot"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/integrations/lark"
 	"github.com/multica-ai/multica/server/internal/integrations/slack"
 	"github.com/multica-ai/multica/server/internal/integrations/telegram"
@@ -186,7 +187,11 @@ type Handler struct {
 	IssueService            *service.IssueService
 	ExternalIssueSync       *service.ExternalIssueSyncService
 	ExternalIssueSyncWorker *ExternalIssueSyncWorker
-	AutopilotService        *service.AutopilotService
+	// GHApp is the shared GitHub App auth client (token cache + singleflight +
+	// rate-limit handling), used by both the PR snapshot pipeline and the
+	// external-issue import path so there is one auth implementation.
+	GHApp            *githubapi.Client
+	AutopilotService *service.AutopilotService
 	// Entitlements supplies workspace-scoped commercial gates. A nil provider
 	// preserves self-hosted behavior without extra reads.
 	Entitlements entitlement.Provider
@@ -480,16 +485,21 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	}
 	h.WebhookDeliveryWorker = NewWebhookDeliveryWorker(h)
 
+	// GitHub App auth is built once and shared: the PR snapshot pipeline and the
+	// external-issue import path both mint installation tokens through this one
+	// client (cache + singleflight + rate-limit handling in one place).
+	ghApp, err := githubapi.NewFromEnv()
+	if err != nil {
+		// Malformed key is operator-actionable; GitHub features stay disabled.
+		slog.Warn("github: App auth disabled (invalid App private key)", "err", err)
+	}
+	h.GHApp = ghApp
+
 	// GitHub API snapshot pipeline for PR cards (MUL-5265). Built
 	// unconditionally but inert (every trigger no-ops) when the App private key
 	// is unconfigured, so the feature degrades cleanly. main.go calls
 	// h.PRRefresh.Start(ctx) to launch its worker pool + TTL sweeper.
-	ghClient, err := ghsnapshot.NewClientFromEnv()
-	if err != nil {
-		// Malformed key is operator-actionable; the pipeline stays disabled.
-		slog.Warn("github: PR snapshot pipeline disabled (invalid App private key)", "err", err)
-	}
-	h.PRRefresh = ghsnapshot.NewManager(ghClient, queries, txStarter, h.broadcastPRSnapshotApplied)
+	h.PRRefresh = ghsnapshot.NewManager(ghsnapshot.NewClientFromAPI(ghApp), queries, txStarter, h.broadcastPRSnapshotApplied)
 
 	// External-issue sync (import issues from GitHub/GitLab). Reuses the shared
 	// IssueService create/update core through its own atomic Apply.

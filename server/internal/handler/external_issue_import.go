@@ -13,58 +13,34 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// mintGitHubIssuesReadToken exchanges the App JWT for an installation token
-// scoped to issues:read + metadata:read. It reuses the same signing/header/
-// revoke helpers as the repository-browse path in github.go rather than copying
-// a third auth implementation. It is a package var so worker tests can inject a
-// fake token without a real GitHub App key.
-var mintGitHubIssuesReadToken = func(ctx context.Context, installationID int64) (string, func(), error) {
-	appJWT, err := signGitHubAppJWT(time.Now())
-	if err != nil {
-		return "", func() {}, err
-	}
-	if appJWT == "" {
+// mintGitHubIssuesReadToken returns an installation token scoped to
+// issues:read + metadata:read via the shared githubapi client (token cache +
+// singleflight + rate-limit handling live there — no third auth copy). The
+// returned token is cached by the client, so the revoke func is a no-op;
+// revoking would defeat the shared cache. A 403 on mint means the installation
+// has not granted the newly requested Issues permission. It is a package var so
+// worker/handler tests can inject a fake token without a real GitHub App key.
+var mintGitHubIssuesReadToken = func(ctx context.Context, app *githubapi.Client, installationID int64) (string, func(), error) {
+	if !app.Enabled() {
 		return "", func() {}, errors.New("github App JWT credentials unavailable")
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	endpoint := fmt.Sprintf("%s/app/installations/%d/access_tokens", strings.TrimRight(githubAPIBase, "/"), installationID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint,
-		strings.NewReader(`{"permissions":{"issues":"read","metadata":"read"}}`))
+	token, err := app.InstallationTokenScoped(ctx, installationID, githubapi.TokenPermissions{
+		"issues": "read", "metadata": "read",
+	})
 	if err != nil {
-		return "", func() {}, err
-	}
-	setGitHubAPIHeaders(req, appJWT)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", func() {}, fmt.Errorf("create installation token: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, githubAPIResponseLimit))
-		// 403 here usually means the installation has not granted the newly
-		// requested Issues permission yet.
-		if resp.StatusCode == http.StatusForbidden {
+		var se *githubapi.StatusError
+		if errors.As(err, &se) && se.StatusCode == http.StatusForbidden {
 			return "", func() {}, errGitHubIssuesPermission
 		}
-		return "", func() {}, fmt.Errorf("create installation token: github status %d", resp.StatusCode)
+		return "", func() {}, err
 	}
-	var body struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, githubAPIResponseLimit)).Decode(&body); err != nil {
-		return "", func() {}, fmt.Errorf("decode installation token: %w", err)
-	}
-	if body.Token == "" {
-		return "", func() {}, errors.New("github returned an empty installation token")
-	}
-	revoke := func() { revokeGitHubInstallationToken(client, body.Token) }
-	return body.Token, revoke, nil
+	return token, func() {}, nil
 }
 
 var errGitHubIssuesPermission = errors.New("github installation has not granted Issues:read")
@@ -154,7 +130,7 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 	// stable external ID and owner/repo is proven to belong to this
 	// installation before we queue any work. The token is discarded here; the
 	// worker mints its own per-claim from the stored installation credential.
-	token, revoke, err := mintGitHubIssuesReadToken(r.Context(), row.InstallationID)
+	token, revoke, err := mintGitHubIssuesReadToken(r.Context(), h.GHApp, row.InstallationID)
 	if err != nil {
 		if errors.Is(err, errGitHubIssuesPermission) {
 			writeErrorCode(w, http.StatusForbidden, "github_issues_permission",

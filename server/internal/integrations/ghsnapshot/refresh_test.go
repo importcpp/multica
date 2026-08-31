@@ -7,6 +7,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 )
 
 func enabledClient(t *testing.T) *Client {
@@ -15,7 +17,7 @@ func enabledClient(t *testing.T) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &Client{appID: "1", privateKey: key, tokens: map[int64]cachedToken{}, now: time.Now}
+	return &Client{api: githubapi.NewClientForTest("1", key), now: time.Now}
 }
 
 // TestManagerDisabledNoOps is the clean-degradation guarantee (acceptance

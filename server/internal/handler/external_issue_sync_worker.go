@@ -180,7 +180,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	if err != nil || installation.WorkspaceID != run.WorkspaceID {
 		return w.finishRun(ctx, run, "needs_reauth", []string{"installation unavailable"})
 	}
-	token, revoke, err := mintGitHubIssuesReadToken(ctx, installation.InstallationID)
+	token, revoke, err := mintGitHubIssuesReadToken(ctx, w.h.GHApp, installation.InstallationID)
 	if err != nil {
 		if errors.Is(err, errGitHubIssuesPermission) {
 			return w.finishRun(ctx, run, "needs_reauth", []string{"installation has not granted Issues read"})

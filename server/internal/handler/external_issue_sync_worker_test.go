@@ -16,6 +16,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -176,7 +177,7 @@ func queueRun(t *testing.T, workspaceID, sourceID string) string {
 func withFakeToken(t *testing.T) {
 	t.Helper()
 	prev := mintGitHubIssuesReadToken
-	mintGitHubIssuesReadToken = func(ctx context.Context, installationID int64) (string, func(), error) {
+	mintGitHubIssuesReadToken = func(ctx context.Context, app *githubapi.Client, installationID int64) (string, func(), error) {
 		return "fake-token", func() {}, nil
 	}
 	t.Cleanup(func() { mintGitHubIssuesReadToken = prev })
