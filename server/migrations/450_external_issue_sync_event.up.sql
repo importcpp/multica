@@ -5,7 +5,7 @@
 -- be stale/out-of-order and carries no authority. delivery_id dedups redeliveries.
 -- No FKs, no CHECK — per repository policy.
 CREATE TABLE external_issue_sync_event (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     source_id UUID NOT NULL,
     delivery_id TEXT NOT NULL,

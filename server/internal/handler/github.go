@@ -952,14 +952,13 @@ func (h *Handler) DeleteGitHubInstallation(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, "failed to remove installation")
 		return
 	}
-	// Disconnecting the installation pauses this workspace's GitHub issue-import
-	// sources rather than deleting them or the issues they imported, so a
-	// reconnect + re-import stays idempotent (external_issue_link provenance is
-	// preserved). See external_issue_import.go.
-	if err := h.Queries.PauseExternalIssueSourcesByProviderInstance(r.Context(), db.PauseExternalIssueSourcesByProviderInstanceParams{
-		WorkspaceID: wsUUID,
-		Provider:    "github",
-		InstanceKey: "github.com",
+	// Disconnecting this installation pauses only the import sources bound to it
+	// (credential_id = this installation), not every GitHub source in the
+	// workspace: another installation's sources must keep working. Issues and
+	// links are preserved so a reconnect + re-import stays idempotent.
+	if err := h.Queries.PauseExternalIssueSourcesByCredential(r.Context(), db.PauseExternalIssueSourcesByCredentialParams{
+		WorkspaceID:  wsUUID,
+		CredentialID: idUUID,
 	}); err != nil {
 		slog.Warn("github: failed to pause issue-import sources after installation delete",
 			"workspace_id", workspaceID, "error", err)

@@ -622,6 +622,17 @@ func (h *Handler) DeleteProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to clear project chat context")
 		return
 	}
+	// External-issue import sources targeting this project must be detached in
+	// the same transaction, or the sync worker would keep creating issues in a
+	// deleted project. Detach + pause; already-imported issues follow the
+	// existing project-delete semantics below.
+	if err := qtx.ClearExternalIssueSourceProject(r.Context(), db.ClearExternalIssueSourceProjectParams{
+		WorkspaceID:     project.WorkspaceID,
+		TargetProjectID: project.ID,
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to detach import sources from project")
+		return
+	}
 	// Project-scoped saved views live on the project page; once the project
 	// is gone they are unreachable, so they go in the same transaction.
 	if err := qtx.DeleteIssueViewsByProjectScope(r.Context(), db.DeleteIssueViewsByProjectScopeParams{

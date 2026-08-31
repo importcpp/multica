@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DownloadCloud } from "lucide-react";
@@ -61,7 +61,6 @@ export function GitHubImportIssuesDialog({
   const [status, setStatus] = useState<SyncRunStatus | null>(null);
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const parsed = splitOwnerRepo(fullPath);
   const isRunning = runId !== null && !(status && TERMINAL_STATES.has(status.state));
@@ -91,38 +90,39 @@ export function GitHubImportIssuesDialog({
   }
 
   // Poll the active run until it reaches a terminal state, then refresh caches.
+  // Serial (no setInterval): each tick is scheduled only after the previous
+  // response returns, so a slow response can't be overtaken by a newer one and
+  // stale data can't clobber a terminal state.
   useEffect(() => {
     if (!runId) return;
-    let cancelled = false;
-    async function poll() {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    async function tick() {
       try {
         const s = await api.getExternalIssueSyncRun(workspaceId, runId!);
-        if (cancelled) return;
+        if (stopped) return;
+        // Guard against a drift/garbage status (empty state) causing an
+        // infinite poll: treat it as still running but keep polling only while
+        // the run id is real.
         setStatus(s);
-        if (TERMINAL_STATES.has(s.state)) {
-          stopPolling();
+        if (s.state && TERMINAL_STATES.has(s.state)) {
+          stopped = true;
           void qc.invalidateQueries({ queryKey: issueKeys.all(workspaceId) });
           void qc.invalidateQueries({ queryKey: githubKeys.all(workspaceId) });
+          return;
         }
       } catch {
-        // Transient poll failure: keep the interval; the next tick retries.
+        // Transient poll failure: fall through and retry on the next tick.
       }
+      if (!stopped) timer = setTimeout(tick, 1500);
     }
-    void poll();
-    pollRef.current = setInterval(poll, 1500);
+    void tick();
     return () => {
-      cancelled = true;
-      stopPolling();
+      stopped = true;
+      if (timer) clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, workspaceId]);
-
-  function stopPolling() {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }
 
   async function handleStart() {
     if (!parsed) return;
@@ -135,6 +135,12 @@ export function GitHubImportIssuesDialog({
         state,
         project_id: defaultProjectId,
       });
+      // Strict: a drift/garbage response with no run id must not leave the UI
+      // stuck "running" with nothing to poll or cancel.
+      if (!res.run_id) {
+        toast.error(t(($) => $.github.import_issues.toast_failed));
+        return;
+      }
       setRunId(res.run_id);
       toast.success(t(($) => $.github.import_issues.toast_queued));
     } catch (e) {

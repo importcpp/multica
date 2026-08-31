@@ -5,7 +5,7 @@
 -- sample feed the progress UI. kind/state validated in application code, no
 -- CHECK, no FKs — per repository policy.
 CREATE TABLE external_issue_sync_run (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     source_id UUID NOT NULL,
     kind TEXT NOT NULL DEFAULT 'backfill',

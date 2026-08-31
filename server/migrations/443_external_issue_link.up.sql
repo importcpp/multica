@@ -11,7 +11,7 @@
 -- so the applier can tell "only remote changed" from "local edited" per field
 -- and never silently clobber a local edit. No FKs by repository policy.
 CREATE TABLE external_issue_link (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     provider TEXT NOT NULL,
     instance_key TEXT NOT NULL,

@@ -16,7 +16,7 @@
 -- rename or transfer does not orphan the source; repository_full_path is the
 -- mutable display path.
 CREATE TABLE external_issue_source (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
     workspace_id UUID NOT NULL,
     provider TEXT NOT NULL,
     instance_key TEXT NOT NULL,

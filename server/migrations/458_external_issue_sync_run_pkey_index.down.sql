@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS external_issue_sync_run_pkey_uidx;

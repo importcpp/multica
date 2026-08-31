@@ -1,0 +1,1 @@
+ALTER TABLE external_issue_sync_event DROP CONSTRAINT IF EXISTS external_issue_sync_event_pkey;

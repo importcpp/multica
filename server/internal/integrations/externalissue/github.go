@@ -191,37 +191,61 @@ func (p githubProvider) nextCursor(creds Credentials, link string) (Cursor, erro
 	return Cursor(next), nil
 }
 
-// assertSameEndpoint validates a cursor URL points at the issues list endpoint
-// of the same repo on the approved origin.
+// assertSameEndpoint validates a cursor URL points at the issues LIST endpoint
+// of THIS repository on the approved origin — not merely some path containing
+// "/issues". GitHub's own next link is one of:
+//   - /repos/{owner}/{name}/issues
+//   - /repositories/{externalID}/issues
+//
+// so we accept exactly those two shapes for this repo and reject anything else
+// (a same-host link to another repo, another resource, or a deeper path).
 func (p githubProvider) assertSameEndpoint(creds Credentials, repo Repository, raw string) error {
-	if err := p.assertSameOriginPath(creds, raw); err != nil {
+	u, err := p.parseSameOrigin(creds, raw)
+	if err != nil {
 		return err
+	}
+	path := strings.TrimRight(u.Path, "/")
+	byFullPath := "/repos/" + repo.FullPath + "/issues"
+	byID := "/repositories/" + repo.ExternalID + "/issues"
+	if !strings.EqualFold(path, byFullPath) && path != byID {
+		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL path %q is not this repo's issues endpoint", u.Path)}
 	}
 	return nil
 }
 
 // assertSameOriginPath rejects any URL whose scheme/host differs from the
-// approved API base, or whose path escapes the REST namespace. This blocks a
-// malicious Link header from redirecting an authenticated request to an
-// attacker host (SSRF / token exfiltration).
+// approved API base, or whose path is not an issues endpoint. Used for the
+// rel="next" URL when the concrete repo endpoint shapes are already known to
+// listURL; the stricter per-repo check is assertSameEndpoint.
 func (p githubProvider) assertSameOriginPath(creds Credentials, raw string) error {
-	u, err := url.Parse(raw)
+	u, err := p.parseSameOrigin(creds, raw)
 	if err != nil {
-		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid pagination URL: %w", err)}
-	}
-	baseU, err := url.Parse(p.base(creds))
-	if err != nil {
-		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid api base: %w", err)}
-	}
-	if !strings.EqualFold(u.Scheme, baseU.Scheme) || !strings.EqualFold(u.Host, baseU.Host) {
-		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL host %q not on approved origin %q", u.Host, baseU.Host)}
+		return err
 	}
 	// GitHub's own next link may point at /repositories/{id}/issues rather than
 	// /repos/{owner}/{name}/issues; both are legitimate REST issue paths.
-	if !strings.Contains(u.Path, "/issues") {
+	if !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/issues") {
 		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL path %q is not an issues endpoint", u.Path)}
 	}
 	return nil
+}
+
+// parseSameOrigin parses raw and confirms it shares the approved API base's
+// scheme+host, blocking a malicious Link from redirecting an authenticated
+// request to an attacker host (SSRF / token exfiltration).
+func (p githubProvider) parseSameOrigin(creds Credentials, raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid pagination URL: %w", err)}
+	}
+	baseU, err := url.Parse(p.base(creds))
+	if err != nil {
+		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid api base: %w", err)}
+	}
+	if !strings.EqualFold(u.Scheme, baseU.Scheme) || !strings.EqualFold(u.Host, baseU.Host) {
+		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL host %q not on approved origin %q", u.Host, baseU.Host)}
+	}
+	return u, nil
 }
 
 // doJSON performs a GET and decodes a 2xx body into out. Non-2xx responses are

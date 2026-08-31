@@ -282,6 +282,10 @@ var concurrentIndexCleanups = map[string]string{
 	"449_external_issue_sync_run_claim_index":                   "idx_external_issue_sync_run_claim",
 	"451_external_issue_sync_event_delivery_index":              "uq_external_issue_sync_event_delivery",
 	"452_external_issue_sync_event_claim_index":                 "idx_external_issue_sync_event_claim",
+	"454_external_issue_source_pkey_index":                      "external_issue_source_pkey_uidx",
+	"456_external_issue_link_pkey_index":                        "external_issue_link_pkey_uidx",
+	"458_external_issue_sync_run_pkey_index":                    "external_issue_sync_run_pkey_uidx",
+	"460_external_issue_sync_event_pkey_index":                  "external_issue_sync_event_pkey_uidx",
 }
 
 // concurrentDownIndexCleanups covers every migration whose down direction
