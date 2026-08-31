@@ -242,3 +242,32 @@ func SetGitHubAPIBaseForTest(base string) (restore func()) {
 	apiBase = base
 	return func() { apiBase = prev }
 }
+
+// CredentialRef identifies the stored credential a run should authenticate with,
+// without leaking provider-specific shape into the worker. The worker passes the
+// run's provider + this ref to a CredentialResolver, which returns ready-to-use
+// Credentials. For GitHub the ID is the github_installation UUID; for GitLab it
+// will be the vcs_connection UUID. The worker never constructs a token itself.
+type CredentialRef struct {
+	// Provider is the externalissue provider kind ("github", later "gitlab").
+	Provider string
+	// WorkspaceID scopes the lookup so a resolver can enforce tenancy.
+	WorkspaceID string
+	// ID is the internal credential UUID (installation / connection).
+	ID string
+}
+
+// ErrCredentialUnavailable means the credential no longer exists or the account
+// must be re-authorized (e.g. installation removed, token revoked). The worker
+// maps it to a needs_reauth run outcome rather than a transient retry.
+var ErrCredentialUnavailable = errors.New("externalissue: credential unavailable")
+
+// CredentialResolver turns a CredentialRef into live Credentials for a call.
+// One implementation per provider keeps auth wiring out of the worker: adding
+// GitLab is a new resolver, not a worker edit. Implementations must return
+// ErrCredentialUnavailable when the credential is gone/needs reauth, and may
+// return a *RateLimitError-style transient error otherwise (the worker requeues
+// on any non-ErrCredentialUnavailable error).
+type CredentialResolver interface {
+	Resolve(ctx context.Context, ref CredentialRef) (Credentials, error)
+}

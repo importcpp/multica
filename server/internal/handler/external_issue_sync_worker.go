@@ -174,26 +174,31 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		return w.finishRun(ctx, run, "failed", []string{"run input snapshot missing or invalid"})
 	}
 
-	// Resolve installation -> fresh issues:read token for this claim. Tokens are
-	// short-lived, so we never persist them; each claim mints its own.
-	installation, err := w.h.Queries.GetGitHubInstallationByID(ctx, snap.CredentialID)
-	if err != nil || installation.WorkspaceID != run.WorkspaceID {
-		return w.finishRun(ctx, run, "needs_reauth", []string{"installation unavailable"})
-	}
-	token, revoke, err := mintGitHubIssuesReadToken(ctx, w.h.GHApp, installation.InstallationID)
-	if err != nil {
-		if errors.Is(err, errGitHubIssuesPermission) {
-			return w.finishRun(ctx, run, "needs_reauth", []string{"installation has not granted Issues read"})
-		}
-		return w.requeueRun(ctx, run, syncRateLimitBackoff)
-	}
-	defer revoke()
-
 	provider, ok := externalissue.For(snap.Provider)
 	if !ok {
 		return w.finishRun(ctx, run, "failed", []string{"provider unavailable"})
 	}
-	creds := externalissue.Credentials{Token: token}
+
+	// Resolve credentials through the provider-neutral resolver so the worker
+	// stays GitHub-agnostic: a GitLab run would use a different resolver without
+	// any change here. ErrCredentialUnavailable => needs_reauth; any other error
+	// (rate limit / network) => requeue.
+	resolver, ok := w.h.credentialResolver(snap.Provider)
+	if !ok {
+		return w.finishRun(ctx, run, "failed", []string{"no credential resolver for provider"})
+	}
+	creds, err := resolver.Resolve(ctx, externalissue.CredentialRef{
+		Provider:    snap.Provider,
+		WorkspaceID: util.UUIDToString(run.WorkspaceID),
+		ID:          util.UUIDToString(snap.CredentialID),
+	})
+	if err != nil {
+		if errors.Is(err, externalissue.ErrCredentialUnavailable) {
+			return w.finishRun(ctx, run, "needs_reauth", []string{"credential unavailable; reconnect the account"})
+		}
+		return w.requeueRun(ctx, run, syncRateLimitBackoff)
+	}
+
 	repo := externalissue.Repository{
 		InstanceKey: snap.InstanceKey,
 		ExternalID:  snap.RepositoryExternalID,
