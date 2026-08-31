@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -196,7 +197,9 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		if errors.Is(err, externalissue.ErrCredentialUnavailable) {
 			return w.finishRun(ctx, run, "needs_reauth", []string{"credential unavailable; reconnect the account"})
 		}
-		return w.requeueRun(ctx, run, syncRateLimitBackoff)
+		// Honor an explicit Retry-After when the credential mint was throttled,
+		// instead of a fixed backoff.
+		return w.requeueRun(ctx, run, credentialRetryDelay(err))
 	}
 
 	repo := externalissue.Repository{
@@ -245,7 +248,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 				SourceID:    run.SourceID,
 				ProjectID:   snap.TargetProjectID,
 				CreatorID:   snap.ConfiguredByUserID,
-				Remote:      toRemoteIssue(iss, repo),
+				Remote:      toRemoteIssue(snap.Provider, iss, repo),
 				RunID:       run.ID,
 				WorkerID:    w.id,
 			})
@@ -500,6 +503,16 @@ func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.Ex
 		}
 	}
 	return w.finishRun(ctx, run, "failed", []string{listErr.Error()})
+}
+
+// credentialRetryDelay honors a githubapi.RateLimitError's Retry-After when a
+// credential mint was throttled, else falls back to the fixed backoff.
+func credentialRetryDelay(err error) time.Duration {
+	var rl *githubapi.RateLimitError
+	if errors.As(err, &rl) && rl.RetryAfter > 0 {
+		return rl.RetryAfter
+	}
+	return syncRateLimitBackoff
 }
 
 // finishRun finalizes a run, fenced on this worker's id. samples is a bounded

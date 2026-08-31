@@ -311,7 +311,7 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 	// mutates the source (credential / project / filter) cannot redirect this
 	// run mid-flight; the worker reads only this snapshot. project/user ids are
 	// stored as strings and empty when unset.
-	inputSnapshot := buildRunInputSnapshot(installationUUID, repo, projectID, actingUserID(r), state)
+	inputSnapshot := buildRunInputSnapshot("github", installationUUID, repo, projectID, actingUserID(r), state)
 
 	// A source allows only one active run (partial unique index). If one is
 	// already queued/running, report it instead of failing the request.
@@ -501,7 +501,7 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 	}
 	// Rebuild the snapshot from the ORIGINAL project/filter/actor, swapping in
 	// only the freshly validated credential.
-	freshSnapshot := buildRunInputSnapshot(source.CredentialID, repo, prevSnap.TargetProjectID, prevSnap.ConfiguredByUserID, prevSnap.State)
+	freshSnapshot := buildRunInputSnapshot(prevSnap.Provider, source.CredentialID, repo, prevSnap.TargetProjectID, prevSnap.ConfiguredByUserID, prevSnap.State)
 
 	run, err := h.Queries.ResumeExternalIssueSyncRun(r.Context(), db.ResumeExternalIssueSyncRunParams{
 		ID:            runUUID,
@@ -526,10 +526,10 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 
 // buildRunInputSnapshot serializes the immutable execution inputs stored on a
 // run (see migration 453 and the worker's runInputSnapshot).
-func buildRunInputSnapshot(credentialID pgtype.UUID, repo externalissue.Repository, projectID, configuredBy pgtype.UUID, state string) []byte {
+func buildRunInputSnapshot(provider string, credentialID pgtype.UUID, repo externalissue.Repository, projectID, configuredBy pgtype.UUID, state string) []byte {
 	m := map[string]string{
 		"credential_id":          util.UUIDToString(credentialID),
-		"provider":               "github",
+		"provider":               provider,
 		"instance_key":           repo.InstanceKey,
 		"repository_external_id": repo.ExternalID,
 		"repository_full_path":   repo.FullPath,
@@ -545,7 +545,7 @@ func buildRunInputSnapshot(credentialID pgtype.UUID, repo externalissue.Reposito
 	return b
 }
 
-func toRemoteIssue(iss externalissue.Issue, repo externalissue.Repository) service.RemoteIssue {
+func toRemoteIssue(provider string, iss externalissue.Issue, repo externalissue.Repository) service.RemoteIssue {
 	var updated time.Time
 	if iss.RemoteUpdatedAt != "" {
 		if t, err := time.Parse(time.RFC3339, iss.RemoteUpdatedAt); err == nil {
@@ -554,7 +554,7 @@ func toRemoteIssue(iss externalissue.Issue, repo externalissue.Repository) servi
 	}
 	return service.RemoteIssue{
 		ExternalID:  iss.ExternalID,
-		Provider:    "github",
+		Provider:    provider,
 		InstanceKey: repo.InstanceKey,
 		Number:      iss.Number,
 		Title:       iss.Title,

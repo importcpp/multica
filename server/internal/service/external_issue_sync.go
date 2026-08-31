@@ -471,3 +471,98 @@ func (s *ExternalIssueSyncService) publishUpdated(ctx context.Context, issue db.
 		},
 	})
 }
+
+// UseRemoteFields overwrites the linked issue's title and/or body with the
+// caller-provided remote content (fetched by the handler via the provider),
+// through the shared transaction: it locks the issue row, updates the requested
+// fields, advances the link's baseline to the remote hashes, clears the field's
+// conflict + local-ownership, and publishes issue:updated after commit. This is
+// the real "use remote" — it applies remote content and emits an event, rather
+// than only nudging a baseline. Fields not requested are left untouched.
+func (s *ExternalIssueSyncService) UseRemoteFields(ctx context.Context, workspaceID pgtype.UUID, issueID pgtype.UUID, remoteTitle, remoteBody string, applyTitle, applyBody bool) error {
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+
+	link, err := qtx.GetExternalIssueLinkByIssue(ctx, db.GetExternalIssueLinkByIssueParams{
+		WorkspaceID: workspaceID, IssueID: issueID,
+	})
+	if err != nil {
+		return fmt.Errorf("load link: %w", err)
+	}
+	issue, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
+		ID: issueID, WorkspaceID: workspaceID,
+	})
+	if err != nil {
+		return fmt.Errorf("lock issue: %w", err)
+	}
+
+	newTitle := issue.Title
+	newBody := issue.Description.String
+	if applyTitle {
+		newTitle = remoteTitle
+	}
+	if applyBody {
+		newBody = remoteBody
+	}
+	changed := newTitle != issue.Title || newBody != issue.Description.String
+	if changed {
+		updated, err := qtx.UpdateIssue(ctx, db.UpdateIssueParams{
+			ID:            issue.ID,
+			Title:         pgtype.Text{String: newTitle, Valid: true},
+			Description:   pgtype.Text{String: newBody, Valid: true},
+			AssigneeType:  issue.AssigneeType,
+			AssigneeID:    issue.AssigneeID,
+			StartDate:     issue.StartDate,
+			DueDate:       issue.DueDate,
+			ParentIssueID: issue.ParentIssueID,
+			ProjectID:     issue.ProjectID,
+			Stage:         issue.Stage,
+		})
+		if err != nil {
+			return fmt.Errorf("update issue: %w", err)
+		}
+		issue = updated
+	}
+
+	// Advance baseline to the applied remote content and clear conflict +
+	// ownership for the applied fields; leave untouched fields as-is.
+	titleBaseline := link.TitleBaselineHash
+	if applyTitle {
+		titleBaseline = contentHash(newTitle)
+	}
+	bodyBaseline := link.BodyBaselineHash
+	if applyBody {
+		bodyBaseline = contentHash(newBody)
+	}
+	if err := qtx.UpdateExternalIssueLinkSync(ctx, db.UpdateExternalIssueLinkSyncParams{
+		ID:                link.ID,
+		DisplayNumber:     link.DisplayNumber,
+		ExternalHtmlUrl:   link.ExternalHtmlUrl,
+		RemoteState:       link.RemoteState,
+		RemoteUpdatedAt:   link.RemoteUpdatedAt,
+		TitleBaselineHash: titleBaseline,
+		BodyBaselineHash:  bodyBaseline,
+		TitleConflict:     link.TitleConflict && !applyTitle,
+		BodyConflict:      link.BodyConflict && !applyBody,
+		TitleLocalOwned:   link.TitleLocalOwned && !applyTitle,
+		BodyLocalOwned:    link.BodyLocalOwned && !applyBody,
+	}); err != nil {
+		return fmt.Errorf("update link sync: %w", err)
+	}
+
+	ws, err := qtx.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		return fmt.Errorf("load workspace: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit use-remote: %w", err)
+	}
+	if changed {
+		s.publishUpdated(ctx, issue, ws)
+	}
+	return nil
+}

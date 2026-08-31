@@ -6,6 +6,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -229,3 +230,45 @@ func TestNewFromEnv(t *testing.T) {
 		}
 	})
 }
+
+// A plain 403 (no rate-limit headers) on token mint must surface as a
+// StatusError(403) — NOT a RateLimitError — so callers can prompt a re-authorize
+// instead of retrying forever as if throttled. Regression for codex56 P0-5.
+func TestMintPlain403IsStatusError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// No Retry-After, no X-RateLimit-Remaining header.
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	_, err := c.InstallationTokenScoped(context.Background(), 1, TokenPermissions{"issues": "read"})
+	var se *StatusError
+	if !errorsAs(err, &se) {
+		t.Fatalf("err = %T (%v), want *StatusError", err, err)
+	}
+	if se.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", se.StatusCode)
+	}
+	var rl *RateLimitError
+	if errorsAs(err, &rl) {
+		t.Fatal("plain 403 must not be a RateLimitError")
+	}
+}
+
+// A 403 WITH X-RateLimit-Remaining: 0 is a genuine throttle → RateLimitError.
+func TestMint403WithRemainingZeroIsRateLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.Header().Set("X-RateLimit-Reset", "4102444800")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	c := newTestClient(t, srv.URL)
+	_, err := c.InstallationToken(context.Background(), 1)
+	var rl *RateLimitError
+	if !errorsAs(err, &rl) {
+		t.Fatalf("err = %T (%v), want *RateLimitError", err, err)
+	}
+}
+
+func errorsAs(err error, target any) bool { return errors.As(err, target) }

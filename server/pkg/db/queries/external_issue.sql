@@ -83,31 +83,22 @@ WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND external_iss
 SELECT * FROM external_issue_link
 WHERE workspace_id = $1 AND issue_id = $2;
 
--- name: SetExternalIssueLinkFieldOwnership :exec
--- Conflict resolution: mark a field local-owned (keep local: remote changes are
--- surfaced but never overwrite) or clear ownership (resume sync: let remote flow
--- again), and clear the field's conflict flag. Baselines are advanced to the
--- current content hashes so the next sync compares from an agreed point.
+-- name: ResolveExternalIssueLinkField :exec
+-- Per-field conflict resolution. For a field IN SCOPE ($3 title, $5 body) the
+-- ownership is set to the given value ($4/$6) and the conflict flag is cleared —
+-- both keep_local and resume_sync resolve the conflict, so clearing does not
+-- depend on the ownership direction (the old query only cleared when ownership
+-- became true, so resume_sync left the conflict showing). Out-of-scope fields
+-- are left completely untouched.
 UPDATE external_issue_link SET
-    title_local_owned = $3,
-    body_local_owned = $4,
-    title_conflict = CASE WHEN $3 THEN false ELSE title_conflict END,
-    body_conflict = CASE WHEN $4 THEN false ELSE body_conflict END,
+    title_local_owned = CASE WHEN sqlc.arg('title_in_scope') THEN sqlc.arg('title_owned') ELSE title_local_owned END,
+    body_local_owned  = CASE WHEN sqlc.arg('body_in_scope')  THEN sqlc.arg('body_owned')  ELSE body_local_owned  END,
+    title_conflict    = CASE WHEN sqlc.arg('title_in_scope') THEN false ELSE title_conflict END,
+    body_conflict     = CASE WHEN sqlc.arg('body_in_scope')  THEN false ELSE body_conflict  END,
     updated_at = now()
 WHERE id = $1 AND workspace_id = $2;
 
--- name: ClearExternalIssueLinkConflicts :exec
--- Used after a "use remote" overwrite: the local content now equals remote, so
--- clear both conflict flags and any local ownership, and advance baselines.
-UPDATE external_issue_link SET
-    title_conflict = false,
-    body_conflict = false,
-    title_local_owned = false,
-    body_local_owned = false,
-    title_baseline_hash = $3,
-    body_baseline_hash = $4,
-    updated_at = now()
-WHERE id = $1 AND workspace_id = $2;
+
 
 -- name: ClaimExternalIssueLink :one
 -- Race-safe claim of a remote issue on stable identity. Two concurrent

@@ -1,13 +1,15 @@
 package handler
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -80,7 +82,11 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	wantTitle, wantBody := scopeFields(req.Fields)
+	wantTitle, wantBody, ok := scopeFields(req.Fields)
+	if !ok {
+		writeError(w, http.StatusBadRequest, "fields must be a subset of [title, body]")
+		return
+	}
 	link, err := h.Queries.GetExternalIssueLinkByIssue(r.Context(), db.GetExternalIssueLinkByIssueParams{
 		WorkspaceID: issue.WorkspaceID,
 		IssueID:     issue.ID,
@@ -92,43 +98,37 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 
 	switch req.Action {
 	case "keep_local":
-		// Local wins for the scoped fields going forward.
-		titleOwned := link.TitleLocalOwned || wantTitle
-		bodyOwned := link.BodyLocalOwned || wantBody
-		if err := h.Queries.SetExternalIssueLinkFieldOwnership(r.Context(), db.SetExternalIssueLinkFieldOwnershipParams{
+		// Local wins for the scoped fields; conflict cleared for those fields.
+		if err := h.Queries.ResolveExternalIssueLinkField(r.Context(), db.ResolveExternalIssueLinkFieldParams{
 			ID: link.ID, WorkspaceID: issue.WorkspaceID,
-			TitleLocalOwned: titleOwned, BodyLocalOwned: bodyOwned,
+			TitleInScope: wantTitle, TitleOwned: true,
+			BodyInScope: wantBody, BodyOwned: true,
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to keep local")
 			return
 		}
 	case "resume_sync":
-		// Clear ownership for the scoped fields so remote can flow again.
-		titleOwned := link.TitleLocalOwned && !wantTitle
-		bodyOwned := link.BodyLocalOwned && !wantBody
-		if err := h.Queries.SetExternalIssueLinkFieldOwnership(r.Context(), db.SetExternalIssueLinkFieldOwnershipParams{
+		// Clear ownership so remote flows again; conflict cleared for those fields.
+		if err := h.Queries.ResolveExternalIssueLinkField(r.Context(), db.ResolveExternalIssueLinkFieldParams{
 			ID: link.ID, WorkspaceID: issue.WorkspaceID,
-			TitleLocalOwned: titleOwned, BodyLocalOwned: bodyOwned,
+			TitleInScope: wantTitle, TitleOwned: false,
+			BodyInScope: wantBody, BodyOwned: false,
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to resume sync")
 			return
 		}
 	case "use_remote":
-		// Overwrite local with the remote content via the shared, event-emitting
-		// update path, then clear conflicts and advance baselines.
-		title := issue.Title
-		body := issue.Description.String
-		// The current remote content is not stored on the link (only its hash),
-		// so a full "use remote" re-fetch belongs to the sync engine; for the
-		// immediate UI action we clear conflict + ownership and let the next sync
-		// apply remote (now unblocked). This keeps the endpoint side-effect-free
-		// on issue content while unblocking the field.
-		if err := h.Queries.ClearExternalIssueLinkConflicts(r.Context(), db.ClearExternalIssueLinkConflictsParams{
-			ID: link.ID, WorkspaceID: issue.WorkspaceID,
-			TitleBaselineHash: hashOrKeep(wantTitle, title, link.TitleBaselineHash),
-			BodyBaselineHash:  hashOrKeep(wantBody, body, link.BodyBaselineHash),
-		}); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to use remote")
+		// Fetch the CURRENT remote content and apply it through the shared,
+		// event-emitting update path — a real overwrite, not just a baseline nudge.
+		remote, status, err := h.fetchRemoteIssue(r, issue.WorkspaceID, link)
+		if err != nil {
+			writeError(w, status, "failed to fetch remote issue")
+			return
+		}
+		if err := h.ExternalIssueSync.UseRemoteFields(
+			r.Context(), issue.WorkspaceID, issue.ID, remote.Title, remote.Body, wantTitle, wantBody,
+		); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to apply remote content")
 			return
 		}
 	default:
@@ -138,10 +138,51 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// scopeFields interprets the optional fields list; empty means both.
-func scopeFields(fields []string) (title, body bool) {
+// fetchRemoteIssue resolves credentials for the link's provider and fetches the
+// issue's current remote state, so "use remote" applies what is actually on the
+// remote now (not a stale hash). Returns an HTTP status for the error path.
+func (h *Handler) fetchRemoteIssue(r *http.Request, workspaceID pgtype.UUID, link db.ExternalIssueLink) (externalissue.Issue, int, error) {
+	provider, ok := externalissue.For(link.Provider)
+	if !ok {
+		return externalissue.Issue{}, http.StatusInternalServerError, fmt.Errorf("provider unavailable")
+	}
+	source, err := h.Queries.GetExternalIssueSource(r.Context(), db.GetExternalIssueSourceParams{
+		ID: link.SourceID, WorkspaceID: workspaceID,
+	})
+	if err != nil || !source.CredentialID.Valid {
+		return externalissue.Issue{}, http.StatusConflict, fmt.Errorf("source unavailable")
+	}
+	resolver, ok := h.credentialResolver(link.Provider)
+	if !ok {
+		return externalissue.Issue{}, http.StatusInternalServerError, fmt.Errorf("no resolver")
+	}
+	creds, err := resolver.Resolve(r.Context(), externalissue.CredentialRef{
+		Provider:    link.Provider,
+		WorkspaceID: util.UUIDToString(workspaceID),
+		ID:          util.UUIDToString(source.CredentialID),
+	})
+	if err != nil {
+		return externalissue.Issue{}, http.StatusBadGateway, err
+	}
+	repo := externalissue.Repository{
+		InstanceKey: source.InstanceKey,
+		ExternalID:  source.RepositoryExternalID,
+		FullPath:    source.RepositoryFullPath,
+	}
+	iss, err := provider.GetIssue(r.Context(), creds, repo, externalissue.IssueRef{
+		ExternalID: link.ExternalIssueID, Number: link.DisplayNumber,
+	})
+	if err != nil {
+		return externalissue.Issue{}, mapExternalIssueStatus(err), err
+	}
+	return iss, http.StatusOK, nil
+}
+
+// scopeFields interprets the optional fields list; empty means both. ok=false
+// when any entry is not "title"/"body" so the caller can 400.
+func scopeFields(fields []string) (title, body, ok bool) {
 	if len(fields) == 0 {
-		return true, true
+		return true, true, true
 	}
 	for _, f := range fields {
 		switch f {
@@ -149,17 +190,9 @@ func scopeFields(fields []string) (title, body bool) {
 			title = true
 		case "body":
 			body = true
+		default:
+			return false, false, false
 		}
 	}
-	return title, body
-}
-
-// hashOrKeep returns the sha256 of value when apply is true, else the existing
-// baseline unchanged.
-func hashOrKeep(apply bool, value, existing string) string {
-	if !apply {
-		return existing
-	}
-	sum := sha256.Sum256([]byte(value))
-	return hex.EncodeToString(sum[:])
+	return title, body, true
 }

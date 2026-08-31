@@ -251,7 +251,12 @@ func (c *Client) mintInstallationToken(ctx context.Context, key tokenKey, perms 
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+	// A 403/429 is a rate limit ONLY when GitHub actually signals throttling
+	// (Retry-After, or X-RateLimit-Remaining: 0). A plain 403 — e.g. the
+	// installation has not granted the requested permission — must surface as a
+	// StatusError so callers can prompt a re-authorize instead of retrying
+	// forever as if throttled.
+	if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode == http.StatusForbidden && isRateLimited(resp)) {
 		return "", RateLimitFromResponse(resp, c.now())
 	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
@@ -288,6 +293,16 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("github: unexpected status %d", e.StatusCode)
+}
+
+// isRateLimited reports whether a response actually carries a GitHub throttling
+// signal — a Retry-After header, or X-RateLimit-Remaining: 0. Used to tell a
+// throttled 403 apart from a permission/other 403.
+func isRateLimited(resp *http.Response) bool {
+	if strings.TrimSpace(resp.Header.Get("Retry-After")) != "" {
+		return true
+	}
+	return strings.TrimSpace(resp.Header.Get("X-RateLimit-Remaining")) == "0"
 }
 
 // RateLimitFromResponse builds a RateLimitError from GitHub's throttling headers.
