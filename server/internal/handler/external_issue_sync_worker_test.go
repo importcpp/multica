@@ -111,11 +111,18 @@ func seedSyncWorkerFixture(t *testing.T, pages [][]map[string]any) (workspaceID,
 	// pre-seeded), and the issues list endpoint returning the scripted pages.
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&counter, 1)
+		w.Header().Set("Content-Type", "application/json")
+		// Repository resolve (GET /repos/{owner}/{repo}) returns the stable id the
+		// source was seeded with, so live credential/repo verification on resume
+		// resolves to the same external id.
+		if strings.Contains(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/issues") {
+			fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
+			return
+		}
 		page := 0
 		if p := r.URL.Query().Get("p"); p != "" {
 			page, _ = strconv.Atoi(p)
 		}
-		w.Header().Set("Content-Type", "application/json")
 		if page >= len(pages) {
 			fmt.Fprint(w, `[]`)
 			return
@@ -609,6 +616,7 @@ func TestResumeSyncRunPreservesOriginalProject(t *testing.T) {
 	}
 	ctx := context.Background()
 	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, [][]map[string]any{{issue(1, 1, "a")}})
+	withFakeToken(t)
 
 	// Two projects: A (the run's original target) and B (source repointed later).
 	var projA, projB string
@@ -819,5 +827,54 @@ func TestSyncWorkerFailedAccountingIsFenced(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("fenced failed-accounting wrote %d ledger rows, want 0", count)
+	}
+}
+
+// Resume must be REJECTED when the reconnected credential/installation can no
+// longer reach the repository, instead of being accepted and only failing later
+// in the worker. Regression for codex56 round-4 (resume credential re-resolve).
+func TestResumeSyncRunRejectsInaccessibleRepo(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, [][]map[string]any{{issue(1, 1, "a")}})
+	withFakeToken(t)
+
+	// Point the provider at a server that 404s the repo resolve: the reconnected
+	// installation no longer includes this repository.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(externalissue.SetGitHubAPIBaseForTest(srv.URL))
+
+	var credentialID, configuredBy string
+	_ = testPool.QueryRow(ctx, `SELECT credential_id::text, configured_by_user_id::text FROM external_issue_source WHERE id=$1`, sourceID).Scan(&credentialID, &configuredBy)
+	snap := fmt.Sprintf(`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":"555","repository_full_path":"acme/widgets","configured_by_user_id":%q,"state":"open"}`, credentialID, configuredBy)
+	var runID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_sync_run(workspace_id,source_id,kind,state,filter_snapshot,input_snapshot,cursor)
+		VALUES($1,$2,'backfill','needs_reauth','{"state":"open"}',$3::jsonb,'saved') RETURNING id`,
+		workspaceID, sourceID, snap).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+
+	req := httptest.NewRequest("POST", "/api/workspaces/"+workspaceID+"/external-issue-sync-runs/"+runID+"/resume", nil)
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", workspaceID)
+	rctx.URLParams.Add("runId", runID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	testHandler.ResumeSyncRun(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("resume status = %d, body=%s, want 409 (inaccessible repo)", rec.Code, rec.Body.String())
+	}
+	// The run must remain in its paused state, not be re-queued.
+	var state string
+	if err := testPool.QueryRow(ctx, `SELECT state FROM external_issue_sync_run WHERE id=$1`, runID).Scan(&state); err != nil {
+		t.Fatalf("read state: %v", err)
+	}
+	if state != "needs_reauth" {
+		t.Fatalf("run state = %q, want needs_reauth (resume rejected, not queued)", state)
 	}
 }

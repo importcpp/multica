@@ -504,6 +504,32 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 		ExternalID:  prevSnap.RepositoryExternalID,
 		FullPath:    prevSnap.RepositoryFullPath,
 	}
+	// Verify the refreshed credential can actually reach the SAME repository
+	// before accepting the resume. Comparing repository_external_id alone does
+	// not prove the new installation still has access: a reconnect with an
+	// installation that no longer includes this repo would otherwise be accepted
+	// and only fail later in the worker. Resolve live and confirm identity.
+	if provider, ok := externalissue.For(prevSnap.Provider); ok {
+		if resolver, ok := h.credentialResolver(prevSnap.Provider); ok {
+			creds, rerr := resolver.Resolve(r.Context(), externalissue.CredentialRef{
+				Provider:    prevSnap.Provider,
+				WorkspaceID: util.UUIDToString(workspaceUUID),
+				ID:          util.UUIDToString(source.CredentialID),
+			})
+			if rerr != nil {
+				writeError(w, http.StatusConflict, "reconnect the GitHub installation before resuming")
+				return
+			}
+			resolved, rerr := provider.ResolveRepository(r.Context(), creds, externalissue.RepositoryRef{
+				FullPath: prevSnap.RepositoryFullPath,
+			})
+			if rerr != nil || resolved.ExternalID != prevSnap.RepositoryExternalID {
+				writeError(w, http.StatusConflict,
+					"the reconnected installation cannot access this repository; start a new import instead of resuming")
+				return
+			}
+		}
+	}
 	// Rebuild the snapshot from the ORIGINAL project/filter/actor, swapping in
 	// only the freshly validated credential.
 	freshSnapshot := buildRunInputSnapshot(prevSnap.Provider, source.CredentialID, repo, prevSnap.TargetProjectID, prevSnap.ConfiguredByUserID, prevSnap.State)
