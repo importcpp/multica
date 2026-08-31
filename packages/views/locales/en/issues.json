@@ -878,5 +878,15 @@
     "surface_loading": "Loading {{name}}…",
     "surface_unavailable": "{{name}} could not load its interface. The installed version may not include it.",
     "surface_navigated": "{{name}} tried to replace its panel with a page loaded from elsewhere. It has been stopped and disconnected — tell your workspace admin."
+  },
+  "external_source": {
+    "label": "Imported from {{provider}}",
+    "view_remote": "View on {{provider}}",
+    "conflict": "Sync conflict",
+    "keep_local": "Keep local",
+    "use_remote": "Use remote",
+    "resume_sync": "Resume sync",
+    "toast_resolved": "Conflict resolved",
+    "toast_failed": "Failed to resolve conflict"
   }
 }

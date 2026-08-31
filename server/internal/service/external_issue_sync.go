@@ -345,6 +345,12 @@ func resolveField(local, remote, baselineHash string, localOwned bool) (value st
 	if localOwned {
 		return local, false, true
 	}
+	// If local and remote already agree there is nothing to reconcile — never
+	// report a conflict when both sides converged on the same final value, even
+	// if each diverged from the baseline independently.
+	if local == remote {
+		return local, false, false
+	}
 	localChanged := contentHash(local) != baselineHash
 	remoteChanged := contentHash(remote) != baselineHash
 	switch {

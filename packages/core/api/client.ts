@@ -167,6 +167,7 @@ import type {
   ListGitHubRepositoriesResponse,
   ImportGitHubIssuesResponse,
   SyncRunStatus,
+  IssueExternalSource,
   GitHubConnectResponse,
   ListVCSConnectionsResponse,
   ConnectVCSRequest,
@@ -411,11 +412,13 @@ import {
   ListGitHubRepositoriesResponseSchema,
   ImportGitHubIssuesResponseSchema,
   SyncRunStatusSchema,
+  IssueExternalSourceSchema,
   EMPTY_GITHUB_CONNECT_RESPONSE,
   EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE,
   EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
   EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
   EMPTY_SYNC_RUN_STATUS,
+  EMPTY_ISSUE_EXTERNAL_SOURCE,
   RuntimeModelListRequestSchema,
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   SkillSchema,
@@ -4382,6 +4385,23 @@ export class ApiClient {
       EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
       { endpoint: "POST /api/workspaces/:id/external-issue-sync-runs/:runId/resume" },
     );
+  }
+
+  async getIssueExternalSource(issueId: string): Promise<IssueExternalSource> {
+    const raw = await this.fetch<unknown>(`/api/issues/${issueId}/external-source`);
+    return parseWithFallback(raw, IssueExternalSourceSchema, EMPTY_ISSUE_EXTERNAL_SOURCE, {
+      endpoint: "GET /api/issues/:id/external-source",
+    });
+  }
+
+  async resolveIssueExternalConflict(
+    issueId: string,
+    body: { action: "keep_local" | "resume_sync" | "use_remote"; fields?: string[] },
+  ): Promise<void> {
+    await this.fetch(`/api/issues/${issueId}/external-source/resolve`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
   }
 
   async deleteGitHubInstallation(workspaceId: string, installationId: string): Promise<void> {

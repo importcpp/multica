@@ -38,3 +38,13 @@ export const issuePullRequestsOptions = (issueId: string) =>
     queryFn: () => api.listIssuePullRequests(issueId),
     enabled: !!issueId,
   });
+
+export const issueExternalSourceOptions = (issueId: string) =>
+  queryOptions({
+    queryKey: ["issue-external-source", issueId] as const,
+    queryFn: () => api.getIssueExternalSource(issueId),
+    enabled: !!issueId,
+    // An issue with no external source returns 404; don't retry that into a
+    // spinner, just treat it as "no badge".
+    retry: false,
+  });

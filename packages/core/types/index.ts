@@ -199,6 +199,7 @@ export type {
   ListGitHubRepositoriesResponse,
   ImportGitHubIssuesResponse,
   SyncRunStatus,
+  IssueExternalSource,
   GitHubConnectResponse,
 } from "./github";
 export type {

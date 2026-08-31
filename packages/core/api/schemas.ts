@@ -64,6 +64,7 @@ import type {
   ListGitHubRepositoriesResponse,
   ImportGitHubIssuesResponse,
   SyncRunStatus,
+  IssueExternalSource,
   ListLabelsResponse,
   ListWebhookDeliveriesResponse,
   IssueStatusEntry,
@@ -428,6 +429,30 @@ export const EMPTY_SYNC_RUN_STATUS: SyncRunStatus = {
   failed: 0,
   total: 0,
   cancel_requested: false,
+};
+
+export const IssueExternalSourceSchema = z.object({
+  provider: z.string().optional().default(""),
+  instance_key: z.string().optional().default(""),
+  display_number: z.number().optional().default(0),
+  external_url: z.string().optional().default(""),
+  remote_state: z.string().optional().default(""),
+  title_conflict: z.boolean().optional().default(false),
+  body_conflict: z.boolean().optional().default(false),
+  title_local_owned: z.boolean().optional().default(false),
+  body_local_owned: z.boolean().optional().default(false),
+}).loose();
+
+export const EMPTY_ISSUE_EXTERNAL_SOURCE: IssueExternalSource = {
+  provider: "",
+  instance_key: "",
+  display_number: 0,
+  external_url: "",
+  remote_state: "",
+  title_conflict: false,
+  body_conflict: false,
+  title_local_owned: false,
+  body_local_owned: false,
 };
 
 export const GitHubPullRequestSchema = z.object({

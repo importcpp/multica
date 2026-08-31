@@ -329,3 +329,28 @@ func TestApplyConcurrentLocalEditNotLost(t *testing.T) {
 		t.Fatalf("local edit was overwritten: title = %q", title)
 	}
 }
+
+// resolveField must not flag a conflict when local and remote converged on the
+// same final value, even if each diverged from the baseline (round-2 review nit).
+func TestResolveFieldEqualValuesNoConflict(t *testing.T) {
+	baseline := contentHash("orig")
+	// Both sides changed away from baseline but to the SAME value.
+	value, conflict, owned := resolveField("same-new", "same-new", baseline, false)
+	if conflict {
+		t.Fatal("equal local/remote must not be a conflict")
+	}
+	if owned {
+		t.Fatal("no ownership change expected")
+	}
+	if value != "same-new" {
+		t.Fatalf("value = %q, want same-new", value)
+	}
+	// Genuinely divergent values still conflict.
+	if _, c, _ := resolveField("local-new", "remote-new", baseline, false); !c {
+		t.Fatal("divergent local/remote must still conflict")
+	}
+	// Local-owned always keeps local and never conflicts.
+	if v, c, o := resolveField("kept", "remote", baseline, true); c || !o || v != "kept" {
+		t.Fatalf("local-owned = (%q,%v,%v), want (kept,false,true)", v, c, o)
+	}
+}

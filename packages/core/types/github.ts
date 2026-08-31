@@ -174,3 +174,16 @@ export interface SyncRunStatus {
   total: number;
   cancel_requested: boolean;
 }
+
+/** Provenance for an imported issue, shown as a source badge on the issue. */
+export interface IssueExternalSource {
+  provider: string;
+  instance_key: string;
+  display_number: number;
+  external_url: string;
+  remote_state: string;
+  title_conflict: boolean;
+  body_conflict: boolean;
+  title_local_owned: boolean;
+  body_local_owned: boolean;
+}

@@ -93,6 +93,7 @@ import { ExecutionLogSection } from "./execution-log-section";
 import { QuickActionsSection } from "./quick-actions-section";
 import { PluginPanelSection } from "../../plugins";
 import { PullRequestList } from "./pull-request-list";
+import { IssueSourceBadge } from "./issue-source-badge";
 import { useGitHubSettings } from "@multica/core/github";
 import { useQuery } from "@tanstack/react-query";
 import { useAuthStore } from "@multica/core/auth";
@@ -2511,6 +2512,10 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
           time rather than by a silently shorter list. */}
       <QuickActionsSection issueId={issue.id} />
       <PluginPanelSection issueId={issue.id} />
+
+      {/* Provenance for an imported issue: source badge + conflict actions.
+          Renders nothing when the issue was not imported. */}
+      <IssueSourceBadge issueId={issue.id} />
 
       {/* Parent issue — standalone section, only when the issue has a
           parent. Setting a parent is reachable via the issue actions menu;

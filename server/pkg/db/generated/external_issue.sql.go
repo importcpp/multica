@@ -315,6 +315,37 @@ func (q *Queries) ClaimNextExternalIssueSyncRun(ctx context.Context, arg ClaimNe
 	return i, err
 }
 
+const clearExternalIssueLinkConflicts = `-- name: ClearExternalIssueLinkConflicts :exec
+UPDATE external_issue_link SET
+    title_conflict = false,
+    body_conflict = false,
+    title_local_owned = false,
+    body_local_owned = false,
+    title_baseline_hash = $3,
+    body_baseline_hash = $4,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+`
+
+type ClearExternalIssueLinkConflictsParams struct {
+	ID                pgtype.UUID `json:"id"`
+	WorkspaceID       pgtype.UUID `json:"workspace_id"`
+	TitleBaselineHash string      `json:"title_baseline_hash"`
+	BodyBaselineHash  string      `json:"body_baseline_hash"`
+}
+
+// Used after a "use remote" overwrite: the local content now equals remote, so
+// clear both conflict flags and any local ownership, and advance baselines.
+func (q *Queries) ClearExternalIssueLinkConflicts(ctx context.Context, arg ClearExternalIssueLinkConflictsParams) error {
+	_, err := q.db.Exec(ctx, clearExternalIssueLinkConflicts,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.TitleBaselineHash,
+		arg.BodyBaselineHash,
+	)
+	return err
+}
+
 const clearExternalIssueSourceProject = `-- name: ClearExternalIssueSourceProject :exec
 UPDATE external_issue_source SET
     target_project_id = NULL,
@@ -1015,6 +1046,37 @@ func (q *Queries) ResumeExternalIssueSyncRun(ctx context.Context, arg ResumeExte
 		&i.PageOffset,
 	)
 	return i, err
+}
+
+const setExternalIssueLinkFieldOwnership = `-- name: SetExternalIssueLinkFieldOwnership :exec
+UPDATE external_issue_link SET
+    title_local_owned = $3,
+    body_local_owned = $4,
+    title_conflict = CASE WHEN $3 THEN false ELSE title_conflict END,
+    body_conflict = CASE WHEN $4 THEN false ELSE body_conflict END,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+`
+
+type SetExternalIssueLinkFieldOwnershipParams struct {
+	ID              pgtype.UUID `json:"id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	TitleLocalOwned bool        `json:"title_local_owned"`
+	BodyLocalOwned  bool        `json:"body_local_owned"`
+}
+
+// Conflict resolution: mark a field local-owned (keep local: remote changes are
+// surfaced but never overwrite) or clear ownership (resume sync: let remote flow
+// again), and clear the field's conflict flag. Baselines are advanced to the
+// current content hashes so the next sync compares from an agreed point.
+func (q *Queries) SetExternalIssueLinkFieldOwnership(ctx context.Context, arg SetExternalIssueLinkFieldOwnershipParams) error {
+	_, err := q.db.Exec(ctx, setExternalIssueLinkFieldOwnership,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.TitleLocalOwned,
+		arg.BodyLocalOwned,
+	)
+	return err
 }
 
 const setExternalIssueSourceState = `-- name: SetExternalIssueSourceState :exec

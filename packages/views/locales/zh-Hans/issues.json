@@ -847,5 +847,15 @@
     "surface_loading": "正在加载 {{name}}…",
     "surface_unavailable": "{{name}} 的界面无法加载，已安装的版本可能不包含它。",
     "surface_navigated": "{{name}} 试图把面板替换成从别处加载的页面。已经拦下并断开连接，建议告知工作区管理员。"
+  },
+  "external_source": {
+    "label": "导入自 {{provider}}",
+    "view_remote": "在 {{provider}} 查看",
+    "conflict": "同步冲突",
+    "keep_local": "保留本地",
+    "use_remote": "使用远端",
+    "resume_sync": "恢复同步",
+    "toast_resolved": "冲突已解决",
+    "toast_failed": "解决冲突失败"
   }
 }
