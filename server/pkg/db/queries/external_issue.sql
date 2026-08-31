@@ -191,7 +191,9 @@ RETURNING *;
 -- name: AdvanceExternalIssueSyncRun :execrows
 -- Persist page progress: new cursor, refreshed lease, and the running counts.
 -- Fenced on worker_id: if the lease was stolen by another worker, this updates
--- zero rows and the caller must stop writing to the run.
+-- zero rows and the caller must stop writing to the run. page_offset records how
+-- many items of the CURRENT page are already accounted (0 once a full page
+-- commits) so a mid-page resume does not re-count.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -201,6 +203,16 @@ UPDATE external_issue_sync_run SET
     failed_count = $7,
     total_seen = $8,
     lease_expires_at = $9,
+    page_offset = sqlc.arg('page_offset'),
+    updated_at = now()
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
+
+-- name: RenewExternalIssueSyncRunLease :execrows
+-- In-page heartbeat: extend the lease mid-page, fenced on worker_id. Zero rows
+-- means the lease was reclaimed by another worker, so this worker must stop
+-- applying immediately rather than drift until the page boundary.
+UPDATE external_issue_sync_run SET
+    lease_expires_at = $2,
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
@@ -233,8 +245,12 @@ UPDATE external_issue_sync_run SET
 WHERE id = $1 AND workspace_id = $2;
 
 -- name: ResumeExternalIssueSyncRun :one
--- Re-queue a paused run (quota_blocked / needs_reauth) from its SAVED cursor
--- rather than starting a fresh run, so counts and cursor continue. Only a
+-- Re-queue a paused run (quota_blocked / needs_reauth / failed) from its SAVED
+-- cursor rather than starting a fresh run, so counts and cursor continue. The
+-- input_snapshot is REWRITTEN from the current (re-validated) source so a
+-- reconnect that minted a new credential UUID is picked up — a needs_reauth run
+-- otherwise keeps reading the dead credential and loops. repo/filter/project
+-- execution semantics are carried in the caller-supplied snapshot. Only a
 -- non-active run in a resumable state can be resumed; the partial unique active
 -- index still guarantees at most one queued/running run per source afterwards.
 UPDATE external_issue_sync_run SET
@@ -244,6 +260,7 @@ UPDATE external_issue_sync_run SET
     lease_expires_at = NULL,
     next_attempt_at = now(),
     finished_at = NULL,
+    input_snapshot = sqlc.arg('input_snapshot'),
     updated_at = now()
 WHERE id = $1 AND workspace_id = $2
   AND state IN ('quota_blocked', 'needs_reauth', 'failed')

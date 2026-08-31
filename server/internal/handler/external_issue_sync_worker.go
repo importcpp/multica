@@ -37,6 +37,13 @@ const (
 	// syncRateLimitBackoff is the floor delay before a rate-limited run is
 	// retried when the provider gives no explicit Retry-At.
 	syncRateLimitBackoff = 60 * time.Second
+	// syncHeartbeatEvery is how many items into a page the worker renews its
+	// lease. It bounds how far a stale (reclaimed) worker can drift before it
+	// detects the steal and stops.
+	syncHeartbeatEvery = 25
+	// syncMaxErrorSamples caps the per-run failed-item diagnostics persisted to
+	// error_sample so a pathological repo can't bloat the row.
+	syncMaxErrorSamples = 20
 )
 
 // ExternalIssueSyncWorker drains queued external-issue backfill runs out of
@@ -155,7 +162,7 @@ func (w *ExternalIssueSyncWorker) ProcessNext(ctx context.Context) (bool, error)
 // syncRunPagesPerClaim pages, persisting the cursor and counts after each page.
 func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalIssueSyncRun) error {
 	if run.CancelRequested {
-		return w.finishRun(ctx, run, "cancelled", "")
+		return w.finishRun(ctx, run, "cancelled", nil)
 	}
 
 	// Read execution inputs from the run's immutable snapshot, not the live
@@ -164,19 +171,19 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	// silently redirect an in-flight import. The snapshot is captured at enqueue.
 	snap, err := decodeRunInput(run.InputSnapshot)
 	if err != nil || !snap.CredentialID.Valid {
-		return w.finishRun(ctx, run, "failed", "run input snapshot missing or invalid")
+		return w.finishRun(ctx, run, "failed", []string{"run input snapshot missing or invalid"})
 	}
 
 	// Resolve installation -> fresh issues:read token for this claim. Tokens are
 	// short-lived, so we never persist them; each claim mints its own.
 	installation, err := w.h.Queries.GetGitHubInstallationByID(ctx, snap.CredentialID)
 	if err != nil || installation.WorkspaceID != run.WorkspaceID {
-		return w.finishRun(ctx, run, "needs_reauth", "installation unavailable")
+		return w.finishRun(ctx, run, "needs_reauth", []string{"installation unavailable"})
 	}
 	token, revoke, err := mintGitHubIssuesReadToken(ctx, installation.InstallationID)
 	if err != nil {
 		if errors.Is(err, errGitHubIssuesPermission) {
-			return w.finishRun(ctx, run, "needs_reauth", "installation has not granted Issues read")
+			return w.finishRun(ctx, run, "needs_reauth", []string{"installation has not granted Issues read"})
 		}
 		return w.requeueRun(ctx, run, syncRateLimitBackoff)
 	}
@@ -184,7 +191,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 
 	provider, ok := externalissue.For(snap.Provider)
 	if !ok {
-		return w.finishRun(ctx, run, "failed", "provider unavailable")
+		return w.finishRun(ctx, run, "failed", []string{"provider unavailable"})
 	}
 	creds := externalissue.Credentials{Token: token}
 	repo := externalissue.Repository{
@@ -203,7 +210,14 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		total:     run.TotalSeen,
 	}
 	cursor := externalissue.Cursor(run.Cursor)
-	sawError := false
+	// pageOffset is how many items of the FIRST page this claim processes were
+	// already applied+accounted by a prior claim that stopped mid-page (quota).
+	// We re-fetch that page and skip them so counts stay exact on resume. It only
+	// applies to the first page of this claim; subsequent pages start at 0.
+	pageOffset := int(run.PageOffset)
+	// errorSamples collects a bounded diagnostic for failed items so a partial
+	// run tells the user which issues failed and why, not just a count.
+	var errorSamples []string
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
@@ -212,17 +226,31 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		}); err == nil && fresh.CancelRequested {
 			// Checkpoint must commit before we finalize; if the lease was
 			// stolen, stop without finishing.
-			if err := w.advance(ctx, run, cursor, counts); err != nil {
+			if err := w.advance(ctx, run, cursor, counts, 0); err != nil {
 				return err
 			}
-			return w.finishRun(ctx, run, "cancelled", "")
+			return w.finishRun(ctx, run, "cancelled", errorSamples)
 		}
 
 		result, listErr := provider.ListIssues(ctx, creds, repo, filter, cursor)
 		if listErr != nil {
 			return w.handleListError(ctx, run, listErr)
 		}
-		for _, iss := range result.Issues {
+		accounted := 0 // items of THIS page already committed to counts
+		for i, iss := range result.Issues {
+			// Skip items a prior claim already accounted on this exact page.
+			if i < pageOffset {
+				continue
+			}
+			// In-page heartbeat: renew the lease periodically so a healthy but
+			// slow page is not reclaimed, and detect a steal immediately instead
+			// of drifting to the page boundary. A lost lease aborts the page
+			// before any further Apply side effects.
+			if accounted%syncHeartbeatEvery == 0 {
+				if err := w.renewLease(ctx, run); err != nil {
+					return err
+				}
+			}
 			counts.total++
 			outcome, applyErr := w.h.ExternalIssueSync.Apply(ctx, service.ApplyParams{
 				WorkspaceID: run.WorkspaceID,
@@ -233,33 +261,44 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			})
 			if applyErr != nil {
 				if service.IsQuotaError(applyErr) {
-					// Persist progress up to this page's start BEFORE finalizing,
-					// so a resume continues from a committed cursor. If the
-					// checkpoint fails (lost lease), do not finalize.
-					if err := w.advance(ctx, run, cursor, counts); err != nil {
+					// Roll back the total bump for the item that hit quota (it was
+					// not accounted) and persist the PAGE-START cursor plus the
+					// count of items accounted on this page, so a resume re-fetches
+					// this page and skips exactly the accounted prefix.
+					counts.total--
+					if err := w.advance(ctx, run, cursor, counts, pageOffset+accounted); err != nil {
 						return err
 					}
-					return w.finishRun(ctx, run, "quota_blocked", "workspace issue quota reached")
+					return w.finishRun(ctx, run, "quota_blocked", errorSamples)
 				}
 				counts.failed++
-				sawError = true
+				accounted++
+				if len(errorSamples) < syncMaxErrorSamples {
+					errorSamples = append(errorSamples, fmt.Sprintf("issue #%d: %v", iss.Number, applyErr))
+				}
 				continue
 			}
 			counts.tally(outcome)
+			accounted++
 		}
 		cursor = result.NextCursor
+		pageOffset = 0 // only the first page of this claim carries a resume offset
 		// Checkpoint the page. A failed checkpoint (lost lease or DB error) MUST
 		// abort: continuing would let the issues we just applied be reprocessed
-		// (or the run be marked succeeded with an unsaved cursor).
-		if err := w.advance(ctx, run, cursor, counts); err != nil {
+		// (or the run be marked succeeded with an unsaved cursor). page_offset is
+		// reset to 0 because a full page just committed.
+		if err := w.advance(ctx, run, cursor, counts, 0); err != nil {
 			return err
 		}
 		if cursor == "" {
+			// Terminal state is decided by the CUMULATIVE failed count persisted
+			// across claims, not a per-claim bool: a failure in an earlier claim
+			// must still make the final run partial.
 			state := "succeeded"
-			if sawError {
+			if counts.failed > 0 {
 				state = "partial"
 			}
-			return w.finishRun(ctx, run, state, "")
+			return w.finishRun(ctx, run, state, errorSamples)
 		}
 	}
 
@@ -342,7 +381,7 @@ var errLeaseLost = errors.New("external-issue sync run lease lost")
 // worker's id. A zero-row update means the lease was stolen (or the run was
 // cancelled/finished elsewhere): return errLeaseLost so the caller aborts
 // WITHOUT finalizing — never mark succeeded on an unsaved cursor.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, pageOffset int) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
 		ID:             run.ID,
@@ -355,12 +394,33 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 		FailedCount:    c.failed,
 		TotalSeen:      c.total,
 		LeaseExpiresAt: lease,
+		PageOffset:     int32(pageOffset),
 	})
 	if err != nil {
 		return fmt.Errorf("advance run: %w", err)
 	}
 	if rows == 0 {
 		slog.Warn("external-issue sync worker: lease lost on advance", "run_id", util.UUIDToString(run.ID))
+		return errLeaseLost
+	}
+	return nil
+}
+
+// renewLease is the in-page heartbeat: it extends the lease mid-page, fenced on
+// this worker's id. A zero-row renew means another worker reclaimed the run, so
+// this worker returns errLeaseLost and stops applying immediately — bounding the
+// window in which a stale worker's Apply side effects (counts, events) can drift
+// to at most syncHeartbeatEvery items.
+func (w *ExternalIssueSyncWorker) renewLease(ctx context.Context, run db.ExternalIssueSyncRun) error {
+	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
+	rows, err := w.h.Queries.RenewExternalIssueSyncRunLease(ctx, db.RenewExternalIssueSyncRunLeaseParams{
+		ID: run.ID, WorkerID: w.id, LeaseExpiresAt: lease,
+	})
+	if err != nil {
+		return fmt.Errorf("renew lease: %w", err)
+	}
+	if rows == 0 {
+		slog.Warn("external-issue sync worker: lease lost on renew", "run_id", util.UUIDToString(run.ID))
 		return errLeaseLost
 	}
 	return nil
@@ -384,20 +444,22 @@ func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.Ex
 		case externalissue.ErrTransient:
 			return w.requeueRun(ctx, run, syncRateLimitBackoff)
 		case externalissue.ErrUnauthorized, externalissue.ErrForbidden:
-			return w.finishRun(ctx, run, "needs_reauth", e.Error())
+			return w.finishRun(ctx, run, "needs_reauth", []string{e.Error()})
 		}
 	}
-	return w.finishRun(ctx, run, "failed", listErr.Error())
+	return w.finishRun(ctx, run, "failed", []string{listErr.Error()})
 }
 
-// finishRun finalizes a run, fenced on this worker's id. A lost lease is a
-// no-op (the new owner owns the outcome), not an error.
-func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.ExternalIssueSyncRun, state, errMsg string) error {
-	sample := []byte("[]")
-	if errMsg != "" {
-		if b, err := json.Marshal([]string{errMsg}); err == nil {
-			sample = b
-		}
+// finishRun finalizes a run, fenced on this worker's id. samples is a bounded
+// list of per-item failure diagnostics persisted to error_sample. A lost lease
+// is a no-op (the new owner owns the outcome), not an error.
+func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.ExternalIssueSyncRun, state string, samples []string) error {
+	if samples == nil {
+		samples = []string{}
+	}
+	sample, err := json.Marshal(samples)
+	if err != nil {
+		sample = []byte("[]")
 	}
 	rows, err := w.h.Queries.FinishExternalIssueSyncRun(ctx, db.FinishExternalIssueSyncRunParams{
 		ID: run.ID, WorkerID: w.id, State: state, ErrorSample: sample,

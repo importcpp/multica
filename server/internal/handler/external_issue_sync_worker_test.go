@@ -11,8 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/entitlement"
+	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
@@ -31,8 +35,25 @@ func claimParams(w *ExternalIssueSyncWorker) db.ClaimNextExternalIssueSyncRunPar
 
 func resumeParams(workspaceID, runID string) db.ResumeExternalIssueSyncRunParams {
 	return db.ResumeExternalIssueSyncRunParams{
-		ID:          util.MustParseUUID(runID),
-		WorkspaceID: util.MustParseUUID(workspaceID),
+		ID:            util.MustParseUUID(runID),
+		WorkspaceID:   util.MustParseUUID(workspaceID),
+		InputSnapshot: []byte(`{"credential_id":"","provider":"github","instance_key":"github.com","repository_external_id":"555","repository_full_path":"acme/widgets","state":"open"}`),
+	}
+}
+
+// resumeParamsForSource rebuilds the run's input snapshot from the seeded
+// source's real credential, mirroring what the Resume handler does so the
+// resumed run has a valid credential for the worker.
+func resumeParamsForSource(workspaceID, runID, sourceID string) db.ResumeExternalIssueSyncRunParams {
+	var credentialID, configuredBy string
+	_ = testPool.QueryRow(context.Background(),
+		`SELECT COALESCE(credential_id::text,''), COALESCE(configured_by_user_id::text,'') FROM external_issue_source WHERE id=$1`, sourceID).
+		Scan(&credentialID, &configuredBy)
+	snap := fmt.Sprintf(`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":"555","repository_full_path":"acme/widgets","configured_by_user_id":%q,"state":"open"}`, credentialID, configuredBy)
+	return db.ResumeExternalIssueSyncRunParams{
+		ID:            util.MustParseUUID(runID),
+		WorkspaceID:   util.MustParseUUID(workspaceID),
+		InputSnapshot: []byte(snap),
 	}
 }
 
@@ -314,7 +335,7 @@ func TestSyncWorkerLeaseFencingStopsStaleWriter(t *testing.T) {
 		t.Fatalf("steal lease: %v", err)
 	}
 	// The stale worker's fenced advance must report a lost lease and change nothing.
-	advErr := stale.advance(context.Background(), claimed, "", runCounts{imported: 999})
+	advErr := stale.advance(context.Background(), claimed, "", runCounts{imported: 999}, 0)
 	if !errorsIs(advErr, errLeaseLost) {
 		t.Fatalf("stale advance err = %v, want errLeaseLost", advErr)
 	}
@@ -357,5 +378,112 @@ func TestSyncWorkerQuotaBlockedResumes(t *testing.T) {
 	}
 	if resumed.ImportedCount != 5 {
 		t.Fatalf("resume must preserve counts, imported = %d", resumed.ImportedCount)
+	}
+}
+
+// limitProvider is a fake entitlement.Provider that enforces a fixed issue
+// limit, so a test can deterministically drive Apply into quota_blocked.
+type limitProvider struct{ limit int }
+
+func (p limitProvider) Gate(ctx context.Context, workspaceID uuid.UUID, name entitlement.GateName) entitlement.Decision {
+	lim := p.limit
+	return entitlement.Decision{Gate: entitlement.Gate{Action: entitlement.ActionEnforce, Limit: &lim}}
+}
+
+// Real quota resume: a page with 2 unique remote issues under a limit of 1 must
+// import the first, hit quota on the second (quota_blocked), and after resume
+// import the second WITHOUT re-counting the first. Regression for the round-2
+// double-count reproduction (final should be imported=2, total=2, not
+// imported=2/skipped=1/total=3).
+func TestSyncWorkerQuotaResumeNoDoubleCount(t *testing.T) {
+	pages := [][]map[string]any{{issue(1, 1, "a"), issue(2, 2, "b")}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	// Build a worker whose sync service enforces a 1-issue quota.
+	q := db.New(testPool)
+	bus := events.New()
+	issues := &service.IssueService{Queries: q, TxStarter: testPool, Bus: bus, Entitlements: limitProvider{limit: 1}}
+	sync := service.NewExternalIssueSyncService(q, testPool, bus, issues)
+	h := &Handler{Queries: q, ExternalIssueSync: sync}
+	w := NewExternalIssueSyncWorker(h)
+
+	// First drain: import #1, quota on #2 -> quota_blocked, one issue in DB.
+	if _, err := w.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("first drain: %v", err)
+	}
+	if st, imported, total := runState(t, runID); st != "quota_blocked" || imported != 1 || total != 1 {
+		t.Fatalf("after quota: state=%q imported=%d total=%d, want quota_blocked/1/1", st, imported, total)
+	}
+	if n := countWsIssues(t, workspaceID); n != 1 {
+		t.Fatalf("after quota, issue rows = %d, want 1", n)
+	}
+
+	// Raise the limit and resume: the re-fetched page must skip the accounted
+	// prefix (#1) and import only #2, ending succeeded with exact counts. Rebuild
+	// the run's input snapshot from the source (as the Resume handler does) so
+	// the worker still has a valid credential.
+	issues.Entitlements = limitProvider{limit: 100}
+	sync.Entitlements = limitProvider{limit: 100}
+	if _, err := q.ResumeExternalIssueSyncRun(context.Background(), resumeParamsForSource(workspaceID, runID, sourceID)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("resume drain: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" {
+			break
+		}
+	}
+	st, imported, total := runState(t, runID)
+	if st != "succeeded" || imported != 2 || total != 2 {
+		var sample string
+		_ = testPool.QueryRow(context.Background(), `SELECT error_sample::text FROM external_issue_sync_run WHERE id=$1`, runID).Scan(&sample)
+		t.Fatalf("after resume: state=%q imported=%d total=%d, want succeeded/2/2 (no double-count); errors=%s", st, imported, total, sample)
+	}
+	if n := countWsIssues(t, workspaceID); n != 2 {
+		t.Fatalf("final issue rows = %d, want 2", n)
+	}
+}
+
+// needs_reauth resume must rebind the credential from the current source. We
+// simulate a reconnect by pointing the run's snapshot at a DEAD credential
+// UUID, marking the run needs_reauth, then resuming with a snapshot rebuilt from
+// the (live) source. The resumed run must drain against the live credential
+// instead of looping back to needs_reauth. Regression for the round-2 reauth
+// reproduction.
+func TestSyncWorkerReauthResumeRebindsCredential(t *testing.T) {
+	pages := [][]map[string]any{{issue(1, 1, "a")}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	// Simulate a needs_reauth stop whose snapshot names a now-dead credential.
+	deadCred := util.UUIDToString(dbid.NewV7())
+	deadSnap := fmt.Sprintf(`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":"555","repository_full_path":"acme/widgets","state":"open"}`, deadCred)
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE external_issue_sync_run SET state='needs_reauth', input_snapshot=$2::jsonb WHERE id=$1`,
+		runID, deadSnap); err != nil {
+		t.Fatalf("set needs_reauth: %v", err)
+	}
+
+	w := NewExternalIssueSyncWorker(testHandler)
+	// Resume rebuilds the snapshot from the source's live credential.
+	if _, err := testHandler.Queries.ResumeExternalIssueSyncRun(context.Background(),
+		resumeParamsForSource(workspaceID, runID, sourceID)); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("resume drain: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" {
+			break
+		}
+	}
+	if st, imported, _ := runState(t, runID); st != "succeeded" || imported != 1 {
+		t.Fatalf("after reauth resume: state=%q imported=%d, want succeeded/1 (rebound credential)", st, imported)
 	}
 }

@@ -1166,6 +1166,17 @@ func (h *Handler) handleInstallationEvent(ctx context.Context, body []byte) {
 		// does not read the broadcast payload directly. One broadcast per
 		// deleted binding so every affected workspace's Settings tab refreshes.
 		for _, row := range deleted {
+			// Pause each workspace's import sources bound to this credential
+			// (the deleted installation's internal id), matching the explicit
+			// delete path. Issues/links are preserved for an idempotent
+			// reconnect; a failure is logged, not fatal to the webhook ack.
+			if err := h.Queries.PauseExternalIssueSourcesByCredential(ctx, db.PauseExternalIssueSourcesByCredentialParams{
+				WorkspaceID:  row.WorkspaceID,
+				CredentialID: row.ID,
+			}); err != nil {
+				slog.Warn("github: pause import sources after webhook installation delete failed",
+					"err", err, "workspace_id", uuidToString(row.WorkspaceID))
+			}
 			h.publish(protocol.EventGitHubInstallationDeleted, uuidToString(row.WorkspaceID), "system", "", map[string]any{
 				"id": uuidToString(row.ID),
 			})

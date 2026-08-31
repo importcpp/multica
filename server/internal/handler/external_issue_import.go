@@ -343,8 +343,46 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	run, err := h.Queries.ResumeExternalIssueSyncRun(r.Context(), db.ResumeExternalIssueSyncRunParams{
+	// Load the run + its (current) source so resume rebinds the credential and
+	// target project from the re-validated source. A reconnect after a
+	// needs_reauth stop mints a new installation UUID; carrying the old snapshot
+	// credential forward would loop straight back to needs_reauth.
+	existing, err := h.Queries.GetExternalIssueSyncRun(r.Context(), db.GetExternalIssueSyncRunParams{
 		ID: runUUID, WorkspaceID: workspaceUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "sync run not found")
+		return
+	}
+	source, err := h.Queries.GetExternalIssueSource(r.Context(), db.GetExternalIssueSourceParams{
+		ID: existing.SourceID, WorkspaceID: workspaceUUID,
+	})
+	if err != nil {
+		writeError(w, http.StatusConflict, "import source no longer exists")
+		return
+	}
+	if !source.CredentialID.Valid {
+		writeError(w, http.StatusConflict, "reconnect the GitHub installation before resuming")
+		return
+	}
+	// Preserve the run's original filter state (from its input snapshot) while
+	// refreshing credential/project/repo identity from the live source.
+	prevSnap, _ := decodeRunInput(existing.InputSnapshot)
+	state := prevSnap.State
+	if state == "" {
+		state = filterStateFromSourceFilter(source.Filter)
+	}
+	repo := externalissue.Repository{
+		InstanceKey: source.InstanceKey,
+		ExternalID:  source.RepositoryExternalID,
+		FullPath:    source.RepositoryFullPath,
+	}
+	freshSnapshot := buildRunInputSnapshot(source.CredentialID, repo, source.TargetProjectID, source.ConfiguredByUserID, state)
+
+	run, err := h.Queries.ResumeExternalIssueSyncRun(r.Context(), db.ResumeExternalIssueSyncRunParams{
+		ID:            runUUID,
+		WorkspaceID:   workspaceUUID,
+		InputSnapshot: freshSnapshot,
 	})
 	if err != nil {
 		// pgx.ErrNoRows here means the run is not in a resumable state (e.g.
@@ -360,6 +398,23 @@ func (h *Handler) ResumeSyncRun(w http.ResponseWriter, r *http.Request) {
 		RunID:    util.UUIDToString(run.ID),
 		State:    run.State,
 	})
+}
+
+// filterStateFromSourceFilter reads {"state":...} from a source's filter JSON,
+// defaulting to open.
+func filterStateFromSourceFilter(filter []byte) string {
+	var f struct {
+		State string `json:"state"`
+	}
+	if len(filter) > 0 {
+		_ = json.Unmarshal(filter, &f)
+	}
+	switch f.State {
+	case "open", "closed", "all":
+		return f.State
+	default:
+		return "open"
+	}
 }
 
 // buildRunInputSnapshot serializes the immutable execution inputs stored on a
