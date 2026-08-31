@@ -211,6 +211,103 @@ type IssueCreateResult struct {
 // MCP/API-key callers — shares the same workspace boundary semantics.
 // Caller-owned validation is limited to transport-shaped checks: title
 // required, RFC3339 date format, assignee pair sanity.
+// issueRowInput carries the fields createIssueRowInTx needs to insert one issue
+// row inside a caller's transaction. It is the shared core of issue creation:
+// both IssueService.Create (HTTP / Lark / MCP) and ExternalIssueSyncService.Apply
+// (external import) go through it, so numbering (with the workspace count
+// policy), top-of-column position, and the origin-vs-plain insert live in ONE
+// place instead of being reimplemented per caller.
+type issueRowInput struct {
+	WorkspaceID   pgtype.UUID
+	Title         string
+	Description   pgtype.Text
+	Status        string
+	Priority      string
+	AssigneeType  pgtype.Text
+	AssigneeID    pgtype.UUID
+	CreatorType   string
+	CreatorID     pgtype.UUID
+	ParentIssueID pgtype.UUID
+	StartDate     pgtype.Date
+	DueDate       pgtype.Date
+	ProjectID     pgtype.UUID
+	Stage         pgtype.Int4
+	OriginType    pgtype.Text
+	OriginID      pgtype.UUID
+	CountPolicy   IssueCountPolicy
+}
+
+// createIssueRowInTx allocates the issue number (enforcing the count policy),
+// computes the top-of-column position, and inserts the issue row — the shared
+// create core. It runs inside the caller's transaction (tx for the position
+// lock, qtx for the writes); the caller owns commit and every post-commit side
+// effect (broadcast, analytics, links). Returns ErrIssueLimitReachedError when
+// the workspace is at quota, so the caller rolls back.
+func createIssueRowInTx(ctx context.Context, tx pgx.Tx, qtx *db.Queries, in issueRowInput) (db.Issue, error) {
+	number, err := AllocateIssueNumber(ctx, qtx, in.WorkspaceID, in.CountPolicy)
+	if err != nil {
+		return db.Issue{}, err
+	}
+	// New issues sort to the top of their (workspace, status) column. Computed
+	// inside the tx after IncrementIssueCounter took the workspace row lock, so
+	// concurrent creates see each other's positions (best-effort; the UI
+	// tolerates equal positions via the secondary ORDER BY key).
+	position, err := issueposition.NextTopPosition(ctx, tx, in.WorkspaceID, in.Status)
+	if err != nil {
+		return db.Issue{}, fmt.Errorf("next top position: %w", err)
+	}
+	if in.OriginType.Valid {
+		issue, err := qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
+			ID:            dbid.NewV7(),
+			WorkspaceID:   in.WorkspaceID,
+			Title:         in.Title,
+			Description:   in.Description,
+			Status:        in.Status,
+			Priority:      in.Priority,
+			AssigneeType:  in.AssigneeType,
+			AssigneeID:    in.AssigneeID,
+			CreatorType:   in.CreatorType,
+			CreatorID:     in.CreatorID,
+			ParentIssueID: in.ParentIssueID,
+			Position:      position,
+			StartDate:     in.StartDate,
+			DueDate:       in.DueDate,
+			Number:        number,
+			ProjectID:     in.ProjectID,
+			OriginType:    in.OriginType,
+			OriginID:      in.OriginID,
+			Stage:         in.Stage,
+		})
+		if err != nil {
+			return db.Issue{}, fmt.Errorf("create issue: %w", err)
+		}
+		return issue, nil
+	}
+	issue, err := qtx.CreateIssue(ctx, db.CreateIssueParams{
+		ID:            dbid.NewV7(),
+		WorkspaceID:   in.WorkspaceID,
+		Title:         in.Title,
+		Description:   in.Description,
+		Status:        in.Status,
+		Priority:      in.Priority,
+		AssigneeType:  in.AssigneeType,
+		AssigneeID:    in.AssigneeID,
+		CreatorType:   in.CreatorType,
+		CreatorID:     in.CreatorID,
+		ParentIssueID: in.ParentIssueID,
+		Position:      position,
+		StartDate:     in.StartDate,
+		DueDate:       in.DueDate,
+		Number:        number,
+		ProjectID:     in.ProjectID,
+		Stage:         in.Stage,
+	})
+	if err != nil {
+		return db.Issue{}, fmt.Errorf("create issue: %w", err)
+	}
+	return issue, nil
+}
+
 func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, error) {
 	issueCountPolicy := ResolveIssueCountPolicy(ctx, s.Entitlements, p.WorkspaceID)
 	tx, err := s.TxStarter.Begin(ctx)
@@ -315,73 +412,29 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{DuplicateIssue: &dup}, ErrActiveDuplicate
 	}
 
-	issueNumber, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, issueCountPolicy)
+	issue, err := createIssueRowInTx(ctx, tx, qtx, issueRowInput{
+		WorkspaceID:   p.WorkspaceID,
+		Title:         p.Title,
+		Description:   p.Description,
+		Status:        p.Status,
+		Priority:      p.Priority,
+		AssigneeType:  p.AssigneeType,
+		AssigneeID:    p.AssigneeID,
+		CreatorType:   p.CreatorType,
+		CreatorID:     p.CreatorID,
+		ParentIssueID: p.ParentIssueID,
+		StartDate:     p.StartDate,
+		DueDate:       p.DueDate,
+		ProjectID:     projectID,
+		Stage:         p.Stage,
+		OriginType:    p.OriginType,
+		OriginID:      p.OriginID,
+		CountPolicy:   issueCountPolicy,
+	})
 	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("allocate issue number: %w", err)
+		return IssueCreateResult{}, err
 	}
-
-	// New issues sort to the top of their (workspace, status) column for
-	// manual ordering. Computed inside the tx, after IncrementIssueCounter
-	// has already taken the workspace row lock, so two concurrent creates
-	// in the same workspace see each other's positions and don't both
-	// land on the same min-1 slot. Concurrent manual reorder via
-	// UpdateIssue(position) does NOT take this lock, so a create racing
-	// a reorder is still allowed to collide on position — manual ordering
-	// is best-effort and the UI tolerates equal positions by falling back
-	// to the secondary ORDER BY key.
-	newPosition, err := issueposition.NextTopPosition(ctx, tx, p.WorkspaceID, p.Status)
-	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("next top position: %w", err)
-	}
-
-	var issue db.Issue
 	var assignedTask db.AgentTaskQueue
-	if p.OriginType.Valid {
-		issue, err = qtx.CreateIssueWithOrigin(ctx, db.CreateIssueWithOriginParams{
-			ID:            dbid.NewV7(),
-			WorkspaceID:   p.WorkspaceID,
-			Title:         p.Title,
-			Description:   p.Description,
-			Status:        p.Status,
-			Priority:      p.Priority,
-			AssigneeType:  p.AssigneeType,
-			AssigneeID:    p.AssigneeID,
-			CreatorType:   p.CreatorType,
-			CreatorID:     p.CreatorID,
-			ParentIssueID: p.ParentIssueID,
-			Position:      newPosition,
-			StartDate:     p.StartDate,
-			DueDate:       p.DueDate,
-			Number:        issueNumber,
-			ProjectID:     projectID,
-			OriginType:    p.OriginType,
-			OriginID:      p.OriginID,
-			Stage:         p.Stage,
-		})
-	} else {
-		issue, err = qtx.CreateIssue(ctx, db.CreateIssueParams{
-			ID:            dbid.NewV7(),
-			WorkspaceID:   p.WorkspaceID,
-			Title:         p.Title,
-			Description:   p.Description,
-			Status:        p.Status,
-			Priority:      p.Priority,
-			AssigneeType:  p.AssigneeType,
-			AssigneeID:    p.AssigneeID,
-			CreatorType:   p.CreatorType,
-			CreatorID:     p.CreatorID,
-			ParentIssueID: p.ParentIssueID,
-			Position:      newPosition,
-			StartDate:     p.StartDate,
-			DueDate:       p.DueDate,
-			Number:        issueNumber,
-			ProjectID:     projectID,
-			Stage:         p.Stage,
-		})
-	}
-	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
-	}
 
 	if p.SourceContext != nil {
 		if _, err := PersistSourceContext(ctx, qtx, *p.SourceContext, issue.ID, pgtype.UUID{}); err != nil {

@@ -12,10 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/events"
-	"github.com/multica-ai/multica/server/internal/issueposition"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
-	"github.com/multica-ai/multica/server/pkg/dbid"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
@@ -192,31 +190,22 @@ func (s *ExternalIssueSyncService) createBoundIssue(ctx context.Context, tx pgx.
 		}
 	}
 
-	number, err := AllocateIssueNumber(ctx, qtx, p.WorkspaceID, ResolveIssueCountPolicy(ctx, s.Entitlements, p.WorkspaceID))
-	if err != nil {
-		return OutcomeFailed, db.Issue{}, db.Workspace{}, fmt.Errorf("allocate issue number: %w", err)
-	}
-	position, err := issueposition.NextTopPosition(ctx, tx, p.WorkspaceID, status)
-	if err != nil {
-		return OutcomeFailed, db.Issue{}, db.Workspace{}, fmt.Errorf("next top position: %w", err)
-	}
-
-	creatorType := "member"
-	issue, err := qtx.CreateIssue(ctx, db.CreateIssueParams{
-		ID:          dbid.NewV7(),
+	// Reuse the shared issue-create core (numbering with the workspace count
+	// policy, top-of-column position, row insert) instead of a second raw
+	// CreateIssue path. Imported issues land in backlog/none with no assignee.
+	issue, err := createIssueRowInTx(ctx, tx, qtx, issueRowInput{
 		WorkspaceID: p.WorkspaceID,
 		Title:       r.Title,
 		Description: pgtype.Text{String: r.Body, Valid: true},
 		Status:      status,
 		Priority:    "none",
-		CreatorType: creatorType,
+		CreatorType: "member",
 		CreatorID:   p.CreatorID,
-		Position:    position,
-		Number:      number,
 		ProjectID:   p.ProjectID,
+		CountPolicy: ResolveIssueCountPolicy(ctx, s.Entitlements, p.WorkspaceID),
 	})
 	if err != nil {
-		return OutcomeFailed, db.Issue{}, db.Workspace{}, fmt.Errorf("create issue: %w", err)
+		return OutcomeFailed, db.Issue{}, db.Workspace{}, err
 	}
 
 	var remoteUpdated pgtype.Timestamptz
