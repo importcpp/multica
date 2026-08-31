@@ -21,18 +21,14 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/issuestatus"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
-
-// githubAPIBase is the base URL for GitHub's REST API. Mutable so tests can
-// point App-authenticated calls at an httptest server without touching GitHub.
-var githubAPIBase = "https://api.github.com"
 
 const (
 	githubReturnToGitHub       = "github"
@@ -534,7 +530,7 @@ func (h *Handler) GitHubSetupCallback(w http.ResponseWriter, r *http.Request) {
 	// Resolve the installation against GitHub's API to capture display info.
 	// If the App auth is not configured we still create the row with the
 	// minimum we know; webhook events will refresh it as soon as one fires.
-	login, accountType, avatar := fetchInstallationAccount(r.Context(), installationID)
+	login, accountType, avatar := h.fetchInstallationAccount(r.Context(), installationID)
 
 	// Best-effort capture of the connecting user (may be nil if the public
 	// callback was hit without a session — e.g. user wasn't logged in to
@@ -614,25 +610,31 @@ func (h *Handler) consumePendingGitHubInstallation(ctx context.Context, inst db.
 // "unknown" placeholder in place, and the frontend re-queries on the
 // realtime broadcast emitted by the webhook handler, so the UI converges
 // without a manual refresh.
-func fetchInstallationAccount(ctx context.Context, installationID int64) (login, accountType string, avatar *string) {
+func (h *Handler) fetchInstallationAccount(ctx context.Context, installationID int64) (login, accountType string, avatar *string) {
 	login = "unknown"
 	accountType = "User"
 	avatar = nil
-	endpoint := fmt.Sprintf("%s/app/installations/%d", strings.TrimRight(githubAPIBase, "/"), installationID)
+	if !h.GHApp.Enabled() {
+		// App identity not configured — degrade to the placeholder; the
+		// installation.created webhook fills the real account later.
+		return
+	}
+	appJWT, err := h.GHApp.SignAppJWT(time.Now())
+	if err != nil {
+		// Misconfigured private key is operator-actionable — log so the
+		// install path doesn't silently fall back to "unknown" forever
+		// without leaving a breadcrumb.
+		slog.Warn("github: sign App JWT failed", "err", err)
+		return
+	}
+	endpoint := fmt.Sprintf("%s/app/installations/%d", h.GHApp.APIBase(), installationID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	if token, err := signGitHubAppJWT(time.Now()); err != nil {
-		// Misconfigured private key is operator-actionable — log so the
-		// install path doesn't silently fall back to "unknown" forever
-		// without leaving a breadcrumb.
-		slog.Warn("github: sign App JWT failed", "err", err)
-	} else if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	resp, err := http.DefaultClient.Do(req)
+	req.Header.Set("Authorization", "Bearer "+appJWT)
+	resp, err := h.GHApp.HTTPClient().Do(req)
 	if err != nil {
 		return
 	}
@@ -647,7 +649,7 @@ func fetchInstallationAccount(ctx context.Context, installationID int64) (login,
 			AvatarURL string `json:"avatar_url"`
 		} `json:"account"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, githubAPIResponseLimit)).Decode(&body); err != nil {
 		return
 	}
 	if body.Account.Login != "" {
@@ -661,43 +663,6 @@ func fetchInstallationAccount(ctx context.Context, installationID int64) (login,
 		avatar = &v
 	}
 	return
-}
-
-// signGitHubAppJWT mints the short-lived RS256 JWT GitHub requires for
-// App-authenticated REST calls (see fetchInstallationAccount). Returns
-// ("", nil) when the operator hasn't configured the App identity — that's
-// a soft "App auth not available" signal, not an error, so callers can
-// fall through to their unauthenticated path. A malformed
-// GITHUB_APP_PRIVATE_KEY surfaces as an error so the operator notices.
-//
-// `now` is injected for deterministic tests; production callers pass
-// time.Now().
-func signGitHubAppJWT(now time.Time) (string, error) {
-	appID := strings.TrimSpace(os.Getenv("GITHUB_APP_ID"))
-	pemKey := strings.TrimSpace(os.Getenv("GITHUB_APP_PRIVATE_KEY"))
-	if appID == "" || pemKey == "" {
-		return "", nil
-	}
-	key, err := jwt.ParseRSAPrivateKeyFromPEM([]byte(pemKey))
-	if err != nil {
-		return "", fmt.Errorf("parse GITHUB_APP_PRIVATE_KEY: %w", err)
-	}
-	// GitHub allows JWTs valid for up to 10 minutes. We back-date `iat`
-	// by 60 seconds to absorb modest clock skew between us and GitHub
-	// (otherwise an "iat in the future" verdict from GitHub fails the
-	// request) and cap `exp` at 9 minutes ahead to stay inside the cap
-	// even with the same skew applied.
-	claims := jwt.MapClaims{
-		"iat": now.Add(-60 * time.Second).Unix(),
-		"exp": now.Add(9 * time.Minute).Unix(),
-		"iss": appID,
-	}
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	signed, err := token.SignedString(key)
-	if err != nil {
-		return "", fmt.Errorf("sign App JWT: %w", err)
-	}
-	return signed, nil
 }
 
 // ── Listing / disconnect ────────────────────────────────────────────────────
@@ -779,7 +744,7 @@ func (h *Handler) ListGitHubInstallationRepositories(w http.ResponseWriter, r *h
 		return
 	}
 
-	repositories, err := fetchGitHubInstallationRepositories(
+	repositories, err := h.fetchGitHubInstallationRepositories(
 		r.Context(),
 		row.InstallationID,
 		page,
@@ -811,59 +776,26 @@ func parseGitHubPageParam(
 	return value, true
 }
 
-func fetchGitHubInstallationRepositories(
+func (h *Handler) fetchGitHubInstallationRepositories(
 	ctx context.Context,
 	installationID int64,
 	page, perPage int,
 ) (GitHubRepositoriesResponse, error) {
-	appJWT, err := signGitHubAppJWT(time.Now())
-	if err != nil {
-		return GitHubRepositoriesResponse{}, err
-	}
-	if appJWT == "" {
+	if !h.GHApp.Enabled() {
 		return GitHubRepositoriesResponse{}, errors.New("github App JWT credentials unavailable")
 	}
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	tokenEndpoint := fmt.Sprintf(
-		"%s/app/installations/%d/access_tokens",
-		strings.TrimRight(githubAPIBase, "/"),
-		installationID,
-	)
-	tokenReq, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		tokenEndpoint,
-		strings.NewReader(`{"permissions":{"metadata":"read"}}`),
-	)
-	if err != nil {
-		return GitHubRepositoriesResponse{}, err
-	}
-	setGitHubAPIHeaders(tokenReq, appJWT)
-	tokenReq.Header.Set("Content-Type", "application/json")
-	tokenResp, err := client.Do(tokenReq)
+	// Mint a least-privileged (metadata:read) installation token through the
+	// shared client — one auth/token/cache implementation for every GitHub call
+	// site. The client owns the token lifecycle (cache + early renew), so this
+	// path no longer mints-and-revokes per request.
+	token, err := h.GHApp.InstallationTokenScoped(ctx, installationID, githubapi.TokenPermissions{"metadata": "read"})
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("create installation token: %w", err)
 	}
-	defer tokenResp.Body.Close()
-	if tokenResp.StatusCode != http.StatusCreated {
-		_, _ = io.Copy(io.Discard, io.LimitReader(tokenResp.Body, githubAPIResponseLimit))
-		return GitHubRepositoriesResponse{}, fmt.Errorf("create installation token: github status %d", tokenResp.StatusCode)
-	}
-	var tokenBody struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(io.LimitReader(tokenResp.Body, githubAPIResponseLimit)).Decode(&tokenBody); err != nil {
-		return GitHubRepositoriesResponse{}, fmt.Errorf("decode installation token: %w", err)
-	}
-	if tokenBody.Token == "" {
-		return GitHubRepositoriesResponse{}, errors.New("github returned an empty installation token")
-	}
-	defer revokeGitHubInstallationToken(client, tokenBody.Token)
 
 	repositoriesEndpoint := fmt.Sprintf(
 		"%s/installation/repositories?page=%d&per_page=%d",
-		strings.TrimRight(githubAPIBase, "/"),
+		h.GHApp.APIBase(),
 		page,
 		perPage,
 	)
@@ -871,8 +803,8 @@ func fetchGitHubInstallationRepositories(
 	if err != nil {
 		return GitHubRepositoriesResponse{}, err
 	}
-	setGitHubAPIHeaders(repositoriesReq, tokenBody.Token)
-	repositoriesResp, err := client.Do(repositoriesReq)
+	setGitHubAPIHeaders(repositoriesReq, token)
+	repositoriesResp, err := h.GHApp.HTTPClient().Do(repositoriesReq)
 	if err != nil {
 		return GitHubRepositoriesResponse{}, fmt.Errorf("list installation repositories: %w", err)
 	}
@@ -915,23 +847,6 @@ func setGitHubAPIHeaders(req *http.Request, token string) {
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-}
-
-func revokeGitHubInstallationToken(client *http.Client, token string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	endpoint := strings.TrimRight(githubAPIBase, "/") + "/installation/token"
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
-	if err != nil {
-		return
-	}
-	setGitHubAPIHeaders(req, token)
-	resp, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, githubAPIResponseLimit))
 }
 
 func (h *Handler) DeleteGitHubInstallation(w http.ResponseWriter, r *http.Request) {

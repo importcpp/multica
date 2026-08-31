@@ -1267,6 +1267,12 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspacePullRequests(ctx, requester.WorkspaceID) },
 		},
 		{
+			// External-issue import subsystem before connections: its sources
+			// reference the GitHub installation as a credential.
+			name: "delete external issue data",
+			run:  func() error { return qtx.DeleteWorkspaceExternalIssueData(ctx, requester.WorkspaceID) },
+		},
+		{
 			name: "delete integrations",
 			run:  func() error { return qtx.DeleteWorkspaceConnections(ctx, requester.WorkspaceID) },
 		},

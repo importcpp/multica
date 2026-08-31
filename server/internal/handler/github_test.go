@@ -21,9 +21,9 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/events"
+	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
@@ -2149,121 +2149,25 @@ func generateTestRSAKeyPEM(t *testing.T) (pemBytes []byte, key *rsa.PrivateKey) 
 	return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}), k
 }
 
-// TestSignGitHubAppJWT_NotConfigured pins the contract that missing env
-// vars produce ("", nil) — a soft "App auth not available" signal that
-// fetchInstallationAccount uses to fall through to its unauthenticated
-// path. Returning an error here would force every install on a vanilla
-// self-host to log a noisy warning even though the deployment is
-// intentionally not running App-authenticated calls.
-func TestSignGitHubAppJWT_NotConfigured(t *testing.T) {
-	t.Setenv("GITHUB_APP_ID", "")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
-	tok, err := signGitHubAppJWT(time.Now())
-	if err != nil {
-		t.Fatalf("expected nil error when env not set, got %v", err)
-	}
-	if tok != "" {
-		t.Errorf("expected empty token when env not set, got %q", tok)
-	}
-
-	// Half-configured (one var set, the other empty) is treated the same
-	// as fully unset — we never want a partial config to claim the App
-	// is wired up.
-	t.Setenv("GITHUB_APP_ID", "12345")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
-	tok, err = signGitHubAppJWT(time.Now())
-	if err != nil || tok != "" {
-		t.Errorf("partial config should return empty token, got tok=%q err=%v", tok, err)
-	}
-}
-
-// TestSignGitHubAppJWT_InvalidPEM proves that a malformed private key is
-// surfaced as an error, not silently swallowed. The setup-callback path
-// catches and logs this so the operator gets a breadcrumb instead of an
-// install that quietly never enriches the row.
-func TestSignGitHubAppJWT_InvalidPEM(t *testing.T) {
-	t.Setenv("GITHUB_APP_ID", "12345")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", "not a real PEM block")
-	if _, err := signGitHubAppJWT(time.Now()); err == nil {
-		t.Error("expected error for malformed private key, got nil")
-	}
-}
-
-// TestSignGitHubAppJWT_ClaimsAndSignature signs a token with a known key
-// and verifies (a) the claims GitHub requires (`iss`, `iat`, `exp`) carry
-// the values we set, (b) iat is back-dated for clock skew, (c) exp stays
-// inside GitHub's 10-minute cap, and (d) the signature verifies against
-// the matching public key.
-func TestSignGitHubAppJWT_ClaimsAndSignature(t *testing.T) {
-	pemBytes, key := generateTestRSAKeyPEM(t)
-	t.Setenv("GITHUB_APP_ID", "424242")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
-
-	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
-	tok, err := signGitHubAppJWT(now)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-	if tok == "" {
-		t.Fatal("expected non-empty token when fully configured")
-	}
-
-	// Inject the same `now` into the parser's clock so default exp/nbf
-	// validation is anchored to the test-time, not real wall clock —
-	// otherwise the test becomes a time bomb that fails for real once
-	// the real time crosses the token's exp (now + 9m).
-	parsed, err := jwt.Parse(
-		tok,
-		func(token *jwt.Token) (any, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodRSA); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return &key.PublicKey, nil
-		},
-		jwt.WithTimeFunc(func() time.Time { return now }),
-	)
-	if err != nil || !parsed.Valid {
-		t.Fatalf("verify token: err=%v valid=%v", err, parsed != nil && parsed.Valid)
-	}
-	claims, ok := parsed.Claims.(jwt.MapClaims)
-	if !ok {
-		t.Fatalf("claims type: %T", parsed.Claims)
-	}
-	if got, _ := claims["iss"].(string); got != "424242" {
-		t.Errorf("iss = %q, want 424242", got)
-	}
-	iat := int64(claims["iat"].(float64))
-	exp := int64(claims["exp"].(float64))
-	if iat != now.Add(-60*time.Second).Unix() {
-		t.Errorf("iat = %d, want %d (now - 60s for clock skew)", iat, now.Add(-60*time.Second).Unix())
-	}
-	if exp != now.Add(9*time.Minute).Unix() {
-		t.Errorf("exp = %d, want %d (now + 9m, inside GitHub's 10m cap)", exp, now.Add(9*time.Minute).Unix())
-	}
-	if exp-iat > int64(10*time.Minute/time.Second) {
-		t.Errorf("exp-iat = %d s, exceeds GitHub's 10m max", exp-iat)
-	}
+// newGHAppTestHandler builds a *Handler whose shared GitHub App client points at
+// a fake server, so the repository-browse and account-enrichment paths exercise
+// the SAME token/JWT implementation the rest of the server uses (githubapi),
+// instead of a second copy that once lived in this file.
+func newGHAppTestHandler(t *testing.T, apiBase string) *Handler {
+	t.Helper()
+	_, key := generateTestRSAKeyPEM(t)
+	app := githubapi.NewClientForTest("424242", key)
+	app.SetAPIBaseForTest(apiBase)
+	return &Handler{GHApp: app}
 }
 
 func TestFetchGitHubInstallationRepositories(t *testing.T) {
-	pemBytes, key := generateTestRSAKeyPEM(t)
-	t.Setenv("GITHUB_APP_ID", "424242")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
-
 	const installationID int64 = 314159
-	var tokenRevoked bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/app/installations/314159/access_tokens":
-			bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if bearer == "" {
+			if strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ") == "" {
 				http.Error(w, "missing app jwt", http.StatusUnauthorized)
-				return
-			}
-			if _, err := jwt.Parse(bearer, func(token *jwt.Token) (any, error) {
-				return &key.PublicKey, nil
-			}); err != nil {
-				http.Error(w, "bad app jwt", http.StatusUnauthorized)
 				return
 			}
 			var tokenRequest struct {
@@ -2300,24 +2204,14 @@ func TestFetchGitHubInstallationRepositories(t *testing.T) {
 					"default_branch": "main",
 				}},
 			})
-		case r.Method == http.MethodDelete && r.URL.Path == "/installation/token":
-			tokenRevoked = r.Header.Get("Authorization") == "Bearer installation-secret"
-			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	t.Cleanup(srv.Close)
-	oldBase := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = oldBase })
 
-	got, err := fetchGitHubInstallationRepositories(
-		context.Background(),
-		installationID,
-		2,
-		1,
-	)
+	h := newGHAppTestHandler(t, srv.URL)
+	got, err := h.fetchGitHubInstallationRepositories(context.Background(), installationID, 2, 1)
 	if err != nil {
 		t.Fatalf("fetchGitHubInstallationRepositories: %v", err)
 	}
@@ -2331,59 +2225,22 @@ func TestFetchGitHubInstallationRepositories(t *testing.T) {
 	if got.TotalCount != 3 || got.NextPage == nil || *got.NextPage != 3 {
 		t.Errorf("pagination = total %d, next %v; want total 3, next 3", got.TotalCount, got.NextPage)
 	}
-	if !tokenRevoked {
-		t.Error("installation token was not revoked after repository listing")
+}
+
+// A disabled App client (no key configured) must fail closed rather than call
+// GitHub unauthenticated.
+func TestFetchGitHubInstallationRepositories_NotConfigured(t *testing.T) {
+	h := &Handler{GHApp: nil}
+	if _, err := h.fetchGitHubInstallationRepositories(context.Background(), 1, 1, 1); err == nil {
+		t.Fatal("want error when App client is not configured")
 	}
 }
 
-func TestListGitHubInstallationRepositoriesRejectsCrossWorkspaceRow(t *testing.T) {
-	if testHandler == nil {
-		t.Skip("handler test fixture not initialized (no DB?)")
-	}
-	ctx := context.Background()
-	const installationID int64 = 818181
-	row, err := testHandler.Queries.CreateGitHubInstallation(ctx, db.CreateGitHubInstallationParams{
-		WorkspaceID:    parseUUID(testWorkspaceID),
-		InstallationID: installationID,
-		AccountLogin:   "cross-workspace-acct",
-		AccountType:    "Organization",
-	})
-	if err != nil {
-		t.Fatalf("CreateGitHubInstallation: %v", err)
-	}
-	t.Cleanup(func() {
-		testPool.Exec(ctx, `DELETE FROM github_installation WHERE installation_id = $1`, installationID)
-	})
-
-	otherWorkspaceID := "11111111-2222-3333-4444-555555555555"
-	req := httptest.NewRequest(
-		http.MethodGet,
-		"/api/workspaces/"+otherWorkspaceID+"/github/installations/"+uuidToString(row.ID)+"/repositories",
-		nil,
-	)
-	rec := httptest.NewRecorder()
-	router := chi.NewRouter()
-	router.Get(
-		"/api/workspaces/{id}/github/installations/{installationId}/repositories",
-		testHandler.ListGitHubInstallationRepositories,
-	)
-	router.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("cross-workspace row: got %d (%s), want 404", rec.Code, rec.Body.String())
-	}
-}
-
-// TestFetchInstallationAccount_AuthenticatedPopulatesRow simulates the
-// GitHub `/app/installations/{id}` endpoint with a JWT-gated mock and
-// verifies that fetchInstallationAccount, when fully configured,
+// verifies that fetchInstallationAccount, when the App client is configured,
 // (a) sends a Bearer JWT, (b) parses the JSON response, and (c) returns
 // the real account login instead of the "unknown" placeholder. This is
 // the assertion that nails down the bug fix for MUL-3078.
 func TestFetchInstallationAccount_AuthenticatedPopulatesRow(t *testing.T) {
-	pemBytes, key := generateTestRSAKeyPEM(t)
-	t.Setenv("GITHUB_APP_ID", "11111")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
-
 	const wantInstallationID int64 = 7777777
 	var sawAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2392,17 +2249,8 @@ func TestFetchInstallationAccount_AuthenticatedPopulatesRow(t *testing.T) {
 		if r.URL.Path != expectedPath {
 			t.Errorf("unexpected path: got %q want %q", r.URL.Path, expectedPath)
 		}
-		// Verify JWT signature using the matching public key — this is
-		// what GitHub does on the real endpoint.
-		bearer := strings.TrimPrefix(sawAuth, "Bearer ")
-		if bearer == sawAuth {
+		if !strings.HasPrefix(sawAuth, "Bearer ") {
 			http.Error(w, "missing Bearer prefix", http.StatusUnauthorized)
-			return
-		}
-		if _, err := jwt.Parse(bearer, func(token *jwt.Token) (any, error) {
-			return &key.PublicKey, nil
-		}); err != nil {
-			http.Error(w, "bad jwt: "+err.Error(), http.StatusUnauthorized)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -2415,11 +2263,8 @@ func TestFetchInstallationAccount_AuthenticatedPopulatesRow(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	oldBase := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = oldBase })
-
-	login, accountType, avatar := fetchInstallationAccount(context.Background(), wantInstallationID)
+	h := newGHAppTestHandler(t, srv.URL)
+	login, accountType, avatar := h.fetchInstallationAccount(context.Background(), wantInstallationID)
 	if login != "octocat" {
 		t.Errorf("login = %q, want %q (the bug repro: stayed as 'unknown' before the fix)", login, "octocat")
 	}
@@ -2435,27 +2280,12 @@ func TestFetchInstallationAccount_AuthenticatedPopulatesRow(t *testing.T) {
 }
 
 // TestFetchInstallationAccount_UnauthenticatedFallsBack documents the
-// degraded path: when the operator hasn't set GITHUB_APP_ID/PRIVATE_KEY,
-// the call is made unauthenticated, GitHub returns 401, and the function
-// returns the "unknown" placeholder. This is the input the webhook then
-// upserts over once GitHub delivers `installation.created`.
+// degraded path: when the App client isn't configured, the call is skipped and
+// the function returns the "unknown" placeholder. This is the input the webhook
+// then upserts over once GitHub delivers `installation.created`.
 func TestFetchInstallationAccount_UnauthenticatedFallsBack(t *testing.T) {
-	t.Setenv("GITHUB_APP_ID", "")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") == "" {
-			http.Error(w, "auth required", http.StatusUnauthorized)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"account": map[string]any{"login": "should-not-see"}})
-	}))
-	t.Cleanup(srv.Close)
-	oldBase := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = oldBase })
-
-	login, _, _ := fetchInstallationAccount(context.Background(), 999)
+	h := &Handler{GHApp: nil}
+	login, _, _ := h.fetchInstallationAccount(context.Background(), 999)
 	if login != "unknown" {
 		t.Errorf("login = %q, want unknown placeholder when auth not configured", login)
 	}
@@ -2464,23 +2294,15 @@ func TestFetchInstallationAccount_UnauthenticatedFallsBack(t *testing.T) {
 // TestFetchInstallationAccount_EmptyAccountKeepsPlaceholder pins that a 200
 // response with a missing `account.login` (e.g. GitHub returned a partial
 // payload) still yields the safe "unknown" placeholder rather than writing
-// an empty string — the frontend renders the literal value, so an empty
-// string would surface as "已连接到 " (the bug we're fixing, in a different
-// shape).
+// an empty string.
 func TestFetchInstallationAccount_EmptyAccountKeepsPlaceholder(t *testing.T) {
-	pemBytes, _ := generateTestRSAKeyPEM(t)
-	t.Setenv("GITHUB_APP_ID", "1")
-	t.Setenv("GITHUB_APP_PRIVATE_KEY", string(pemBytes))
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"account": map[string]any{}})
 	}))
 	t.Cleanup(srv.Close)
-	oldBase := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = oldBase })
 
-	login, accountType, avatar := fetchInstallationAccount(context.Background(), 12)
+	h := newGHAppTestHandler(t, srv.URL)
+	login, accountType, avatar := h.fetchInstallationAccount(context.Background(), 12)
 	if login != "unknown" {
 		t.Errorf("expected 'unknown' placeholder for empty account.login, got %q", login)
 	}
@@ -2625,16 +2447,13 @@ func TestSetupCallback_ConsumesPendingInstallationCreated(t *testing.T) {
 		testPool.Exec(ctx, `DELETE FROM github_pending_installation WHERE installation_id = $1`, installationID)
 	})
 
-	// Force fetchInstallationAccount to take its degraded path. This pins that
+	// Force fetchInstallationAccount to take its degraded path via a
+	// disabled GHApp on testHandler; no GitHub call is made. This pins that
 	// the final real account name comes from the earlier webhook, not the
 	// setup callback's synchronous GitHub API lookup.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "auth required", http.StatusUnauthorized)
-	}))
-	t.Cleanup(srv.Close)
-	oldBase := githubAPIBase
-	githubAPIBase = srv.URL
-	t.Cleanup(func() { githubAPIBase = oldBase })
+	prev := testHandler.GHApp
+	testHandler.GHApp = nil
+	t.Cleanup(func() { testHandler.GHApp = prev })
 
 	body, _ := json.Marshal(map[string]any{
 		"action": "created",

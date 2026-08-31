@@ -226,6 +226,31 @@ func (q *Queries) DeleteWorkspaceConnections(ctx context.Context, workspaceID pg
 	return err
 }
 
+const deleteWorkspaceExternalIssueData = `-- name: DeleteWorkspaceExternalIssueData :exec
+WITH deleted_run_items AS (
+    DELETE FROM external_issue_sync_run_item WHERE external_issue_sync_run_item.workspace_id = $1
+), deleted_events AS (
+    DELETE FROM external_issue_sync_event WHERE external_issue_sync_event.workspace_id = $1
+), deleted_runs AS (
+    DELETE FROM external_issue_sync_run WHERE external_issue_sync_run.workspace_id = $1
+), deleted_links AS (
+    DELETE FROM external_issue_link WHERE external_issue_link.workspace_id = $1
+)
+DELETE FROM external_issue_source WHERE external_issue_source.workspace_id = $1
+`
+
+// Clear the external-issue import subsystem for a workspace: the run-item
+// ledger, sync events, runs, links, and finally the sources. No foreign keys or
+// cascades exist, so each table is deleted explicitly. Ordered leaf → root
+// (items/events/runs before sources) for readability; deletion is workspace-
+// scoped only, so order is not correctness-critical here. Run before
+// DeleteWorkspaceConnections so the GitHub installation these sources reference
+// as a credential is torn down after its dependents.
+func (q *Queries) DeleteWorkspaceExternalIssueData(ctx context.Context, workspaceID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, deleteWorkspaceExternalIssueData, workspaceID)
+	return err
+}
+
 const deleteWorkspaceIssueRoots = `-- name: DeleteWorkspaceIssueRoots :exec
 WITH
 deleted_issues AS (

@@ -128,3 +128,81 @@ func TestUseRemoteAppliesRemoteContent(t *testing.T) {
 		t.Fatal("title_conflict must be cleared after use_remote")
 	}
 }
+
+// A single full first page (15 issues, no next-page Link) must report
+// has_more=true even though only 10 are sampled — the old NextCursor-only check
+// wrongly said false and hid the other issues. Regression for codex56 preview.
+func TestPreviewHasMoreOnFullFirstPageNoCursor(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"prev", "prev-"+suffix+"@t.local").Scan(&userID); err != nil {
+		t.Fatalf("user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"prev-ws", "prev-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationRowID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationRowID); err != nil {
+		t.Fatalf("installation: %v", err)
+	}
+
+	// Fake GitHub: resolve repo + a single page of 15 open issues, NO Link header.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "/issues") {
+			fmt.Fprint(w, "[")
+			for i := 0; i < 15; i++ {
+				if i > 0 {
+					fmt.Fprint(w, ",")
+				}
+				fmt.Fprintf(w, `{"id":%d,"number":%d,"title":"i%d","state":"open","html_url":"h","updated_at":"2026-01-01T00:00:00Z"}`, i+1, i+1, i+1)
+			}
+			fmt.Fprint(w, "]")
+			return
+		}
+		fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
+	}))
+	defer srv.Close()
+	defer externalissue.SetGitHubAPIBaseForTest(srv.URL)()
+	withFakeToken(t)
+
+	h := &Handler{Queries: db.New(testPool), Entitlements: testHandler.Entitlements}
+	reqBody, _ := json.Marshal(map[string]any{"owner": "acme", "repo": "widgets", "state": "open"})
+	req := httptest.NewRequest("POST", "/x", strings.NewReader(string(reqBody)))
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", workspaceID)
+	rctx.URLParams.Add("installationId", installationRowID)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	// PreviewGitHubIssues reads the repository-browse env gate; set it.
+	t.Setenv("GITHUB_APP_ID", "1")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", "x")
+	rec := httptest.NewRecorder()
+	h.PreviewGitHubIssues(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("preview status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var out previewGitHubIssuesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.SampleCount != 10 {
+		t.Fatalf("sample_count = %d, want 10", out.SampleCount)
+	}
+	if !out.HasMore {
+		t.Fatal("has_more must be true for a 15-issue full page even without a next cursor")
+	}
+}

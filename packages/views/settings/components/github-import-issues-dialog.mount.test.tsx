@@ -9,6 +9,7 @@ import { GitHubImportIssuesDialog } from "./github-import-issues-dialog";
 const mockImport = vi.hoisted(() => vi.fn());
 const mockResume = vi.hoisted(() => vi.fn());
 const mockGetRun = vi.hoisted(() => vi.fn());
+const mockPreview = vi.hoisted(() => vi.fn());
 const mockInvalidate = vi.hoisted(() => vi.fn());
 
 vi.mock("@tanstack/react-query", () => ({
@@ -21,7 +22,7 @@ vi.mock("@multica/core/api", () => ({
     importGitHubIssues: (...a: unknown[]) => mockImport(...a),
     resumeExternalIssueSyncRun: (...a: unknown[]) => mockResume(...a),
     getExternalIssueSyncRun: (...a: unknown[]) => mockGetRun(...a),
-    previewGitHubIssues: vi.fn(),
+    previewGitHubIssues: (...a: unknown[]) => mockPreview(...a),
     cancelExternalIssueSyncRun: vi.fn(),
   },
 }));
@@ -51,6 +52,27 @@ function runStatus(state: string, over: Record<string, unknown> = {}) {
   };
 }
 
+function previewResponse(over: Record<string, unknown> = {}) {
+  return {
+    sample: [{ number: 1, title: "first", state: "open" }],
+    sample_count: 1,
+    has_more: false,
+    capacity_remaining: -1,
+    capacity_limited: false,
+    ...over,
+  };
+}
+
+// Import is gated behind a fresh preview: open the dialog, preview, then click
+// Import. Mirrors the real user flow the gate enforces.
+async function openPreviewAndImport(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: /import issues/i }));
+  await user.click(screen.getByRole("button", { name: "Preview" }));
+  const importBtn = await screen.findByRole("button", { name: "Import" });
+  await waitFor(() => expect(importBtn).toBeEnabled());
+  await user.click(importBtn);
+}
+
 describe("GitHubImportIssuesDialog resume poll", () => {
   beforeEach(() => vi.clearAllMocks());
 
@@ -59,6 +81,7 @@ describe("GitHubImportIssuesDialog resume poll", () => {
   // Regression for codex56 P1-5 (same-run-id resume didn't re-run the effect).
   it("restarts polling on resume with the same run id", async () => {
     const user = userEvent.setup();
+    mockPreview.mockResolvedValue(previewResponse());
     mockImport.mockResolvedValue({ source_id: "src-1", run_id: "run-1", state: "queued" });
     mockResume.mockResolvedValue({ source_id: "src-1", run_id: "run-1", state: "queued" });
     mockGetRun
@@ -66,8 +89,7 @@ describe("GitHubImportIssuesDialog resume poll", () => {
       .mockResolvedValue(runStatus("succeeded", { imported: 2, total: 2 }));
 
     renderDialog();
-    await user.click(screen.getByRole("button", { name: /import issues/i }));
-    await user.click(screen.getByRole("button", { name: "Import" }));
+    await openPreviewAndImport(user);
 
     // First poll lands on quota_blocked → Resume button appears.
     await waitFor(() => expect(screen.getByRole("button", { name: "Resume" })).toBeInTheDocument());
@@ -81,13 +103,34 @@ describe("GitHubImportIssuesDialog resume poll", () => {
   // A partial run's per-issue error sample is shown to the user.
   it("shows the failed-issue error sample", async () => {
     const user = userEvent.setup();
+    mockPreview.mockResolvedValue(previewResponse());
     mockImport.mockResolvedValue({ source_id: "src-1", run_id: "run-1", state: "queued" });
     mockGetRun.mockResolvedValue(
       runStatus("partial", { imported: 1, failed: 1, total: 2, errors: ["issue #7: boom"] }),
     );
     renderDialog();
-    await user.click(screen.getByRole("button", { name: /import issues/i }));
-    await user.click(screen.getByRole("button", { name: "Import" }));
+    await openPreviewAndImport(user);
     await waitFor(() => expect(screen.getByText("issue #7: boom")).toBeInTheDocument());
+  });
+
+  // Import stays disabled until a fresh preview exists, and a preview goes stale
+  // the moment the repo/state inputs change. Regression for codex56 preview gate.
+  it("gates Import on a fresh preview and clears it on input change", async () => {
+    const user = userEvent.setup();
+    mockPreview.mockResolvedValue(previewResponse());
+    renderDialog();
+    await user.click(screen.getByRole("button", { name: /import issues/i }));
+
+    // No preview yet → Import disabled.
+    expect(screen.getByRole("button", { name: "Import" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Preview" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Import" })).toBeEnabled());
+
+    // Changing the repo invalidates the preview → Import disabled again.
+    const repoInput = screen.getByLabelText(/repository/i);
+    await user.type(repoInput, "-2");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Import" })).toBeDisabled());
+    expect(mockImport).not.toHaveBeenCalled();
   });
 });

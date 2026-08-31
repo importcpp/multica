@@ -80,11 +80,28 @@ export function GitHubImportIssuesDialog({
   const [resuming, setResuming] = useState(false);
   const [preview, setPreview] = useState<PreviewGitHubIssuesResponse | null>(null);
   const [previewing, setPreviewing] = useState(false);
+  // The (owner/repo/state) the current preview was fetched for. Import is gated
+  // on this matching the current inputs so the user cannot confirm an import of
+  // one repo/state while looking at a stale preview of another.
+  const [previewKey, setPreviewKey] = useState<string | null>(null);
 
   const parsed = splitOwnerRepo(fullPath);
+  const currentKey = parsed ? `${parsed.owner}/${parsed.repo}@${state}` : null;
+  const previewFresh = preview !== null && previewKey !== null && previewKey === currentKey;
+
+  // Drop a stale preview the moment the inputs it was taken for change, so the
+  // summary on screen always describes what an Import would actually pull.
+  useEffect(() => {
+    if (previewKey !== null && previewKey !== currentKey) {
+      setPreview(null);
+      setPreviewKey(null);
+    }
+  }, [currentKey, previewKey]);
   const isRunning =
     runId !== null && !pollError && !(status && TERMINAL_STATES.has(status.state));
-  const canSubmit = parsed !== null && !starting && !isRunning;
+  // Import requires a FRESH preview of the exact inputs — the user must see what
+  // will be pulled and confirm it before a backfill starts.
+  const canSubmit = parsed !== null && previewFresh && !starting && !isRunning;
   const canResume = status !== null && RESUMABLE_STATES.has(status.state) && !resuming;
 
   // Localized label for a run state. Unknown/in-flight states fall back to the
@@ -194,6 +211,7 @@ export function GitHubImportIssuesDialog({
     if (!parsed) return;
     setPreviewing(true);
     setPreview(null);
+    setPreviewKey(null);
     try {
       const res = await api.previewGitHubIssues(workspaceId, installationId, {
         owner: parsed.owner,
@@ -201,6 +219,7 @@ export function GitHubImportIssuesDialog({
         state,
       });
       setPreview(res);
+      setPreviewKey(`${parsed.owner}/${parsed.repo}@${state}`);
     } catch (e) {
       const message = e instanceof Error ? e.message : "";
       if (message.toLowerCase().includes("issues")) {
@@ -214,7 +233,7 @@ export function GitHubImportIssuesDialog({
   }
 
   async function handleStart() {
-    if (!parsed) return;
+    if (!parsed || !previewFresh) return;
     setStarting(true);
     setStatus(null);
     try {

@@ -137,12 +137,12 @@ func (h *Handler) PreviewGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		writeError(w, mapExternalIssueStatus(err), "failed to list issues")
 		return
 	}
+	const previewSampleLimit = 10
 	resp := previewGitHubIssuesResponse{
-		HasMore:           page.NextCursor != "",
 		CapacityRemaining: -1,
 	}
 	for _, iss := range page.Issues {
-		if len(resp.Sample) >= 10 {
+		if len(resp.Sample) >= previewSampleLimit {
 			break
 		}
 		resp.Sample = append(resp.Sample, previewSampleIssue{
@@ -150,6 +150,11 @@ func (h *Handler) PreviewGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	resp.SampleCount = len(resp.Sample)
+	// "more than what's shown" is true when either the FIRST PAGE already held
+	// more issues than the sample cap (a 11-100 issue repo returns a single full
+	// page with NO next cursor — the old NextCursor-only check wrongly said
+	// has_more=false and hid them), or a further page exists.
+	resp.HasMore = len(page.Issues) > len(resp.Sample) || page.NextCursor != ""
 
 	// Capacity hint from the workspace issue-count policy.
 	policy := service.ResolveIssueCountPolicy(r.Context(), h.Entitlements, workspaceUUID)
