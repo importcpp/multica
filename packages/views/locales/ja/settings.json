@@ -771,7 +771,13 @@
       "toast_cancel_requested": "取消をリクエストしました",
       "resume": "再開",
       "resuming": "再開中…",
-      "toast_resumed": "インポートを再開しました"
+      "toast_resumed": "インポートを再開しました",
+      "preview": "プレビュー",
+      "previewing": "プレビューを読み込み中…",
+      "preview_summary": "{{count}} 件のサンプル Issue を表示{{more}}",
+      "preview_more": "（さらにあり）",
+      "capacity_hint": "ワークスペースはあと {{remaining}} 件の Issue を保持できます",
+      "capacity_full": "ワークスペースの Issue 上限に達しました"
     }
   },
   "vcs": {

@@ -771,7 +771,13 @@
       "toast_cancel_requested": "已请求取消",
       "resume": "继续导入",
       "resuming": "继续中…",
-      "toast_resumed": "已继续导入"
+      "toast_resumed": "已继续导入",
+      "preview": "预览",
+      "previewing": "加载预览中…",
+      "preview_summary": "展示 {{count}} 条示例 Issue{{more}}",
+      "preview_more": "（还有更多）",
+      "capacity_hint": "工作区还可容纳 {{remaining}} 条 Issue",
+      "capacity_full": "已达工作区 Issue 上限"
     }
   },
   "vcs": {

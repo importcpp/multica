@@ -12,6 +12,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/entitlement"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
 	"github.com/multica-ai/multica/server/internal/integrations/githubapi"
 	"github.com/multica-ai/multica/server/internal/service"
@@ -44,6 +45,127 @@ var mintGitHubIssuesReadToken = func(ctx context.Context, app *githubapi.Client,
 }
 
 var errGitHubIssuesPermission = errors.New("github installation has not granted Issues:read")
+
+type previewGitHubIssuesResponse struct {
+	// Sample is the first page of issue titles (PRs filtered) so the user sees
+	// what will be imported before confirming.
+	Sample []previewSampleIssue `json:"sample"`
+	// SampleCount is len(Sample); FirstPageFull + HasMore indicate the repo has
+	// more than one page (a best-effort "there are more than this" signal — we
+	// deliberately do NOT scan the whole repo to produce an exact count).
+	SampleCount int  `json:"sample_count"`
+	HasMore     bool `json:"has_more"`
+	// CapacityRemaining is how many more issues the workspace can hold before the
+	// issue-count limit (−1 = unlimited). CapacityLimited says a limit applies.
+	CapacityRemaining int64 `json:"capacity_remaining"`
+	CapacityLimited   bool  `json:"capacity_limited"`
+}
+
+type previewSampleIssue struct {
+	Number int64  `json:"number"`
+	Title  string `json:"title"`
+	State  string `json:"state"`
+}
+
+// PreviewGitHubIssues returns a sample + best-effort estimate + capacity hint so
+// the user can confirm before starting an import. It fetches only the first page
+// (no full scan): an exact precount would double the API cost by walking the
+// whole repo. Admin-gated at the router.
+func (h *Handler) PreviewGitHubIssues(w http.ResponseWriter, r *http.Request) {
+	workspaceUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "id"), "workspace id")
+	if !ok {
+		return
+	}
+	installationUUID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "installationId"), "installationId")
+	if !ok {
+		return
+	}
+	if !isGitHubRepositoryBrowseConfigured() {
+		writeError(w, http.StatusServiceUnavailable, "github app is not configured for repository access")
+		return
+	}
+	var req importGitHubIssuesRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	req.Owner = strings.TrimSpace(req.Owner)
+	req.Repo = strings.TrimSpace(req.Repo)
+	if req.Owner == "" || req.Repo == "" {
+		writeError(w, http.StatusBadRequest, "owner and repo are required")
+		return
+	}
+	state := strings.ToLower(strings.TrimSpace(req.State))
+	switch state {
+	case "", "open":
+		state = "open"
+	case "closed", "all":
+	default:
+		writeError(w, http.StatusBadRequest, "state must be open, closed, or all")
+		return
+	}
+	row, err := h.Queries.GetGitHubInstallationByID(r.Context(), installationUUID)
+	if err != nil || row.WorkspaceID != workspaceUUID {
+		writeError(w, http.StatusNotFound, "installation not found")
+		return
+	}
+	token, revoke, err := mintGitHubIssuesReadToken(r.Context(), h.GHApp, row.InstallationID)
+	if err != nil {
+		if errors.Is(err, errGitHubIssuesPermission) {
+			writeErrorCode(w, http.StatusForbidden, "github_issues_permission",
+				"this GitHub installation has not granted Issues read access; re-authorize the app to enable issue import")
+			return
+		}
+		writeError(w, http.StatusBadGateway, "failed to authenticate with github")
+		return
+	}
+	defer revoke()
+
+	provider, ok := externalissue.For("github")
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "github provider unavailable")
+		return
+	}
+	creds := externalissue.Credentials{Token: token}
+	repo, err := provider.ResolveRepository(r.Context(), creds, externalissue.RepositoryRef{FullPath: req.Owner + "/" + req.Repo})
+	if err != nil {
+		writeError(w, mapExternalIssueStatus(err), "failed to resolve repository")
+		return
+	}
+	page, err := provider.ListIssues(r.Context(), creds, repo, externalissue.IssueFilter{State: state}, "")
+	if err != nil {
+		writeError(w, mapExternalIssueStatus(err), "failed to list issues")
+		return
+	}
+	resp := previewGitHubIssuesResponse{
+		HasMore:           page.NextCursor != "",
+		CapacityRemaining: -1,
+	}
+	for _, iss := range page.Issues {
+		if len(resp.Sample) >= 10 {
+			break
+		}
+		resp.Sample = append(resp.Sample, previewSampleIssue{
+			Number: iss.Number, Title: iss.Title, State: string(iss.State),
+		})
+	}
+	resp.SampleCount = len(resp.Sample)
+
+	// Capacity hint from the workspace issue-count policy.
+	policy := service.ResolveIssueCountPolicy(r.Context(), h.Entitlements, workspaceUUID)
+	if policy.Action == entitlement.ActionEnforce && policy.Limit > 0 {
+		used, err := service.CountIssueUsage(r.Context(), h.Queries, workspaceUUID, policy)
+		if err == nil {
+			remaining := policy.Limit - used
+			if remaining < 0 {
+				remaining = 0
+			}
+			resp.CapacityLimited = true
+			resp.CapacityRemaining = remaining
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
 
 // actingUserID resolves the authenticated member UUID from the request, or an
 // invalid UUID when there is no session (matches the github-connect behavior).

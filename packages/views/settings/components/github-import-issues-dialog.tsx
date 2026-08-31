@@ -16,6 +16,7 @@ import {
 } from "@multica/ui/components/ui/dialog";
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
+import type { PreviewGitHubIssuesResponse } from "@multica/core/types";
 import { api } from "@multica/core/api";
 import { githubKeys } from "@multica/core/github";
 import { issueKeys } from "@multica/core/issues/queries";
@@ -69,6 +70,8 @@ export function GitHubImportIssuesDialog({
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [preview, setPreview] = useState<PreviewGitHubIssuesResponse | null>(null);
+  const [previewing, setPreviewing] = useState(false);
 
   const parsed = splitOwnerRepo(fullPath);
   const isRunning = runId !== null && !(status && TERMINAL_STATES.has(status.state));
@@ -160,6 +163,29 @@ export function GitHubImportIssuesDialog({
       toast.error(e instanceof Error ? e.message : t(($) => $.github.import_issues.toast_failed));
     } finally {
       setResuming(false);
+    }
+  }
+
+  async function handlePreview() {
+    if (!parsed) return;
+    setPreviewing(true);
+    setPreview(null);
+    try {
+      const res = await api.previewGitHubIssues(workspaceId, installationId, {
+        owner: parsed.owner,
+        repo: parsed.repo,
+        state,
+      });
+      setPreview(res);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : "";
+      if (message.toLowerCase().includes("issues")) {
+        toast.error(t(($) => $.github.import_issues.toast_permission));
+      } else {
+        toast.error(message || t(($) => $.github.import_issues.toast_failed));
+      }
+    } finally {
+      setPreviewing(false);
     }
   }
 
@@ -257,6 +283,31 @@ export function GitHubImportIssuesDialog({
             </select>
           </div>
 
+          {preview && !status && (
+            <div className="flex flex-col gap-1.5 rounded-md border border-border p-2">
+              <span className="text-caption text-muted-foreground">
+                {t(($) => $.github.import_issues.preview_summary, {
+                  count: preview.sample_count,
+                  more: preview.has_more ? t(($) => $.github.import_issues.preview_more) : "",
+                })}
+              </span>
+              <ul className="text-caption flex flex-col gap-0.5">
+                {preview.sample.slice(0, 5).map((s) => (
+                  <li key={s.number} className="truncate">
+                    #{s.number} {s.title}
+                  </li>
+                ))}
+              </ul>
+              <span className="text-caption text-muted-foreground">
+                {preview.capacity_limited
+                  ? preview.capacity_remaining > 0
+                    ? t(($) => $.github.import_issues.capacity_hint, { remaining: preview.capacity_remaining })
+                    : t(($) => $.github.import_issues.capacity_full)
+                  : ""}
+              </span>
+            </div>
+          )}
+
           {status && (
             <div className="flex flex-col gap-1">
               <span className="text-body font-medium">{runStateLabel(status.state)}</span>
@@ -292,9 +343,16 @@ export function GitHubImportIssuesDialog({
                 : t(($) => $.github.import_issues.resume)}
             </Button>
           ) : (
-            <Button onClick={handleStart} disabled={!canSubmit}>
-              {t(($) => $.github.import_issues.submit)}
-            </Button>
+            <>
+              <Button variant="outline" onClick={handlePreview} disabled={parsed === null || previewing || isRunning}>
+                {previewing
+                  ? t(($) => $.github.import_issues.previewing)
+                  : t(($) => $.github.import_issues.preview)}
+              </Button>
+              <Button onClick={handleStart} disabled={!canSubmit}>
+                {t(($) => $.github.import_issues.submit)}
+              </Button>
+            </>
           )}
         </DialogFooter>
       </DialogContent>

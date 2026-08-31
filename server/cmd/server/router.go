@@ -1608,6 +1608,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/github/connect", h.GitHubConnect)
 					r.Get("/github/installations/{installationId}/repositories", h.ListGitHubInstallationRepositories)
 					r.Post("/github/installations/{installationId}/import-issues", h.ImportGitHubIssues)
+					r.Post("/github/installations/{installationId}/preview-issues", h.PreviewGitHubIssues)
 					r.Get("/external-issue-sync-runs/{runId}", h.GetSyncRun)
 					r.Post("/external-issue-sync-runs/{runId}/cancel", h.CancelSyncRun)
 					r.Post("/external-issue-sync-runs/{runId}/resume", h.ResumeSyncRun)

@@ -187,3 +187,18 @@ export interface IssueExternalSource {
   title_local_owned: boolean;
   body_local_owned: boolean;
 }
+
+export interface PreviewSampleIssue {
+  number: number;
+  title: string;
+  state: string;
+}
+
+/** Pre-import preview: a sample + best-effort "there's more" + capacity hint. */
+export interface PreviewGitHubIssuesResponse {
+  sample: PreviewSampleIssue[];
+  sample_count: number;
+  has_more: boolean;
+  capacity_remaining: number;
+  capacity_limited: boolean;
+}

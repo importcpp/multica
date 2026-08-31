@@ -65,6 +65,7 @@ import type {
   ImportGitHubIssuesResponse,
   SyncRunStatus,
   IssueExternalSource,
+  PreviewGitHubIssuesResponse,
   ListLabelsResponse,
   ListWebhookDeliveriesResponse,
   IssueStatusEntry,
@@ -453,6 +454,26 @@ export const EMPTY_ISSUE_EXTERNAL_SOURCE: IssueExternalSource = {
   body_conflict: false,
   title_local_owned: false,
   body_local_owned: false,
+};
+
+export const PreviewGitHubIssuesResponseSchema = z.object({
+  sample: z.array(z.object({
+    number: z.number().optional().default(0),
+    title: z.string().optional().default(""),
+    state: z.string().optional().default(""),
+  })).optional().default([]),
+  sample_count: z.number().optional().default(0),
+  has_more: z.boolean().optional().default(false),
+  capacity_remaining: z.number().optional().default(-1),
+  capacity_limited: z.boolean().optional().default(false),
+}).loose();
+
+export const EMPTY_PREVIEW_GITHUB_ISSUES_RESPONSE: PreviewGitHubIssuesResponse = {
+  sample: [],
+  sample_count: 0,
+  has_more: false,
+  capacity_remaining: -1,
+  capacity_limited: false,
 };
 
 export const GitHubPullRequestSchema = z.object({

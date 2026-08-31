@@ -773,7 +773,13 @@
       "toast_cancel_requested": "Cancellation requested",
       "resume": "Resume",
       "resuming": "Resuming…",
-      "toast_resumed": "Import resumed"
+      "toast_resumed": "Import resumed",
+      "preview": "Preview",
+      "previewing": "Loading preview…",
+      "preview_summary": "Showing {{count}} sample issue(s){{more}}",
+      "preview_more": " (more available)",
+      "capacity_hint": "Workspace can hold {{remaining}} more issue(s)",
+      "capacity_full": "Workspace issue limit reached"
     }
   },
   "vcs": {

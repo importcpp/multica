@@ -168,6 +168,7 @@ import type {
   ImportGitHubIssuesResponse,
   SyncRunStatus,
   IssueExternalSource,
+  PreviewGitHubIssuesResponse,
   GitHubConnectResponse,
   ListVCSConnectionsResponse,
   ConnectVCSRequest,
@@ -413,12 +414,14 @@ import {
   ImportGitHubIssuesResponseSchema,
   SyncRunStatusSchema,
   IssueExternalSourceSchema,
+  PreviewGitHubIssuesResponseSchema,
   EMPTY_GITHUB_CONNECT_RESPONSE,
   EMPTY_LIST_GITHUB_INSTALLATIONS_RESPONSE,
   EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
   EMPTY_IMPORT_GITHUB_ISSUES_RESPONSE,
   EMPTY_SYNC_RUN_STATUS,
   EMPTY_ISSUE_EXTERNAL_SOURCE,
+  EMPTY_PREVIEW_GITHUB_ISSUES_RESPONSE,
   RuntimeModelListRequestSchema,
   MALFORMED_RUNTIME_MODEL_LIST_REQUEST,
   SkillSchema,
@@ -4338,6 +4341,23 @@ export class ApiClient {
       ListGitHubRepositoriesResponseSchema,
       EMPTY_LIST_GITHUB_REPOSITORIES_RESPONSE,
       { endpoint: "GET /api/workspaces/:id/github/installations/:installationId/repositories" },
+    );
+  }
+
+  async previewGitHubIssues(
+    workspaceId: string,
+    installationId: string,
+    body: { owner: string; repo: string; state?: string },
+  ): Promise<PreviewGitHubIssuesResponse> {
+    const raw = await this.fetch<unknown>(
+      `/api/workspaces/${workspaceId}/github/installations/${installationId}/preview-issues`,
+      { method: "POST", body: JSON.stringify(body) },
+    );
+    return parseWithFallback(
+      raw,
+      PreviewGitHubIssuesResponseSchema,
+      EMPTY_PREVIEW_GITHUB_ISSUES_RESPONSE,
+      { endpoint: "POST /api/workspaces/:id/github/installations/:installationId/preview-issues" },
     );
   }
 
