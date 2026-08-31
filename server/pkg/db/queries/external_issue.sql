@@ -205,6 +205,22 @@ WHERE id = (
 )
 RETURNING *;
 
+-- name: CheckpointExternalIssueSyncRunCursor :execrows
+-- Lightweight interior-page checkpoint: persist ONLY the cursor, reconcile
+-- baseline, and refreshed lease, without re-aggregating the identity ledger.
+-- Fenced on worker_id. Full count aggregation is expensive (a scan of the run's
+-- ledger) and only needs to happen at claim EXIT points, so interior pages use
+-- this to keep the resume cursor crash-safe at O(1); the counts on the run row
+-- may lag within a claim and are refreshed authoritatively at the next exit /
+-- next claim start (the ledger is the source of truth, so a crash mid-claim
+-- re-aggregates correctly on resume).
+UPDATE external_issue_sync_run SET
+    cursor = $2,
+    lease_expires_at = $3,
+    reconcile_baseline = sqlc.arg('reconcile_baseline'),
+    updated_at = now()
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
+
 -- name: AdvanceExternalIssueSyncRun :execrows
 -- Persist page progress: new cursor, refreshed lease, the running counts, and the
 -- current fixpoint-reconcile baseline. Fenced on worker_id: if the lease was
@@ -427,6 +443,16 @@ SELECT EXISTS (
 
 -- name: DeleteExternalIssueSyncRunItemsByWorkspace :exec
 DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1;
+
+-- name: DeleteExternalIssueSyncRunItemsByRun :exec
+-- Terminal retention: drop a finished run's identity ledger once it can no longer
+-- be resumed. The run's counts are already snapshotted on the run row, and a
+-- non-resumable terminal run (succeeded / partial / cancelled) will never re-scan,
+-- so the per-issue dedup rows are dead weight — deleting them bounds ledger growth
+-- instead of accumulating one row per imported issue forever. Resumable terminal
+-- states (quota_blocked / needs_reauth / failed) KEEP their ledger so resume can
+-- still skip already-accounted issues.
+DELETE FROM external_issue_sync_run_item WHERE run_id = $1;
 
 -- name: SetExternalIssueSyncRunErrorSample :execrows
 -- Persist the accumulated error sample mid-run (page checkpoint), fenced on

@@ -346,17 +346,13 @@ func (s *ExternalIssueSyncService) updateBoundIssue(ctx context.Context, qtx *db
 	}
 
 	if changed {
-		updated, err := qtx.UpdateIssue(ctx, db.UpdateIssueParams{
-			ID:            issue.ID,
-			Title:         pgtype.Text{String: newTitle, Valid: true},
-			Description:   pgtype.Text{String: newBody, Valid: true},
-			AssigneeType:  issue.AssigneeType,
-			AssigneeID:    issue.AssigneeID,
-			StartDate:     issue.StartDate,
-			DueDate:       issue.DueDate,
-			ParentIssueID: issue.ParentIssueID,
-			ProjectID:     issue.ProjectID,
-			Stage:         issue.Stage,
+		// Reuse the shared, transaction-aware content update core so an import
+		// update goes through the same primitive as a Public API edit, inside this
+		// applier's transaction. No ExpectedRevision: the FOR UPDATE lock above
+		// already serializes against concurrent local edits.
+		updated, err := s.Issues.UpdateContentInTx(ctx, qtx, issue, IssueContentPatch{
+			Title:       &newTitle,
+			Description: &newBody,
 		})
 		if err != nil {
 			return OutcomeFailed, db.Issue{}, db.Workspace{}, false, fmt.Errorf("update issue: %w", err)
@@ -510,17 +506,12 @@ func (s *ExternalIssueSyncService) UseRemoteFields(ctx context.Context, workspac
 	}
 	changed := newTitle != issue.Title || newBody != issue.Description.String
 	if changed {
-		updated, err := qtx.UpdateIssue(ctx, db.UpdateIssueParams{
-			ID:            issue.ID,
-			Title:         pgtype.Text{String: newTitle, Valid: true},
-			Description:   pgtype.Text{String: newBody, Valid: true},
-			AssigneeType:  issue.AssigneeType,
-			AssigneeID:    issue.AssigneeID,
-			StartDate:     issue.StartDate,
-			DueDate:       issue.DueDate,
-			ParentIssueID: issue.ParentIssueID,
-			ProjectID:     issue.ProjectID,
-			Stage:         issue.Stage,
+		// Reuse the shared, transaction-aware content update core (see
+		// updateBoundIssue): the FOR UPDATE lock above serializes local edits, so
+		// no ExpectedRevision is needed.
+		updated, err := s.Issues.UpdateContentInTx(ctx, qtx, issue, IssueContentPatch{
+			Title:       &newTitle,
+			Description: &newBody,
 		})
 		if err != nil {
 			return fmt.Errorf("update issue: %w", err)

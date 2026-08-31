@@ -47,11 +47,21 @@ vi.mock("@tanstack/react-query", () => ({
     if (key.includes("installations")) return { data: installationsRef.current };
     return { data: undefined };
   },
+  // The import dialog's repo picker uses an infinite query; return an empty repo
+  // list so it falls back to the manual owner/repo input in this tab's tests.
+  useInfiniteQuery: () => ({
+    data: { pages: [{ repositories: [] }] },
+    isLoading: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
   useQueryClient: () => ({
     setQueryData: mockSetQueryData,
     invalidateQueries: mockInvalidate,
   }),
   queryOptions: <T,>(opts: T) => opts,
+  infiniteQueryOptions: <T,>(opts: T) => opts,
 }));
 
 vi.mock("@multica/core/hooks", () => ({

@@ -294,22 +294,21 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			_ = outcome // accounting is in the ledger, not a local counter
 		}
 		cursor = result.NextCursor
-		// Checkpoint the page from the ledger-derived counts. A failed checkpoint
-		// (lost lease or DB error) MUST abort.
-		counts, cerr := w.ledgerCounts(ctx, run.ID)
-		if cerr != nil {
-			return cerr
-		}
-		if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
-			return err
-		}
-		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
-			return err
-		}
 		if cursor == "" {
-			// The scan reached the end. Decide between finishing and running
-			// another reconcile pass. A pass "discovered nothing new" when the
-			// ledger total is unchanged from the baseline captured at its start.
+			// End of scan: aggregate the ledger once (authoritative counts) and
+			// decide between finishing and another reconcile pass. A pass
+			// "discovered nothing new" when the total is unchanged from the
+			// baseline captured at its start.
+			counts, cerr := w.ledgerCounts(ctx, run.ID)
+			if cerr != nil {
+				return cerr
+			}
+			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+				return err
+			}
+			if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
+				return err
+			}
 			if reconcileBaseline >= 0 && counts.total == reconcileBaseline {
 				state := "succeeded"
 				if counts.failed > 0 {
@@ -328,10 +327,28 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			}
 			return w.requeueRun(ctx, run, 0)
 		}
+		// Interior page: keep the resume cursor crash-safe at O(1) without
+		// re-aggregating the ledger every page (that scan grows with the run). The
+		// run-row counts refresh authoritatively at the next exit / claim start.
+		if err := w.checkpointCursor(ctx, run, cursor, reconcileBaseline); err != nil {
+			return err
+		}
+		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
+			return err
+		}
 	}
 
-	// Hit the per-claim page budget with more to do: yield the run back to the
-	// queue so cancel/other runs get a turn. It resumes from the saved cursor.
+	// Hit the per-claim page budget with more to do: aggregate the ledger once
+	// (authoritative counts for the polled UI + next claim's baseline) and yield
+	// the run back to the queue so cancel/other runs get a turn. It resumes from
+	// the saved cursor.
+	counts, cerr := w.ledgerCounts(ctx, run.ID)
+	if cerr != nil {
+		return cerr
+	}
+	if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+		return err
+	}
 	return w.requeueRun(ctx, run, 0)
 }
 
@@ -417,6 +434,28 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 	}
 	if rows == 0 {
 		slog.Warn("external-issue sync worker: lease lost on advance", "run_id", util.UUIDToString(run.ID))
+		return errLeaseLost
+	}
+	return nil
+}
+
+// checkpointCursor persists ONLY the resume cursor + reconcile baseline and
+// renews the lease, without re-aggregating the identity ledger. Used for interior
+// pages so per-page cost stays O(1) as the run grows; fenced on worker_id.
+func (w *ExternalIssueSyncWorker) checkpointCursor(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, reconcileBaseline int64) error {
+	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
+	rows, err := w.h.Queries.CheckpointExternalIssueSyncRunCursor(ctx, db.CheckpointExternalIssueSyncRunCursorParams{
+		ID:                run.ID,
+		WorkerID:          w.id,
+		Cursor:            string(cursor),
+		LeaseExpiresAt:    lease,
+		ReconcileBaseline: reconcileBaseline,
+	})
+	if err != nil {
+		return fmt.Errorf("checkpoint cursor: %w", err)
+	}
+	if rows == 0 {
+		slog.Warn("external-issue sync worker: lease lost on cursor checkpoint", "run_id", util.UUIDToString(run.ID))
 		return errLeaseLost
 	}
 	return nil
@@ -564,8 +603,32 @@ func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.External
 	}
 	if rows == 0 {
 		slog.Warn("external-issue sync worker: lease lost on finish", "run_id", util.UUIDToString(run.ID))
+		return nil
+	}
+	// Terminal retention: a non-resumable terminal run will never re-scan, and its
+	// counts are already snapshotted on the run row, so drop the per-issue identity
+	// ledger to bound growth. Resumable terminal states keep it so resume can still
+	// dedup already-accounted issues. Best-effort: a cleanup failure must not flip a
+	// successfully finished run back to an error.
+	if isNonResumableTerminal(state) {
+		if err := w.h.Queries.DeleteExternalIssueSyncRunItemsByRun(ctx, run.ID); err != nil {
+			slog.Warn("external-issue sync worker: ledger cleanup failed",
+				"run_id", util.UUIDToString(run.ID), "state", state, "err", err)
+		}
 	}
 	return nil
+}
+
+// isNonResumableTerminal reports whether a finished run can never be resumed, so
+// its identity ledger is safe to delete. quota_blocked / needs_reauth / failed
+// are terminal-for-now but resumable, so they keep their ledger.
+func isNonResumableTerminal(state string) bool {
+	switch state {
+	case "succeeded", "partial", "cancelled":
+		return true
+	default:
+		return false
+	}
 }
 
 // requeueRun returns the run to the queue, fenced on this worker's id.

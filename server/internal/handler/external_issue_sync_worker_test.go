@@ -878,3 +878,75 @@ func TestResumeSyncRunRejectsInaccessibleRepo(t *testing.T) {
 		t.Fatalf("run state = %q, want needs_reauth (resume rejected, not queued)", state)
 	}
 }
+
+func ledgerRowCount(t *testing.T, runID string) int {
+	t.Helper()
+	var n int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM external_issue_sync_run_item WHERE run_id=$1`, runID).Scan(&n); err != nil {
+		t.Fatalf("count ledger: %v", err)
+	}
+	return n
+}
+
+// A run that finishes in a non-resumable terminal state (succeeded) must have its
+// identity ledger deleted — counts are already snapshotted on the run row and it
+// can never re-scan, so the per-issue rows are dead weight. Terminal retention
+// for codex56 round-4 ledger-bloat item.
+func TestSyncWorkerCleansLedgerOnSuccess(t *testing.T) {
+	pages := [][]map[string]any{{issue(1, 1, "a"), issue(2, 2, "b")}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	w := NewExternalIssueSyncWorker(testHandler)
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" {
+			break
+		}
+	}
+	state, imported, total := runState(t, runID)
+	if state != "succeeded" {
+		t.Fatalf("state = %q, want succeeded", state)
+	}
+	// Counts survive on the run row even though the ledger is gone.
+	if imported != 2 || total != 2 {
+		t.Fatalf("imported=%d total=%d, want 2/2 (counts snapshotted on run row)", imported, total)
+	}
+	if n := ledgerRowCount(t, runID); n != 0 {
+		t.Fatalf("ledger rows after success = %d, want 0 (terminal retention)", n)
+	}
+}
+
+// A run that stops in a RESUMABLE terminal state (quota_blocked) must KEEP its
+// ledger so a later resume can still skip already-accounted issues.
+func TestSyncWorkerKeepsLedgerOnQuotaBlocked(t *testing.T) {
+	// One issue succeeds, then quota blocks the second.
+	pages := [][]map[string]any{{issue(1, 1, "a"), issue(2, 2, "b")}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	// A worker whose sync service enforces a 1-issue quota so the 2nd issue trips
+	// quota_blocked (mirrors TestSyncWorkerQuotaResumeNoDoubleCount).
+	q := db.New(testPool)
+	bus := events.New()
+	issues := &service.IssueService{Queries: q, TxStarter: testPool, Bus: bus, Entitlements: limitProvider{limit: 1}}
+	sync := service.NewExternalIssueSyncService(q, testPool, bus, issues)
+	h := &Handler{Queries: q, ExternalIssueSync: sync}
+	w := NewExternalIssueSyncWorker(h)
+
+	if _, err := w.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	state, _, _ := runState(t, runID)
+	if state != "quota_blocked" {
+		t.Fatalf("run state = %q, want quota_blocked", state)
+	}
+	if n := ledgerRowCount(t, runID); n == 0 {
+		t.Fatal("ledger rows after quota_blocked = 0, want > 0 (resumable state must keep ledger)")
+	}
+}

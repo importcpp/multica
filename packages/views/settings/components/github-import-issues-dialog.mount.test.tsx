@@ -11,10 +11,21 @@ const mockResume = vi.hoisted(() => vi.fn());
 const mockGetRun = vi.hoisted(() => vi.fn());
 const mockPreview = vi.hoisted(() => vi.fn());
 const mockInvalidate = vi.hoisted(() => vi.fn());
+// Repos surfaced by the installation picker; empty by default so tests that
+// don't care fall back to the manual owner/repo <Input>.
+const repoState = vi.hoisted(() => ({ repositories: [] as { id: number; full_name: string }[] }));
 
 vi.mock("@tanstack/react-query", () => ({
   useQueryClient: () => ({ invalidateQueries: mockInvalidate }),
   queryOptions: <T,>(opts: T) => opts,
+  infiniteQueryOptions: <T,>(opts: T) => opts,
+  useInfiniteQuery: () => ({
+    data: { pages: [{ repositories: repoState.repositories }] },
+    isLoading: false,
+    hasNextPage: false,
+    isFetchingNextPage: false,
+    fetchNextPage: vi.fn(),
+  }),
 }));
 
 vi.mock("@multica/core/api", () => ({
@@ -27,7 +38,10 @@ vi.mock("@multica/core/api", () => ({
   },
 }));
 
-vi.mock("@multica/core/github", () => ({ githubKeys: { all: () => ["github"] } }));
+vi.mock("@multica/core/github", () => ({
+  githubKeys: { all: () => ["github"] },
+  githubInstallationRepositoriesOptions: () => ({ queryKey: ["repos"] }),
+}));
 vi.mock("@multica/core/issues/queries", () => ({ issueKeys: { all: () => ["issues"] } }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }));
 
@@ -74,7 +88,10 @@ async function openPreviewAndImport(user: ReturnType<typeof userEvent.setup>) {
 }
 
 describe("GitHubImportIssuesDialog resume poll", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    repoState.repositories = [];
+  });
 
   // A quota_blocked run shows Resume; clicking it must restart polling even
   // though the run id is unchanged, and the UI must advance to succeeded.
@@ -132,5 +149,34 @@ describe("GitHubImportIssuesDialog resume poll", () => {
     await user.type(repoInput, "-2");
     await waitFor(() => expect(screen.getByRole("button", { name: "Import" })).toBeDisabled());
     expect(mockImport).not.toHaveBeenCalled();
+  });
+
+  // When the installation picker has repos, the user selects one from the
+  // dropdown instead of typing owner/repo, and preview uses that selection.
+  it("selects a repository from the installation picker", async () => {
+    repoState.repositories = [
+      { id: 1, full_name: "acme/widgets" },
+      { id: 2, full_name: "acme/gadgets" },
+    ];
+    mockPreview.mockResolvedValue(previewResponse());
+    const user = userEvent.setup();
+    // Render WITHOUT a defaultFullPath so the picker drives selection.
+    render(
+      <I18nProvider locale="en" resources={{ en: { common: enCommon, settings: enSettings } }}>
+        <GitHubImportIssuesDialog workspaceId="ws-1" installationId="inst-1" pollIntervalMs={5} />
+      </I18nProvider>,
+    );
+    await user.click(screen.getByRole("button", { name: /import issues/i }));
+
+    const select = screen.getByLabelText(/repository/i);
+    await user.selectOptions(select, "acme/gadgets");
+    await user.click(screen.getByRole("button", { name: "Preview" }));
+
+    await waitFor(() => expect(mockPreview).toHaveBeenCalled());
+    expect(mockPreview).toHaveBeenCalledWith(
+      "ws-1",
+      "inst-1",
+      expect.objectContaining({ owner: "acme", repo: "gadgets" }),
+    );
   });
 });

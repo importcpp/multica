@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { DownloadCloud } from "lucide-react";
 import { Button } from "@multica/ui/components/ui/button";
@@ -18,7 +18,7 @@ import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import type { PreviewGitHubIssuesResponse } from "@multica/core/types";
 import { api } from "@multica/core/api";
-import { githubKeys } from "@multica/core/github";
+import { githubKeys, githubInstallationRepositoriesOptions } from "@multica/core/github";
 import { issueKeys } from "@multica/core/issues/queries";
 import type { SyncRunStatus } from "@multica/core/types";
 import { useT } from "../../i18n";
@@ -84,6 +84,23 @@ export function GitHubImportIssuesDialog({
   // on this matching the current inputs so the user cannot confirm an import of
   // one repo/state while looking at a stale preview of another.
   const [previewKey, setPreviewKey] = useState<string | null>(null);
+  // manualEntry lets the user type an owner/repo the installation picker does not
+  // list (or fall back when the picker fails to load), instead of forcing a
+  // choice from the fetched list.
+  const [manualEntry, setManualEntry] = useState(false);
+
+  // Reuse the installation repository picker (same infinite query as the
+  // repository-browse UI) so the user selects a repo instead of typing it. Only
+  // fetch while the dialog is open and not mid-run.
+  const reposQuery = useInfiniteQuery({
+    ...githubInstallationRepositoriesOptions(workspaceId, installationId),
+    enabled: open && !!workspaceId && !!installationId,
+  });
+  const repositories = useMemo(
+    () => (reposQuery.data?.pages ?? []).flatMap((p) => p.repositories),
+    [reposQuery.data],
+  );
+  const pickerAvailable = !manualEntry && (reposQuery.isLoading || repositories.length > 0);
 
   const parsed = splitOwnerRepo(fullPath);
   const currentKey = parsed ? `${parsed.owner}/${parsed.repo}@${state}` : null;
@@ -301,14 +318,74 @@ export function GitHubImportIssuesDialog({
             <Label htmlFor="gh-import-repo">
               {t(($) => $.github.import_issues.repo_label)}
             </Label>
-            <Input
-              id="gh-import-repo"
-              placeholder={t(($) => $.github.import_issues.repo_placeholder)}
-              value={fullPath}
-              onChange={(e) => setFullPath(e.target.value)}
-              disabled={isRunning}
-              autoComplete="off"
-            />
+            {pickerAvailable ? (
+              <>
+                <select
+                  id="gh-import-repo"
+                  className="border-input bg-background h-9 rounded-md border px-3 text-body"
+                  value={repositories.some((r) => r.full_name === fullPath) ? fullPath : ""}
+                  onChange={(e) => {
+                    if (e.target.value === "__manual__") {
+                      setManualEntry(true);
+                      setFullPath("");
+                      return;
+                    }
+                    setFullPath(e.target.value);
+                  }}
+                  disabled={isRunning || reposQuery.isLoading}
+                >
+                  <option value="" disabled>
+                    {reposQuery.isLoading
+                      ? t(($) => $.github.import_issues.repo_loading)
+                      : t(($) => $.github.import_issues.repo_select_placeholder)}
+                  </option>
+                  {repositories.map((r) => (
+                    <option key={r.id} value={r.full_name}>
+                      {r.full_name}
+                    </option>
+                  ))}
+                  <option value="__manual__">
+                    {t(($) => $.github.import_issues.repo_manual_option)}
+                  </option>
+                </select>
+                {reposQuery.hasNextPage && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => reposQuery.fetchNextPage()}
+                    disabled={reposQuery.isFetchingNextPage || isRunning}
+                  >
+                    {t(($) => $.github.import_issues.repo_load_more)}
+                  </Button>
+                )}
+              </>
+            ) : (
+              <>
+                <Input
+                  id="gh-import-repo"
+                  placeholder={t(($) => $.github.import_issues.repo_placeholder)}
+                  value={fullPath}
+                  onChange={(e) => setFullPath(e.target.value)}
+                  disabled={isRunning}
+                  autoComplete="off"
+                />
+                {repositories.length > 0 && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setManualEntry(false);
+                      setFullPath("");
+                    }}
+                    disabled={isRunning}
+                  >
+                    {t(($) => $.github.import_issues.repo_pick_from_list)}
+                  </Button>
+                )}
+              </>
+            )}
           </div>
 
           <div className="flex flex-col gap-1.5">
