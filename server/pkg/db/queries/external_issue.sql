@@ -68,17 +68,6 @@ UPDATE external_issue_source SET
     updated_at = now()
 WHERE workspace_id = $1 AND target_project_id = $2;
 
--- name: PauseExternalIssueSourcesByProviderInstance :exec
--- Disconnecting a provider account (e.g. removing a GitHub installation) pauses
--- that provider/instance's sources for the workspace without deleting them or
--- their imported issues, so a reconnect + re-import stays idempotent. Provenance
--- (links) is preserved.
-UPDATE external_issue_source SET
-    credential_id = NULL,
-    state = 'needs_reauth',
-    updated_at = now()
-WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3;
-
 -- name: DeleteExternalIssueSourcesByWorkspace :exec
 DELETE FROM external_issue_source WHERE workspace_id = $1;
 
@@ -168,9 +157,9 @@ DELETE FROM external_issue_link WHERE workspace_id = $1;
 
 -- name: CreateExternalIssueSyncRun :one
 INSERT INTO external_issue_sync_run (
-    workspace_id, source_id, kind, state, filter_snapshot, cutoff
+    workspace_id, source_id, kind, state, filter_snapshot, input_snapshot, cutoff
 ) VALUES (
-    $1, $2, $3, $4, $5, sqlc.narg('cutoff')
+    $1, $2, $3, $4, $5, $6, sqlc.narg('cutoff')
 )
 RETURNING *;
 
@@ -199,8 +188,10 @@ WHERE id = (
 )
 RETURNING *;
 
--- name: AdvanceExternalIssueSyncRun :exec
+-- name: AdvanceExternalIssueSyncRun :execrows
 -- Persist page progress: new cursor, refreshed lease, and the running counts.
+-- Fenced on worker_id: if the lease was stolen by another worker, this updates
+-- zero rows and the caller must stop writing to the run.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -211,9 +202,10 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     updated_at = now()
-WHERE id = $1;
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
--- name: FinishExternalIssueSyncRun :exec
+-- name: FinishExternalIssueSyncRun :execrows
+-- Fenced on worker_id so a reclaimed run is not finalized by its former owner.
 UPDATE external_issue_sync_run SET
     state = $2,
     error_sample = $3,
@@ -221,22 +213,41 @@ UPDATE external_issue_sync_run SET
     worker_id = '',
     finished_at = now(),
     updated_at = now()
-WHERE id = $1;
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
--- name: RequeueExternalIssueSyncRun :exec
+-- name: RequeueExternalIssueSyncRun :execrows
+-- Fenced on worker_id; returns the run to the queue only if this worker still
+-- owns the lease.
 UPDATE external_issue_sync_run SET
     state = 'queued',
     worker_id = '',
     lease_expires_at = NULL,
     next_attempt_at = $2,
     updated_at = now()
-WHERE id = $1;
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
 -- name: RequestExternalIssueSyncRunCancel :exec
 UPDATE external_issue_sync_run SET
     cancel_requested = true,
     updated_at = now()
 WHERE id = $1 AND workspace_id = $2;
+
+-- name: ResumeExternalIssueSyncRun :one
+-- Re-queue a paused run (quota_blocked / needs_reauth) from its SAVED cursor
+-- rather than starting a fresh run, so counts and cursor continue. Only a
+-- non-active run in a resumable state can be resumed; the partial unique active
+-- index still guarantees at most one queued/running run per source afterwards.
+UPDATE external_issue_sync_run SET
+    state = 'queued',
+    cancel_requested = false,
+    worker_id = '',
+    lease_expires_at = NULL,
+    next_attempt_at = now(),
+    finished_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+  AND state IN ('quota_blocked', 'needs_reauth', 'failed')
+RETURNING *;
 
 -- name: ListExternalIssueSyncRunsBySource :many
 SELECT * FROM external_issue_sync_run

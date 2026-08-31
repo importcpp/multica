@@ -267,3 +267,65 @@ func (f applyFixture) issueTitle(t *testing.T) string {
 	}
 	return title
 }
+
+// A local edit that commits WHILE an Apply update is mid-flight must not be
+// silently lost: the row lock forces the concurrent editor to serialize after
+// Apply, and because Apply took the older baseline it records a conflict and
+// keeps the (now newer) local value rather than overwriting it. This exercises
+// the FOR UPDATE lock in updateBoundIssue (P0-1).
+func TestApplyConcurrentLocalEditNotLost(t *testing.T) {
+	pool := newExternalIssuePool(t)
+	f := seedApplyFixture(t, pool)
+	ctx := context.Background()
+	t0 := time.Now().Add(-time.Hour)
+
+	if _, err := f.svc.Apply(ctx, f.params(f.remote("700", 7, "Orig", "Body", t0))); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	link, err := f.queries.GetExternalIssueLinkByIdentity(ctx, db.GetExternalIssueLinkByIdentityParams{
+		WorkspaceID: f.workspaceID, Provider: "github", InstanceKey: "github.com", ExternalIssueID: "700",
+	})
+	if err != nil {
+		t.Fatalf("get link: %v", err)
+	}
+
+	// Hold the issue row lock in a separate tx, start Apply (which will block on
+	// LockIssueForDescriptionUpdate), then commit a local title edit and release
+	// the lock. Apply must then observe the local change and not overwrite it.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin blocker tx: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM issue WHERE id=$1 FOR UPDATE`, link.IssueID); err != nil {
+		t.Fatalf("lock row: %v", err)
+	}
+
+	applyDone := make(chan ApplyOutcome, 1)
+	applyErr := make(chan error, 1)
+	go func() {
+		out, err := f.svc.Apply(ctx, f.params(f.remote("700", 7, "Remote Wins?", "Body", t0.Add(time.Minute))))
+		applyDone <- out
+		applyErr <- err
+	}()
+
+	// Give Apply time to reach the lock and block on it.
+	time.Sleep(300 * time.Millisecond)
+	// Commit a local edit while Apply is blocked, then release the lock.
+	if _, err := tx.Exec(ctx, `UPDATE issue SET title='Locally Edited', revision=revision+1 WHERE id=$1`, link.IssueID); err != nil {
+		t.Fatalf("local edit: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit local edit: %v", err)
+	}
+
+	out := <-applyDone
+	if err := <-applyErr; err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if out != OutcomeConflict {
+		t.Fatalf("apply outcome = %v, want conflict (local edit + remote change)", out)
+	}
+	if title := f.issueTitle(t); title != "Locally Edited" {
+		t.Fatalf("local edit was overwritten: title = %q", title)
+	}
+}

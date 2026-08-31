@@ -716,6 +716,7 @@ type ExternalIssueSyncRun struct {
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
 	StartedAt       pgtype.Timestamptz `json:"started_at"`
 	FinishedAt      pgtype.Timestamptz `json:"finished_at"`
+	InputSnapshot   []byte             `json:"input_snapshot"`
 }
 
 type Feedback struct {

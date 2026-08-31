@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,10 +11,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
 	"github.com/multica-ai/multica/server/internal/util"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/dbid"
 )
+
+// errorsIs is a tiny alias so the test reads cleanly next to the worker's
+// sentinel error.
+func errorsIs(err, target error) bool { return errors.Is(err, target) }
+
+func claimParams(w *ExternalIssueSyncWorker) db.ClaimNextExternalIssueSyncRunParams {
+	return db.ClaimNextExternalIssueSyncRunParams{
+		WorkerID:       w.id,
+		LeaseExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(2 * time.Minute), Valid: true},
+	}
+}
+
+func resumeParams(workspaceID, runID string) db.ResumeExternalIssueSyncRunParams {
+	return db.ResumeExternalIssueSyncRunParams{
+		ID:          util.MustParseUUID(runID),
+		WorkspaceID: util.MustParseUUID(workspaceID),
+	}
+}
 
 func seedSyncWorkerFixture(t *testing.T, pages [][]map[string]any) (workspaceID, sourceID string, srv *httptest.Server, hits *int64) {
 	t.Helper()
@@ -109,11 +130,23 @@ func issue(id, number int, title string) map[string]any {
 
 func queueRun(t *testing.T, workspaceID, sourceID string) string {
 	t.Helper()
+	// Build the run input snapshot from the seeded source, mirroring what the
+	// import handler captures at enqueue time.
+	var credentialID, repoExternalID, repoFullPath, configuredBy string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT credential_id, repository_external_id, repository_full_path, COALESCE(configured_by_user_id::text,'')
+		   FROM external_issue_source WHERE id=$1`, sourceID).
+		Scan(&credentialID, &repoExternalID, &repoFullPath, &configuredBy); err != nil {
+		t.Fatalf("read source for snapshot: %v", err)
+	}
+	snapshot := fmt.Sprintf(
+		`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":%q,"repository_full_path":%q,"configured_by_user_id":%q,"state":"open"}`,
+		credentialID, repoExternalID, repoFullPath, configuredBy)
 	var runID string
 	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO external_issue_sync_run (workspace_id, source_id, kind, state, filter_snapshot)
-		VALUES ($1,$2,'backfill','queued','{"state":"open"}') RETURNING id`,
-		workspaceID, sourceID).Scan(&runID); err != nil {
+		INSERT INTO external_issue_sync_run (workspace_id, source_id, kind, state, filter_snapshot, input_snapshot)
+		VALUES ($1,$2,'backfill','queued','{"state":"open"}',$3::jsonb) RETURNING id`,
+		workspaceID, sourceID, snapshot).Scan(&runID); err != nil {
 		t.Fatalf("queue run: %v", err)
 	}
 	return runID
@@ -252,5 +285,77 @@ func TestSyncWorkerHonorsCancel(t *testing.T) {
 	}
 	if n := countWsIssues(t, workspaceID); n != 0 {
 		t.Fatalf("cancelled-before-drain should import nothing, got %d", n)
+	}
+}
+
+// A worker whose lease was stolen must not advance/finish the run: its fenced
+// writes update zero rows and it aborts without corrupting the new owner's run.
+func TestSyncWorkerLeaseFencingStopsStaleWriter(t *testing.T) {
+	// Enough pages that one claim yields (requeues) rather than finishing, so we
+	// can steal the lease between the stale worker's pages.
+	var pages [][]map[string]any
+	for i := 1; i <= syncRunPagesPerClaim+2; i++ {
+		pages = append(pages, []map[string]any{issue(i, i, fmt.Sprintf("i%d", i))})
+	}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	stale := NewExternalIssueSyncWorker(testHandler)
+	// Claim as the stale worker.
+	claimed, err := stale.h.Queries.ClaimNextExternalIssueSyncRun(context.Background(),
+		claimParams(stale))
+	if err != nil {
+		t.Fatalf("stale claim: %v", err)
+	}
+	// A new owner steals the lease (simulating reclaim after lease expiry).
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE external_issue_sync_run SET worker_id = 'new-owner' WHERE id=$1`, runID); err != nil {
+		t.Fatalf("steal lease: %v", err)
+	}
+	// The stale worker's fenced advance must report a lost lease and change nothing.
+	advErr := stale.advance(context.Background(), claimed, "", runCounts{imported: 999})
+	if !errorsIs(advErr, errLeaseLost) {
+		t.Fatalf("stale advance err = %v, want errLeaseLost", advErr)
+	}
+	var imported int64
+	var owner string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT imported_count, worker_id FROM external_issue_sync_run WHERE id=$1`, runID).
+		Scan(&imported, &owner); err != nil {
+		t.Fatalf("read run: %v", err)
+	}
+	if imported == 999 {
+		t.Fatal("stale worker's counts must not overwrite the reclaimed run")
+	}
+	if owner != "new-owner" {
+		t.Fatalf("worker_id = %q, want new-owner (stale writer must not touch it)", owner)
+	}
+}
+
+// A quota_blocked run resumes from its saved cursor rather than starting over.
+func TestSyncWorkerQuotaBlockedResumes(t *testing.T) {
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, [][]map[string]any{{issue(1, 1, "a")}})
+	runID := queueRun(t, workspaceID, sourceID)
+	// Put the run in quota_blocked with a saved cursor and a partial count.
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE external_issue_sync_run
+		SET state='quota_blocked', cursor='saved-cursor', imported_count=5, total_seen=5
+		WHERE id=$1`, runID); err != nil {
+		t.Fatalf("set quota_blocked: %v", err)
+	}
+	resumed, err := testHandler.Queries.ResumeExternalIssueSyncRun(context.Background(),
+		resumeParams(workspaceID, runID))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if resumed.State != "queued" {
+		t.Fatalf("resumed state = %q, want queued", resumed.State)
+	}
+	if resumed.Cursor != "saved-cursor" {
+		t.Fatalf("resume must preserve cursor, got %q", resumed.Cursor)
+	}
+	if resumed.ImportedCount != 5 {
+		t.Fatalf("resume must preserve counts, imported = %d", resumed.ImportedCount)
 	}
 }

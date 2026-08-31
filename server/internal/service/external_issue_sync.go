@@ -257,11 +257,16 @@ func (s *ExternalIssueSyncService) updateBoundIssue(ctx context.Context, qtx *db
 		return OutcomeSkipped, db.Issue{}, db.Workspace{}, false, nil
 	}
 
-	issue, err := qtx.GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+	// Lock the issue row FOR UPDATE before reading it, so the conflict decision
+	// and the write see a consistent row: a concurrent local edit either
+	// commits before this lock (and is seen as a local change -> conflict) or
+	// blocks until this tx commits. Reading without the lock let a local edit
+	// landing between read and write be silently overwritten.
+	issue, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
 		ID: link.IssueID, WorkspaceID: p.WorkspaceID,
 	})
 	if err != nil {
-		return OutcomeFailed, db.Issue{}, db.Workspace{}, false, fmt.Errorf("load linked issue: %w", err)
+		return OutcomeFailed, db.Issue{}, db.Workspace{}, false, fmt.Errorf("lock linked issue: %w", err)
 	}
 
 	newTitle, titleConflict, titleOwned := resolveField(

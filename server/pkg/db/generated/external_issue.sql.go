@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const advanceExternalIssueSyncRun = `-- name: AdvanceExternalIssueSyncRun :exec
+const advanceExternalIssueSyncRun = `-- name: AdvanceExternalIssueSyncRun :execrows
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -22,7 +22,7 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     updated_at = now()
-WHERE id = $1
+WHERE id = $1 AND worker_id = $10
 `
 
 type AdvanceExternalIssueSyncRunParams struct {
@@ -35,11 +35,14 @@ type AdvanceExternalIssueSyncRunParams struct {
 	FailedCount    int64              `json:"failed_count"`
 	TotalSeen      int64              `json:"total_seen"`
 	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	WorkerID       string             `json:"worker_id"`
 }
 
 // Persist page progress: new cursor, refreshed lease, and the running counts.
-func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceExternalIssueSyncRunParams) error {
-	_, err := q.db.Exec(ctx, advanceExternalIssueSyncRun,
+// Fenced on worker_id: if the lease was stolen by another worker, this updates
+// zero rows and the caller must stop writing to the run.
+func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceExternalIssueSyncRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, advanceExternalIssueSyncRun,
 		arg.ID,
 		arg.Cursor,
 		arg.ImportedCount,
@@ -49,8 +52,12 @@ func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceEx
 		arg.FailedCount,
 		arg.TotalSeen,
 		arg.LeaseExpiresAt,
+		arg.WorkerID,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const bindExternalIssueLinkIssue = `-- name: BindExternalIssueLinkIssue :exec
@@ -259,7 +266,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot
 `
 
 type ClaimNextExternalIssueSyncRunParams struct {
@@ -297,6 +304,7 @@ func (q *Queries) ClaimNextExternalIssueSyncRun(ctx context.Context, arg ClaimNe
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.InputSnapshot,
 	)
 	return i, err
 }
@@ -324,11 +332,11 @@ func (q *Queries) ClearExternalIssueSourceProject(ctx context.Context, arg Clear
 const createExternalIssueSyncRun = `-- name: CreateExternalIssueSyncRun :one
 
 INSERT INTO external_issue_sync_run (
-    workspace_id, source_id, kind, state, filter_snapshot, cutoff
+    workspace_id, source_id, kind, state, filter_snapshot, input_snapshot, cutoff
 ) VALUES (
-    $1, $2, $3, $4, $5, $6
+    $1, $2, $3, $4, $5, $6, $7
 )
-RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot
 `
 
 type CreateExternalIssueSyncRunParams struct {
@@ -337,6 +345,7 @@ type CreateExternalIssueSyncRunParams struct {
 	Kind           string             `json:"kind"`
 	State          string             `json:"state"`
 	FilterSnapshot []byte             `json:"filter_snapshot"`
+	InputSnapshot  []byte             `json:"input_snapshot"`
 	Cutoff         pgtype.Timestamptz `json:"cutoff"`
 }
 
@@ -350,6 +359,7 @@ func (q *Queries) CreateExternalIssueSyncRun(ctx context.Context, arg CreateExte
 		arg.Kind,
 		arg.State,
 		arg.FilterSnapshot,
+		arg.InputSnapshot,
 		arg.Cutoff,
 	)
 	var i ExternalIssueSyncRun
@@ -378,6 +388,7 @@ func (q *Queries) CreateExternalIssueSyncRun(ctx context.Context, arg CreateExte
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.InputSnapshot,
 	)
 	return i, err
 }
@@ -488,7 +499,7 @@ func (q *Queries) FinishExternalIssueSyncEvent(ctx context.Context, arg FinishEx
 	return err
 }
 
-const finishExternalIssueSyncRun = `-- name: FinishExternalIssueSyncRun :exec
+const finishExternalIssueSyncRun = `-- name: FinishExternalIssueSyncRun :execrows
 UPDATE external_issue_sync_run SET
     state = $2,
     error_sample = $3,
@@ -496,18 +507,28 @@ UPDATE external_issue_sync_run SET
     worker_id = '',
     finished_at = now(),
     updated_at = now()
-WHERE id = $1
+WHERE id = $1 AND worker_id = $4
 `
 
 type FinishExternalIssueSyncRunParams struct {
 	ID          pgtype.UUID `json:"id"`
 	State       string      `json:"state"`
 	ErrorSample []byte      `json:"error_sample"`
+	WorkerID    string      `json:"worker_id"`
 }
 
-func (q *Queries) FinishExternalIssueSyncRun(ctx context.Context, arg FinishExternalIssueSyncRunParams) error {
-	_, err := q.db.Exec(ctx, finishExternalIssueSyncRun, arg.ID, arg.State, arg.ErrorSample)
-	return err
+// Fenced on worker_id so a reclaimed run is not finalized by its former owner.
+func (q *Queries) FinishExternalIssueSyncRun(ctx context.Context, arg FinishExternalIssueSyncRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishExternalIssueSyncRun,
+		arg.ID,
+		arg.State,
+		arg.ErrorSample,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getExternalIssueLinkByIdentity = `-- name: GetExternalIssueLinkByIdentity :one
@@ -634,7 +655,7 @@ func (q *Queries) GetExternalIssueSource(ctx context.Context, arg GetExternalIss
 }
 
 const getExternalIssueSyncRun = `-- name: GetExternalIssueSyncRun :one
-SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at FROM external_issue_sync_run
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot FROM external_issue_sync_run
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -671,6 +692,7 @@ func (q *Queries) GetExternalIssueSyncRun(ctx context.Context, arg GetExternalIs
 		&i.UpdatedAt,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.InputSnapshot,
 	)
 	return i, err
 }
@@ -767,7 +789,7 @@ func (q *Queries) ListExternalIssueSourcesByWorkspace(ctx context.Context, works
 }
 
 const listExternalIssueSyncRunsBySource = `-- name: ListExternalIssueSyncRunsBySource :many
-SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at FROM external_issue_sync_run
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot FROM external_issue_sync_run
 WHERE source_id = $1
 ORDER BY created_at DESC
 LIMIT $2
@@ -812,6 +834,7 @@ func (q *Queries) ListExternalIssueSyncRunsBySource(ctx context.Context, arg Lis
 			&i.UpdatedAt,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.InputSnapshot,
 		); err != nil {
 			return nil, err
 		}
@@ -855,29 +878,6 @@ func (q *Queries) PauseExternalIssueSourcesByCredential(ctx context.Context, arg
 	return err
 }
 
-const pauseExternalIssueSourcesByProviderInstance = `-- name: PauseExternalIssueSourcesByProviderInstance :exec
-UPDATE external_issue_source SET
-    credential_id = NULL,
-    state = 'needs_reauth',
-    updated_at = now()
-WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3
-`
-
-type PauseExternalIssueSourcesByProviderInstanceParams struct {
-	WorkspaceID pgtype.UUID `json:"workspace_id"`
-	Provider    string      `json:"provider"`
-	InstanceKey string      `json:"instance_key"`
-}
-
-// Disconnecting a provider account (e.g. removing a GitHub installation) pauses
-// that provider/instance's sources for the workspace without deleting them or
-// their imported issues, so a reconnect + re-import stays idempotent. Provenance
-// (links) is preserved.
-func (q *Queries) PauseExternalIssueSourcesByProviderInstance(ctx context.Context, arg PauseExternalIssueSourcesByProviderInstanceParams) error {
-	_, err := q.db.Exec(ctx, pauseExternalIssueSourcesByProviderInstance, arg.WorkspaceID, arg.Provider, arg.InstanceKey)
-	return err
-}
-
 const requestExternalIssueSyncRunCancel = `-- name: RequestExternalIssueSyncRunCancel :exec
 UPDATE external_issue_sync_run SET
     cancel_requested = true,
@@ -895,24 +895,86 @@ func (q *Queries) RequestExternalIssueSyncRunCancel(ctx context.Context, arg Req
 	return err
 }
 
-const requeueExternalIssueSyncRun = `-- name: RequeueExternalIssueSyncRun :exec
+const requeueExternalIssueSyncRun = `-- name: RequeueExternalIssueSyncRun :execrows
 UPDATE external_issue_sync_run SET
     state = 'queued',
     worker_id = '',
     lease_expires_at = NULL,
     next_attempt_at = $2,
     updated_at = now()
-WHERE id = $1
+WHERE id = $1 AND worker_id = $3
 `
 
 type RequeueExternalIssueSyncRunParams struct {
 	ID            pgtype.UUID        `json:"id"`
 	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+	WorkerID      string             `json:"worker_id"`
 }
 
-func (q *Queries) RequeueExternalIssueSyncRun(ctx context.Context, arg RequeueExternalIssueSyncRunParams) error {
-	_, err := q.db.Exec(ctx, requeueExternalIssueSyncRun, arg.ID, arg.NextAttemptAt)
-	return err
+// Fenced on worker_id; returns the run to the queue only if this worker still
+// owns the lease.
+func (q *Queries) RequeueExternalIssueSyncRun(ctx context.Context, arg RequeueExternalIssueSyncRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, requeueExternalIssueSyncRun, arg.ID, arg.NextAttemptAt, arg.WorkerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const resumeExternalIssueSyncRun = `-- name: ResumeExternalIssueSyncRun :one
+UPDATE external_issue_sync_run SET
+    state = 'queued',
+    cancel_requested = false,
+    worker_id = '',
+    lease_expires_at = NULL,
+    next_attempt_at = now(),
+    finished_at = NULL,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+  AND state IN ('quota_blocked', 'needs_reauth', 'failed')
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot
+`
+
+type ResumeExternalIssueSyncRunParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// Re-queue a paused run (quota_blocked / needs_reauth) from its SAVED cursor
+// rather than starting a fresh run, so counts and cursor continue. Only a
+// non-active run in a resumable state can be resumed; the partial unique active
+// index still guarantees at most one queued/running run per source afterwards.
+func (q *Queries) ResumeExternalIssueSyncRun(ctx context.Context, arg ResumeExternalIssueSyncRunParams) (ExternalIssueSyncRun, error) {
+	row := q.db.QueryRow(ctx, resumeExternalIssueSyncRun, arg.ID, arg.WorkspaceID)
+	var i ExternalIssueSyncRun
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.SourceID,
+		&i.Kind,
+		&i.State,
+		&i.FilterSnapshot,
+		&i.Cutoff,
+		&i.Cursor,
+		&i.ImportedCount,
+		&i.UpdatedCount,
+		&i.ConflictCount,
+		&i.SkippedCount,
+		&i.FailedCount,
+		&i.TotalSeen,
+		&i.ErrorSample,
+		&i.Attempt,
+		&i.WorkerID,
+		&i.LeaseExpiresAt,
+		&i.NextAttemptAt,
+		&i.CancelRequested,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.InputSnapshot,
+	)
+	return i, err
 }
 
 const setExternalIssueSourceState = `-- name: SetExternalIssueSourceState :exec

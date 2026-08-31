@@ -141,6 +141,11 @@ func (w *ExternalIssueSyncWorker) ProcessNext(ctx context.Context) (bool, error)
 		return false, fmt.Errorf("claim run: %w", err)
 	}
 	if err := w.drainRun(ctx, run); err != nil {
+		if errors.Is(err, errLeaseLost) {
+			// Another worker reclaimed this run; that's expected under failover,
+			// not a processing failure. Keep pulling.
+			return true, nil
+		}
 		return true, err
 	}
 	return true, nil
@@ -153,19 +158,18 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		return w.finishRun(ctx, run, "cancelled", "")
 	}
 
-	source, err := w.h.Queries.GetExternalIssueSource(ctx, db.GetExternalIssueSourceParams{
-		ID: run.SourceID, WorkspaceID: run.WorkspaceID,
-	})
-	if err != nil {
-		return w.finishRun(ctx, run, "failed", "source not found")
-	}
-	if !source.CredentialID.Valid {
-		return w.finishRun(ctx, run, "failed", "source has no credential; reconnect the installation")
+	// Read execution inputs from the run's immutable snapshot, not the live
+	// (mutable) source: a second import request can change the source's
+	// credential / target project / filter mid-run, and re-reading it here would
+	// silently redirect an in-flight import. The snapshot is captured at enqueue.
+	snap, err := decodeRunInput(run.InputSnapshot)
+	if err != nil || !snap.CredentialID.Valid {
+		return w.finishRun(ctx, run, "failed", "run input snapshot missing or invalid")
 	}
 
 	// Resolve installation -> fresh issues:read token for this claim. Tokens are
 	// short-lived, so we never persist them; each claim mints its own.
-	installation, err := w.h.Queries.GetGitHubInstallationByID(ctx, source.CredentialID)
+	installation, err := w.h.Queries.GetGitHubInstallationByID(ctx, snap.CredentialID)
 	if err != nil || installation.WorkspaceID != run.WorkspaceID {
 		return w.finishRun(ctx, run, "needs_reauth", "installation unavailable")
 	}
@@ -174,21 +178,21 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		if errors.Is(err, errGitHubIssuesPermission) {
 			return w.finishRun(ctx, run, "needs_reauth", "installation has not granted Issues read")
 		}
-		return w.requeueRun(ctx, run, syncRateLimitBackoff, "github auth failed")
+		return w.requeueRun(ctx, run, syncRateLimitBackoff)
 	}
 	defer revoke()
 
-	provider, ok := externalissue.For(source.Provider)
+	provider, ok := externalissue.For(snap.Provider)
 	if !ok {
 		return w.finishRun(ctx, run, "failed", "provider unavailable")
 	}
 	creds := externalissue.Credentials{Token: token}
 	repo := externalissue.Repository{
-		InstanceKey: source.InstanceKey,
-		ExternalID:  source.RepositoryExternalID,
-		FullPath:    source.RepositoryFullPath,
+		InstanceKey: snap.InstanceKey,
+		ExternalID:  snap.RepositoryExternalID,
+		FullPath:    snap.RepositoryFullPath,
 	}
-	filter := externalissue.IssueFilter{State: filterStateFromSnapshot(run.FilterSnapshot)}
+	filter := externalissue.IssueFilter{State: snap.State}
 
 	counts := runCounts{
 		imported:  run.ImportedCount,
@@ -199,49 +203,115 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		total:     run.TotalSeen,
 	}
 	cursor := externalissue.Cursor(run.Cursor)
+	sawError := false
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
 		if fresh, err := w.h.Queries.GetExternalIssueSyncRun(ctx, db.GetExternalIssueSyncRunParams{
 			ID: run.ID, WorkspaceID: run.WorkspaceID,
 		}); err == nil && fresh.CancelRequested {
-			w.advance(ctx, run.ID, cursor, counts, false)
+			// Checkpoint must commit before we finalize; if the lease was
+			// stolen, stop without finishing.
+			if err := w.advance(ctx, run, cursor, counts); err != nil {
+				return err
+			}
 			return w.finishRun(ctx, run, "cancelled", "")
 		}
 
 		result, listErr := provider.ListIssues(ctx, creds, repo, filter, cursor)
 		if listErr != nil {
-			return w.handleListError(ctx, run, cursor, counts, listErr)
+			return w.handleListError(ctx, run, listErr)
 		}
 		for _, iss := range result.Issues {
 			counts.total++
 			outcome, applyErr := w.h.ExternalIssueSync.Apply(ctx, service.ApplyParams{
 				WorkspaceID: run.WorkspaceID,
-				SourceID:    source.ID,
-				ProjectID:   source.TargetProjectID,
-				CreatorID:   source.ConfiguredByUserID,
+				SourceID:    run.SourceID,
+				ProjectID:   snap.TargetProjectID,
+				CreatorID:   snap.ConfiguredByUserID,
 				Remote:      toRemoteIssue(iss, repo),
 			})
 			if applyErr != nil {
 				if service.IsQuotaError(applyErr) {
-					w.advance(ctx, run.ID, cursor, counts, true)
+					// Persist progress up to this page's start BEFORE finalizing,
+					// so a resume continues from a committed cursor. If the
+					// checkpoint fails (lost lease), do not finalize.
+					if err := w.advance(ctx, run, cursor, counts); err != nil {
+						return err
+					}
 					return w.finishRun(ctx, run, "quota_blocked", "workspace issue quota reached")
 				}
 				counts.failed++
+				sawError = true
 				continue
 			}
 			counts.tally(outcome)
 		}
 		cursor = result.NextCursor
-		w.advance(ctx, run.ID, cursor, counts, true)
+		// Checkpoint the page. A failed checkpoint (lost lease or DB error) MUST
+		// abort: continuing would let the issues we just applied be reprocessed
+		// (or the run be marked succeeded with an unsaved cursor).
+		if err := w.advance(ctx, run, cursor, counts); err != nil {
+			return err
+		}
 		if cursor == "" {
-			return w.finishRun(ctx, run, "succeeded", "")
+			state := "succeeded"
+			if sawError {
+				state = "partial"
+			}
+			return w.finishRun(ctx, run, state, "")
 		}
 	}
 
 	// Hit the per-claim page budget with more to do: yield the run back to the
 	// queue so cancel/other runs get a turn. It resumes from the saved cursor.
-	return w.requeueRun(ctx, run, 0, "")
+	return w.requeueRun(ctx, run, 0)
+}
+
+// runInputSnapshot is the immutable execution input captured on the run at
+// enqueue time (see migration 453). The worker reads this instead of the live
+// source so a mid-run source mutation cannot redirect the import.
+type runInputSnapshot struct {
+	CredentialID          pgtype.UUID `json:"-"`
+	CredentialIDStr       string      `json:"credential_id"`
+	Provider              string      `json:"provider"`
+	InstanceKey           string      `json:"instance_key"`
+	RepositoryExternalID  string      `json:"repository_external_id"`
+	RepositoryFullPath    string      `json:"repository_full_path"`
+	TargetProjectID       pgtype.UUID `json:"-"`
+	TargetProjectIDStr    string      `json:"target_project_id"`
+	ConfiguredByUserID    pgtype.UUID `json:"-"`
+	ConfiguredByUserIDStr string      `json:"configured_by_user_id"`
+	State                 string      `json:"state"`
+}
+
+func decodeRunInput(raw []byte) (runInputSnapshot, error) {
+	var s runInputSnapshot
+	if len(raw) == 0 {
+		return s, errors.New("empty snapshot")
+	}
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return s, err
+	}
+	if s.CredentialIDStr != "" {
+		if u, err := util.ParseUUID(s.CredentialIDStr); err == nil {
+			s.CredentialID = u
+		}
+	}
+	if s.TargetProjectIDStr != "" {
+		if u, err := util.ParseUUID(s.TargetProjectIDStr); err == nil {
+			s.TargetProjectID = u
+		}
+	}
+	if s.ConfiguredByUserIDStr != "" {
+		if u, err := util.ParseUUID(s.ConfiguredByUserIDStr); err == nil {
+			s.ConfiguredByUserID = u
+		}
+	}
+	if s.State != "open" && s.State != "closed" && s.State != "all" {
+		s.State = "open"
+	}
+	return s, nil
 }
 
 type runCounts struct {
@@ -263,15 +333,20 @@ func (c *runCounts) tally(o service.ApplyOutcome) {
 	}
 }
 
-// advance persists the cursor + counts, and (when refreshLease) extends the
-// lease so a long but healthy run is not reclaimed mid-drain.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, runID pgtype.UUID, cursor externalissue.Cursor, c runCounts, refreshLease bool) {
-	lease := pgtype.Timestamptz{}
-	if refreshLease {
-		lease = pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
-	}
-	if err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
-		ID:             runID,
+// errLeaseLost signals the run's lease was reclaimed by another worker between
+// claim and this write. The caller stops touching the run; the new owner drives
+// it. It is not surfaced as a processing error.
+var errLeaseLost = errors.New("external-issue sync run lease lost")
+
+// advance persists the cursor + counts and refreshes the lease, fenced on this
+// worker's id. A zero-row update means the lease was stolen (or the run was
+// cancelled/finished elsewhere): return errLeaseLost so the caller aborts
+// WITHOUT finalizing — never mark succeeded on an unsaved cursor.
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
+	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
+	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
+		ID:             run.ID,
+		WorkerID:       w.id,
 		Cursor:         string(cursor),
 		ImportedCount:  c.imported,
 		UpdatedCount:   c.updated,
@@ -280,15 +355,21 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, runID pgtype.UUID
 		FailedCount:    c.failed,
 		TotalSeen:      c.total,
 		LeaseExpiresAt: lease,
-	}); err != nil {
-		slog.Warn("external-issue sync worker: advance run", "run_id", util.UUIDToString(runID), "error", err)
+	})
+	if err != nil {
+		return fmt.Errorf("advance run: %w", err)
 	}
+	if rows == 0 {
+		slog.Warn("external-issue sync worker: lease lost on advance", "run_id", util.UUIDToString(run.ID))
+		return errLeaseLost
+	}
+	return nil
 }
 
 // handleListError maps a provider list failure to the right run outcome: a
 // rate-limit requeues with the provider's Retry-At; a transient error requeues
 // with a short backoff; anything else fails the run.
-func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, listErr error) error {
+func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.ExternalIssueSyncRun, listErr error) error {
 	var e *externalissue.Error
 	if errors.As(listErr, &e) {
 		switch e.Kind {
@@ -299,9 +380,9 @@ func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.Ex
 					delay = d
 				}
 			}
-			return w.requeueRun(ctx, run, delay, "rate limited")
+			return w.requeueRun(ctx, run, delay)
 		case externalissue.ErrTransient:
-			return w.requeueRun(ctx, run, syncRateLimitBackoff, "transient error")
+			return w.requeueRun(ctx, run, syncRateLimitBackoff)
 		case externalissue.ErrUnauthorized, externalissue.ErrForbidden:
 			return w.finishRun(ctx, run, "needs_reauth", e.Error())
 		}
@@ -309,6 +390,8 @@ func (w *ExternalIssueSyncWorker) handleListError(ctx context.Context, run db.Ex
 	return w.finishRun(ctx, run, "failed", listErr.Error())
 }
 
+// finishRun finalizes a run, fenced on this worker's id. A lost lease is a
+// no-op (the new owner owns the outcome), not an error.
 func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.ExternalIssueSyncRun, state, errMsg string) error {
 	sample := []byte("[]")
 	if errMsg != "" {
@@ -316,20 +399,30 @@ func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.External
 			sample = b
 		}
 	}
-	if err := w.h.Queries.FinishExternalIssueSyncRun(ctx, db.FinishExternalIssueSyncRunParams{
-		ID: run.ID, State: state, ErrorSample: sample,
-	}); err != nil {
+	rows, err := w.h.Queries.FinishExternalIssueSyncRun(ctx, db.FinishExternalIssueSyncRunParams{
+		ID: run.ID, WorkerID: w.id, State: state, ErrorSample: sample,
+	})
+	if err != nil {
 		return fmt.Errorf("finish run %s: %w", state, err)
+	}
+	if rows == 0 {
+		slog.Warn("external-issue sync worker: lease lost on finish", "run_id", util.UUIDToString(run.ID))
 	}
 	return nil
 }
 
-func (w *ExternalIssueSyncWorker) requeueRun(ctx context.Context, run db.ExternalIssueSyncRun, delay time.Duration, _ string) error {
+// requeueRun returns the run to the queue, fenced on this worker's id.
+func (w *ExternalIssueSyncWorker) requeueRun(ctx context.Context, run db.ExternalIssueSyncRun, delay time.Duration) error {
 	next := pgtype.Timestamptz{Time: time.Now().Add(delay), Valid: true}
-	if err := w.h.Queries.RequeueExternalIssueSyncRun(ctx, db.RequeueExternalIssueSyncRunParams{
-		ID: run.ID, NextAttemptAt: next,
-	}); err != nil {
+	rows, err := w.h.Queries.RequeueExternalIssueSyncRun(ctx, db.RequeueExternalIssueSyncRunParams{
+		ID: run.ID, WorkerID: w.id, NextAttemptAt: next,
+	})
+	if err != nil {
 		return fmt.Errorf("requeue run: %w", err)
+	}
+	if rows == 0 {
+		slog.Warn("external-issue sync worker: lease lost on requeue", "run_id", util.UUIDToString(run.ID))
+		return nil
 	}
 	// Wake ourselves if the delay is immediate so a page-budget yield continues
 	// promptly instead of waiting for the poll tick.
@@ -337,21 +430,4 @@ func (w *ExternalIssueSyncWorker) requeueRun(ctx context.Context, run db.Externa
 		w.Notify()
 	}
 	return nil
-}
-
-// filterStateFromSnapshot reads {"state":"open|closed|all"} from a run's filter
-// snapshot, defaulting to open.
-func filterStateFromSnapshot(snapshot []byte) string {
-	var f struct {
-		State string `json:"state"`
-	}
-	if len(snapshot) > 0 {
-		_ = json.Unmarshal(snapshot, &f)
-	}
-	switch f.State {
-	case "open", "closed", "all":
-		return f.State
-	default:
-		return "open"
-	}
 }

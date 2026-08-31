@@ -1610,6 +1610,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/github/installations/{installationId}/import-issues", h.ImportGitHubIssues)
 					r.Get("/external-issue-sync-runs/{runId}", h.GetSyncRun)
 					r.Post("/external-issue-sync-runs/{runId}/cancel", h.CancelSyncRun)
+					r.Post("/external-issue-sync-runs/{runId}/resume", h.ResumeSyncRun)
 					r.Delete("/github/installations/{installationId}", h.DeleteGitHubInstallation)
 					// VCS connect / disconnect / webhook regeneration (admin-only).
 					r.Post("/vcs/connections", h.ConnectVCS)
