@@ -417,6 +417,7 @@ export const SyncRunStatusSchema = z.object({
   failed: z.number().optional().default(0),
   total: z.number().optional().default(0),
   cancel_requested: z.boolean().optional().default(false),
+  errors: z.array(z.string()).optional().default([]),
 }).loose();
 
 export const EMPTY_SYNC_RUN_STATUS: SyncRunStatus = {
@@ -430,6 +431,7 @@ export const EMPTY_SYNC_RUN_STATUS: SyncRunStatus = {
   failed: 0,
   total: 0,
   cancel_requested: false,
+  errors: [],
 };
 
 export const IssueExternalSourceSchema = z.object({

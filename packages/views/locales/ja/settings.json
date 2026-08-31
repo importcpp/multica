@@ -777,7 +777,8 @@
       "preview_summary": "{{count}} 件のサンプル Issue を表示{{more}}",
       "preview_more": "（さらにあり）",
       "capacity_hint": "ワークスペースはあと {{remaining}} 件の Issue を保持できます",
-      "capacity_full": "ワークスペースの Issue 上限に達しました"
+      "capacity_full": "ワークスペースの Issue 上限に達しました",
+      "poll_error": "このインポートの状態を追跡できなくなりました。再度開いて確認してください。"
     }
   },
   "vcs": {

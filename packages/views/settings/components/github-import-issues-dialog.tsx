@@ -46,6 +46,8 @@ interface GitHubImportIssuesDialogProps {
   installationId: string;
   defaultProjectId?: string;
   defaultFullPath?: string;
+  /** Poll cadence in ms; overridable so tests can run the poll loop fast. */
+  pollIntervalMs?: number;
 }
 
 /**
@@ -59,6 +61,7 @@ export function GitHubImportIssuesDialog({
   installationId,
   defaultProjectId,
   defaultFullPath,
+  pollIntervalMs = 1500,
 }: GitHubImportIssuesDialogProps) {
   const { t } = useT("settings");
   const qc = useQueryClient();
@@ -67,6 +70,11 @@ export function GitHubImportIssuesDialog({
   const [state, setState] = useState<ImportState>("open");
   const [runId, setRunId] = useState<string | null>(null);
   const [status, setStatus] = useState<SyncRunStatus | null>(null);
+  // pollGen forces the poll effect to restart even when the run id is unchanged
+  // (Resume returns the SAME run id): bumping it re-runs the effect that had
+  // stopped at a terminal/paused state.
+  const [pollGen, setPollGen] = useState(0);
+  const [pollError, setPollError] = useState(false);
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -74,7 +82,8 @@ export function GitHubImportIssuesDialog({
   const [previewing, setPreviewing] = useState(false);
 
   const parsed = splitOwnerRepo(fullPath);
-  const isRunning = runId !== null && !(status && TERMINAL_STATES.has(status.state));
+  const isRunning =
+    runId !== null && !pollError && !(status && TERMINAL_STATES.has(status.state));
   const canSubmit = parsed !== null && !starting && !isRunning;
   const canResume = status !== null && RESUMABLE_STATES.has(status.state) && !resuming;
 
@@ -109,11 +118,15 @@ export function GitHubImportIssuesDialog({
     if (!runId) return;
     let stopped = false;
     let emptyPolls = 0;
+    let errorPolls = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    setPollError(false);
     async function tick() {
       try {
         const s = await api.getExternalIssueSyncRun(workspaceId, runId!);
         if (stopped) return;
+        errorPolls = 0;
+        setPollError(false);
         setStatus(s);
         if (s.state && TERMINAL_STATES.has(s.state)) {
           stopped = true;
@@ -122,20 +135,29 @@ export function GitHubImportIssuesDialog({
           return;
         }
         // A persistently empty state means backend drift, not progress: stop
-        // after a bounded number of ticks instead of polling forever.
+        // after a bounded number of ticks and surface it, so the UI doesn't sit
+        // in a stuck "running" state forever.
         if (!s.state) {
           emptyPolls++;
           if (emptyPolls >= MAX_EMPTY_POLLS) {
             stopped = true;
+            setPollError(true);
             return;
           }
         } else {
           emptyPolls = 0;
         }
       } catch {
-        // Transient poll failure: fall through and retry on the next tick.
+        // Bounded retry on network failure: after a cap, stop and surface a
+        // retry affordance instead of retrying forever.
+        errorPolls++;
+        if (errorPolls >= MAX_EMPTY_POLLS) {
+          stopped = true;
+          setPollError(true);
+          return;
+        }
       }
-      if (!stopped) timer = setTimeout(tick, 1500);
+      if (!stopped) timer = setTimeout(tick, pollIntervalMs);
     }
     void tick();
     return () => {
@@ -143,7 +165,7 @@ export function GitHubImportIssuesDialog({
       if (timer) clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runId, workspaceId]);
+  }, [runId, workspaceId, pollGen]);
 
   async function handleResume() {
     if (!runId) return;
@@ -154,10 +176,12 @@ export function GitHubImportIssuesDialog({
         toast.error(t(($) => $.github.import_issues.toast_failed));
         return;
       }
-      // Resume returns the same run id; reset status so the poll loop restarts
-      // and the UI shows progress again.
+      // Resume returns the SAME run id; setRunId alone won't re-run the poll
+      // effect that already stopped, so bump pollGen to force a restart.
       setStatus(null);
+      setPollError(false);
       setRunId(res.run_id);
+      setPollGen((g) => g + 1);
       toast.success(t(($) => $.github.import_issues.toast_resumed));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t(($) => $.github.import_issues.toast_failed));
@@ -206,7 +230,9 @@ export function GitHubImportIssuesDialog({
         toast.error(t(($) => $.github.import_issues.toast_failed));
         return;
       }
+      setPollError(false);
       setRunId(res.run_id);
+      setPollGen((g) => g + 1);
       toast.success(t(($) => $.github.import_issues.toast_queued));
     } catch (e) {
       const message = e instanceof Error ? e.message : "";
@@ -320,7 +346,21 @@ export function GitHubImportIssuesDialog({
                   failed: status.failed,
                 })}
               </span>
+              {status.errors && status.errors.length > 0 && (
+                <ul className="text-caption text-destructive flex flex-col gap-0.5">
+                  {status.errors.slice(0, 5).map((e, i) => (
+                    <li key={i} className="truncate">
+                      {e}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </div>
+          )}
+          {pollError && (
+            <span className="text-caption text-destructive">
+              {t(($) => $.github.import_issues.poll_error)}
+            </span>
           )}
         </div>
 

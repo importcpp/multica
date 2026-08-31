@@ -173,6 +173,8 @@ export interface SyncRunStatus {
   failed: number;
   total: number;
   cancel_requested: boolean;
+  /** Bounded sample of per-issue failure diagnostics for a partial/failed run. */
+  errors: string[];
 }
 
 /** Provenance for an imported issue, shown as a source badge on the issue. */

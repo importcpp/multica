@@ -779,7 +779,8 @@
       "preview_summary": "Showing {{count}} sample issue(s){{more}}",
       "preview_more": " (more available)",
       "capacity_hint": "Workspace can hold {{remaining}} more issue(s)",
-      "capacity_full": "Workspace issue limit reached"
+      "capacity_full": "Workspace issue limit reached",
+      "poll_error": "Lost track of this import. Reopen to check its status."
     }
   },
   "vcs": {

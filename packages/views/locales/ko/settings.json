@@ -777,7 +777,8 @@
       "preview_summary": "샘플 이슈 {{count}}건 표시{{more}}",
       "preview_more": "(더 있음)",
       "capacity_hint": "워크스페이스에 이슈 {{remaining}}건을 더 담을 수 있습니다",
-      "capacity_full": "워크스페이스 이슈 한도 도달"
+      "capacity_full": "워크스페이스 이슈 한도 도달",
+      "poll_error": "이 가져오기의 상태를 추적할 수 없습니다. 다시 열어 확인하세요."
     }
   },
   "vcs": {
