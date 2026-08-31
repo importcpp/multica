@@ -206,11 +206,13 @@ WHERE id = (
 RETURNING *;
 
 -- name: AdvanceExternalIssueSyncRun :execrows
--- Persist page progress: new cursor, refreshed lease, and the running counts.
--- Fenced on worker_id: if the lease was stolen by another worker, this updates
--- zero rows and the caller must stop writing to the run. page_offset records how
--- many items of the CURRENT page are already accounted (0 once a full page
--- commits) so a mid-page resume does not re-count.
+-- Persist page progress: new cursor, refreshed lease, the running counts, and the
+-- current fixpoint-reconcile baseline. Fenced on worker_id: if the lease was
+-- stolen by another worker, this updates zero rows and the caller must stop
+-- writing to the run. page_offset records how many items of the CURRENT page are
+-- already accounted (0 once a full page commits) so a mid-page resume does not
+-- re-count. reconcile_baseline carries the ledger total_seen at the start of the
+-- CURRENT scan pass across claims (-1 during the initial forward scan).
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -221,17 +223,21 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     page_offset = sqlc.arg('page_offset'),
+    reconcile_baseline = sqlc.arg('reconcile_baseline'),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
 -- name: RenewExternalIssueSyncRunLease :execrows
--- In-page heartbeat: extend the lease mid-page, fenced on worker_id. Zero rows
--- means the lease was reclaimed by another worker, so this worker must stop
--- applying immediately rather than drift until the page boundary.
+-- In-page heartbeat: extend the lease mid-page, fenced on worker_id AND on the
+-- run still being running and not cancel-requested. Zero rows means the lease was
+-- reclaimed OR a cancel/terminal transition landed concurrently, so this worker
+-- must stop applying immediately rather than drift until the page boundary.
 UPDATE external_issue_sync_run SET
     lease_expires_at = $2,
     updated_at = now()
-WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
+WHERE id = $1 AND worker_id = sqlc.arg('worker_id')
+  AND state = 'running'
+  AND cancel_requested = false;
 
 -- name: FinishExternalIssueSyncRun :execrows
 -- Fenced on worker_id so a reclaimed run is not finalized by its former owner.
@@ -371,6 +377,34 @@ ON CONFLICT (run_id, external_issue_id) DO UPDATE SET
         ELSE external_issue_sync_run_item.outcome
     END
 RETURNING (xmax = 0) AS inserted;
+
+-- name: RecordFailedExternalIssueSyncRunItemFenced :one
+-- Fenced failed-accounting: record a 'failed' outcome ONLY while this worker
+-- still owns a live, non-cancelled, running run. The INSERT is gated on the run
+-- row via a WHERE EXISTS so a stale/reclaimed/cancelled worker writes NOTHING
+-- (the success-path ledger write is already fenced inside Apply's tx; this closes
+-- the failure path that previously wrote unconditionally). Returns fenced=false
+-- when the guard blocked the write so the caller stops this claim.
+WITH owned AS (
+    SELECT 1 AS ok FROM external_issue_sync_run r
+    WHERE r.id = $1
+      AND r.worker_id = sqlc.arg('worker_id')
+      AND r.state = 'running'
+      AND r.cancel_requested = false
+      AND (r.lease_expires_at IS NULL OR r.lease_expires_at > now())
+), ins AS (
+    INSERT INTO external_issue_sync_run_item (run_id, workspace_id, external_issue_id, outcome)
+    SELECT $1, $2, $3, 'failed' FROM owned
+    ON CONFLICT (run_id, external_issue_id) DO UPDATE SET
+        outcome = CASE
+            WHEN array_position(ARRAY['failed','skipped','conflict','updated','imported'], EXCLUDED.outcome)
+               > array_position(ARRAY['failed','skipped','conflict','updated','imported'], external_issue_sync_run_item.outcome)
+            THEN EXCLUDED.outcome
+            ELSE external_issue_sync_run_item.outcome
+        END
+    RETURNING 1
+)
+SELECT EXISTS (SELECT 1 FROM owned) AS fenced_ok;
 
 -- name: CountExternalIssueSyncRunItems :one
 -- Derive run counts by aggregating the ledger, so counts never depend on a

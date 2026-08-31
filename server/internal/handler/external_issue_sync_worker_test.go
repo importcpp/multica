@@ -659,3 +659,165 @@ func TestResumeSyncRunPreservesOriginalProject(t *testing.T) {
 		t.Fatalf("resume must preserve original project A (%s), not adopt B (%s); snapshot=%s", projA, projB, newSnap)
 	}
 }
+
+// seedSyncWorkerFixtureDynamic is like seedSyncWorkerFixture but the page set is
+// read live from *pages on every request, so a test can mutate the remote issue
+// list BETWEEN worker claims (e.g. a shift that moves an issue into an
+// already-consumed page).
+func seedSyncWorkerFixtureDynamic(t *testing.T, pages *[][]map[string]any) (workspaceID, sourceID string) {
+	t.Helper()
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user" (name, email) VALUES ($1,$2) RETURNING id`,
+		"eis-dyn", "eis-dyn-"+suffix+"@test.local").Scan(&userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace (name, slug, description) VALUES ($1,$2,'') RETURNING id`,
+		"eis-dyn-ws", "eis-d-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("seed workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run_item WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO github_installation (workspace_id, installation_id, account_login, account_type, connected_by_id)
+		VALUES ($1, $2, 'acme', 'Organization', $3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationID); err != nil {
+		t.Fatalf("seed installation: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO external_issue_source
+			(workspace_id, provider, instance_key, credential_id, repository_external_id, repository_full_path, configured_by_user_id, filter)
+		VALUES ($1,'github','github.com',$2,'555','acme/widgets',$3,'{"state":"open"}')
+		RETURNING id`, workspaceID, installationID, userID).Scan(&sourceID); err != nil {
+		t.Fatalf("seed source: %v", err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		page := 0
+		if p := r.URL.Query().Get("p"); p != "" {
+			page, _ = strconv.Atoi(p)
+		}
+		cur := *pages
+		w.Header().Set("Content-Type", "application/json")
+		if page >= len(cur) {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		if page+1 < len(cur) {
+			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/acme/widgets/issues?p=%d>; rel="next"`, srvBase(r), page+1))
+		}
+		writeIssuesJSON(w, cur[page])
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(externalissue.SetGitHubAPIBaseForTest(srv.URL))
+	return workspaceID, sourceID
+}
+
+// A page-cursor scan can MISS an issue that shifts into an already-consumed page
+// between claims. Reproduction: N=syncRunPagesPerClaim+1 pages of one issue each;
+// the first claim consumes all but the last page, then the earliest issue closes
+// (drops out), pushing the final issue back one page — into a page the worker
+// already passed. Without a fixpoint reconcile the resume reads an empty tail and
+// finishes short. Regression for codex56 round-4 P0 #1.
+func TestSyncWorkerReconcilesPageShiftAcrossClaims(t *testing.T) {
+	n := syncRunPagesPerClaim + 1
+	var pages [][]map[string]any
+	for i := 0; i < n; i++ {
+		id := i + 1
+		pages = append(pages, []map[string]any{issue(id, id, fmt.Sprintf("i%d", id))})
+	}
+	live := pages
+	workspaceID, sourceID := seedSyncWorkerFixtureDynamic(t, &live)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	w := NewExternalIssueSyncWorker(testHandler)
+	// First claim drains the page budget (pages 0..budget-1), leaving the last
+	// page for a later claim, then requeues.
+	if _, err := w.ProcessNext(context.Background()); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if st, _, _ := runState(t, runID); st != "queued" {
+		t.Fatalf("after first claim state = %q, want queued", st)
+	}
+
+	// The earliest issue closes: drop page 0, which shifts every later issue back
+	// one page. The final issue (id=n) now lives on a page the worker already
+	// consumed; a naive cursor resume from the tail would never re-fetch it.
+	live = live[1:]
+
+	// Drain to terminal. The reconcile pass must re-scan from the top and pick up
+	// the shifted issue.
+	for i := 0; i < 40; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("drain claim: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" || st == "partial" {
+			break
+		}
+	}
+	state, _, _ := runState(t, runID)
+	if state != "succeeded" {
+		t.Fatalf("final state = %q, want succeeded", state)
+	}
+	// All n distinct issues must be imported exactly once — none lost to the shift.
+	if got := countWsIssues(t, workspaceID); got != n {
+		t.Fatalf("imported issues = %d, want %d (page-shifted issue must not be lost)", got, n)
+	}
+}
+
+// Failed accounting must be fenced on run ownership: a worker whose lease was
+// taken over and whose run was cancelled must NOT append 'failed' ledger rows.
+// Regression for codex56 round-4 P0 #2.
+func TestSyncWorkerFailedAccountingIsFenced(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	pages := [][]map[string]any{{issue(1, 1, "a")}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	// Put the run into the state a taken-over + cancelled run would be in for the
+	// stale worker: owned by a DIFFERENT worker id and cancel_requested.
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE external_issue_sync_run SET worker_id='other-worker', state='running',
+		 cancel_requested=true, lease_expires_at=now()+interval '2 minutes' WHERE id=$1`, runID); err != nil {
+		t.Fatalf("simulate takeover: %v", err)
+	}
+
+	staleRun, err := testHandler.Queries.GetExternalIssueSyncRun(context.Background(), db.GetExternalIssueSyncRunParams{
+		ID: parseUUID(runID), WorkspaceID: parseUUID(workspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load run: %v", err)
+	}
+	// The stale worker (its own id, not 'other-worker') tries to record a failure.
+	w := NewExternalIssueSyncWorker(testHandler)
+	gotErr := w.recordFailedItem(context.Background(), staleRun, "999")
+	if gotErr == nil {
+		t.Fatal("recordFailedItem on a taken-over/cancelled run must return an error (fence), got nil")
+	}
+	// No ledger row may have been written.
+	var count int
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT count(*) FROM external_issue_sync_run_item WHERE run_id=$1`, runID).Scan(&count); err != nil {
+		t.Fatalf("count ledger: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("fenced failed-accounting wrote %d ledger rows, want 0", count)
+	}
+}

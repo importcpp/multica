@@ -22,29 +22,33 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     page_offset = $10,
+    reconcile_baseline = $11,
     updated_at = now()
-WHERE id = $1 AND worker_id = $11
+WHERE id = $1 AND worker_id = $12
 `
 
 type AdvanceExternalIssueSyncRunParams struct {
-	ID             pgtype.UUID        `json:"id"`
-	Cursor         string             `json:"cursor"`
-	ImportedCount  int64              `json:"imported_count"`
-	UpdatedCount   int64              `json:"updated_count"`
-	ConflictCount  int64              `json:"conflict_count"`
-	SkippedCount   int64              `json:"skipped_count"`
-	FailedCount    int64              `json:"failed_count"`
-	TotalSeen      int64              `json:"total_seen"`
-	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
-	PageOffset     int32              `json:"page_offset"`
-	WorkerID       string             `json:"worker_id"`
+	ID                pgtype.UUID        `json:"id"`
+	Cursor            string             `json:"cursor"`
+	ImportedCount     int64              `json:"imported_count"`
+	UpdatedCount      int64              `json:"updated_count"`
+	ConflictCount     int64              `json:"conflict_count"`
+	SkippedCount      int64              `json:"skipped_count"`
+	FailedCount       int64              `json:"failed_count"`
+	TotalSeen         int64              `json:"total_seen"`
+	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
+	PageOffset        int32              `json:"page_offset"`
+	ReconcileBaseline int64              `json:"reconcile_baseline"`
+	WorkerID          string             `json:"worker_id"`
 }
 
-// Persist page progress: new cursor, refreshed lease, and the running counts.
-// Fenced on worker_id: if the lease was stolen by another worker, this updates
-// zero rows and the caller must stop writing to the run. page_offset records how
-// many items of the CURRENT page are already accounted (0 once a full page
-// commits) so a mid-page resume does not re-count.
+// Persist page progress: new cursor, refreshed lease, the running counts, and the
+// current fixpoint-reconcile baseline. Fenced on worker_id: if the lease was
+// stolen by another worker, this updates zero rows and the caller must stop
+// writing to the run. page_offset records how many items of the CURRENT page are
+// already accounted (0 once a full page commits) so a mid-page resume does not
+// re-count. reconcile_baseline carries the ledger total_seen at the start of the
+// CURRENT scan pass across claims (-1 during the initial forward scan).
 func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceExternalIssueSyncRunParams) (int64, error) {
 	result, err := q.db.Exec(ctx, advanceExternalIssueSyncRun,
 		arg.ID,
@@ -57,6 +61,7 @@ func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceEx
 		arg.TotalSeen,
 		arg.LeaseExpiresAt,
 		arg.PageOffset,
+		arg.ReconcileBaseline,
 		arg.WorkerID,
 	)
 	if err != nil {
@@ -271,7 +276,7 @@ WHERE id = (
     FOR UPDATE SKIP LOCKED
     LIMIT 1
 )
-RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline
 `
 
 type ClaimNextExternalIssueSyncRunParams struct {
@@ -311,6 +316,7 @@ func (q *Queries) ClaimNextExternalIssueSyncRun(ctx context.Context, arg ClaimNe
 		&i.FinishedAt,
 		&i.InputSnapshot,
 		&i.PageOffset,
+		&i.ReconcileBaseline,
 	)
 	return i, err
 }
@@ -379,7 +385,7 @@ INSERT INTO external_issue_sync_run (
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7
 )
-RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline
 `
 
 type CreateExternalIssueSyncRunParams struct {
@@ -433,6 +439,7 @@ func (q *Queries) CreateExternalIssueSyncRun(ctx context.Context, arg CreateExte
 		&i.FinishedAt,
 		&i.InputSnapshot,
 		&i.PageOffset,
+		&i.ReconcileBaseline,
 	)
 	return i, err
 }
@@ -727,7 +734,7 @@ func (q *Queries) GetExternalIssueSource(ctx context.Context, arg GetExternalIss
 }
 
 const getExternalIssueSyncRun = `-- name: GetExternalIssueSyncRun :one
-SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset FROM external_issue_sync_run
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline FROM external_issue_sync_run
 WHERE id = $1 AND workspace_id = $2
 `
 
@@ -766,6 +773,7 @@ func (q *Queries) GetExternalIssueSyncRun(ctx context.Context, arg GetExternalIs
 		&i.FinishedAt,
 		&i.InputSnapshot,
 		&i.PageOffset,
+		&i.ReconcileBaseline,
 	)
 	return i, err
 }
@@ -862,7 +870,7 @@ func (q *Queries) ListExternalIssueSourcesByWorkspace(ctx context.Context, works
 }
 
 const listExternalIssueSyncRunsBySource = `-- name: ListExternalIssueSyncRunsBySource :many
-SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset FROM external_issue_sync_run
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline FROM external_issue_sync_run
 WHERE source_id = $1
 ORDER BY created_at DESC
 LIMIT $2
@@ -909,6 +917,7 @@ func (q *Queries) ListExternalIssueSyncRunsBySource(ctx context.Context, arg Lis
 			&i.FinishedAt,
 			&i.InputSnapshot,
 			&i.PageOffset,
+			&i.ReconcileBaseline,
 		); err != nil {
 			return nil, err
 		}
@@ -922,7 +931,7 @@ func (q *Queries) ListExternalIssueSyncRunsBySource(ctx context.Context, arg Lis
 
 const lockExternalIssueSyncRunForApply = `-- name: LockExternalIssueSyncRunForApply :one
 
-SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset FROM external_issue_sync_run
+SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline FROM external_issue_sync_run
 WHERE id = $1
   AND worker_id = $2
   AND state = 'running'
@@ -974,6 +983,7 @@ func (q *Queries) LockExternalIssueSyncRunForApply(ctx context.Context, arg Lock
 		&i.FinishedAt,
 		&i.InputSnapshot,
 		&i.PageOffset,
+		&i.ReconcileBaseline,
 	)
 	return i, err
 }
@@ -1010,11 +1020,61 @@ func (q *Queries) PauseExternalIssueSourcesByCredential(ctx context.Context, arg
 	return err
 }
 
+const recordFailedExternalIssueSyncRunItemFenced = `-- name: RecordFailedExternalIssueSyncRunItemFenced :one
+WITH owned AS (
+    SELECT 1 AS ok FROM external_issue_sync_run r
+    WHERE r.id = $1
+      AND r.worker_id = $4
+      AND r.state = 'running'
+      AND r.cancel_requested = false
+      AND (r.lease_expires_at IS NULL OR r.lease_expires_at > now())
+), ins AS (
+    INSERT INTO external_issue_sync_run_item (run_id, workspace_id, external_issue_id, outcome)
+    SELECT $1, $2, $3, 'failed' FROM owned
+    ON CONFLICT (run_id, external_issue_id) DO UPDATE SET
+        outcome = CASE
+            WHEN array_position(ARRAY['failed','skipped','conflict','updated','imported'], EXCLUDED.outcome)
+               > array_position(ARRAY['failed','skipped','conflict','updated','imported'], external_issue_sync_run_item.outcome)
+            THEN EXCLUDED.outcome
+            ELSE external_issue_sync_run_item.outcome
+        END
+    RETURNING 1
+)
+SELECT EXISTS (SELECT 1 FROM owned) AS fenced_ok
+`
+
+type RecordFailedExternalIssueSyncRunItemFencedParams struct {
+	ID              pgtype.UUID `json:"id"`
+	WorkspaceID     pgtype.UUID `json:"workspace_id"`
+	ExternalIssueID string      `json:"external_issue_id"`
+	WorkerID        string      `json:"worker_id"`
+}
+
+// Fenced failed-accounting: record a 'failed' outcome ONLY while this worker
+// still owns a live, non-cancelled, running run. The INSERT is gated on the run
+// row via a WHERE EXISTS so a stale/reclaimed/cancelled worker writes NOTHING
+// (the success-path ledger write is already fenced inside Apply's tx; this closes
+// the failure path that previously wrote unconditionally). Returns fenced=false
+// when the guard blocked the write so the caller stops this claim.
+func (q *Queries) RecordFailedExternalIssueSyncRunItemFenced(ctx context.Context, arg RecordFailedExternalIssueSyncRunItemFencedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, recordFailedExternalIssueSyncRunItemFenced,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.ExternalIssueID,
+		arg.WorkerID,
+	)
+	var fenced_ok bool
+	err := row.Scan(&fenced_ok)
+	return fenced_ok, err
+}
+
 const renewExternalIssueSyncRunLease = `-- name: RenewExternalIssueSyncRunLease :execrows
 UPDATE external_issue_sync_run SET
     lease_expires_at = $2,
     updated_at = now()
 WHERE id = $1 AND worker_id = $3
+  AND state = 'running'
+  AND cancel_requested = false
 `
 
 type RenewExternalIssueSyncRunLeaseParams struct {
@@ -1023,9 +1083,10 @@ type RenewExternalIssueSyncRunLeaseParams struct {
 	WorkerID       string             `json:"worker_id"`
 }
 
-// In-page heartbeat: extend the lease mid-page, fenced on worker_id. Zero rows
-// means the lease was reclaimed by another worker, so this worker must stop
-// applying immediately rather than drift until the page boundary.
+// In-page heartbeat: extend the lease mid-page, fenced on worker_id AND on the
+// run still being running and not cancel-requested. Zero rows means the lease was
+// reclaimed OR a cancel/terminal transition landed concurrently, so this worker
+// must stop applying immediately rather than drift until the page boundary.
 func (q *Queries) RenewExternalIssueSyncRunLease(ctx context.Context, arg RenewExternalIssueSyncRunLeaseParams) (int64, error) {
 	result, err := q.db.Exec(ctx, renewExternalIssueSyncRunLease, arg.ID, arg.LeaseExpiresAt, arg.WorkerID)
 	if err != nil {
@@ -1126,7 +1187,7 @@ UPDATE external_issue_sync_run SET
     updated_at = now()
 WHERE id = $1 AND workspace_id = $2
   AND state IN ('quota_blocked', 'needs_reauth', 'failed')
-RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset
+RETURNING id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, page_offset, reconcile_baseline
 `
 
 type ResumeExternalIssueSyncRunParams struct {
@@ -1173,6 +1234,7 @@ func (q *Queries) ResumeExternalIssueSyncRun(ctx context.Context, arg ResumeExte
 		&i.FinishedAt,
 		&i.InputSnapshot,
 		&i.PageOffset,
+		&i.ReconcileBaseline,
 	)
 	return i, err
 }

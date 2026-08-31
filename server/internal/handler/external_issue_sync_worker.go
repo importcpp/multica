@@ -213,6 +213,13 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	// sample so a failure in an earlier claim survives into the final state.
 	errorSamples := decodeErrorSamples(run.ErrorSample)
 	cursor := externalissue.Cursor(run.Cursor)
+	// reconcileBaseline carries the fixpoint-reconcile state across claims:
+	// -1 during the initial forward scan; >= 0 during a reconcile pass, holding
+	// the ledger total at the pass's start. A page-cursor scan can MISS an issue
+	// that shifts into an already-consumed page between claims, so after the
+	// cursor exhausts we re-scan from the start and repeat until a full pass
+	// discovers zero new identities (total unchanged vs the pass baseline).
+	reconcileBaseline := run.ReconcileBaseline
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
@@ -223,7 +230,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			if cerr != nil {
 				return cerr
 			}
-			if err := w.advance(ctx, run, cursor, counts); err != nil {
+			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
 				return err
 			}
 			return w.finishRun(ctx, run, "cancelled", errorSamples)
@@ -268,7 +275,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 					if cerr != nil {
 						return cerr
 					}
-					if err := w.advance(ctx, run, cursor, counts); err != nil {
+					if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
 						return err
 					}
 					return w.finishRun(ctx, run, "quota_blocked", errorSamples)
@@ -293,18 +300,33 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		if cerr != nil {
 			return cerr
 		}
-		if err := w.advance(ctx, run, cursor, counts); err != nil {
+		if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
 			return err
 		}
 		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
 			return err
 		}
 		if cursor == "" {
-			state := "succeeded"
-			if counts.failed > 0 {
-				state = "partial"
+			// The scan reached the end. Decide between finishing and running
+			// another reconcile pass. A pass "discovered nothing new" when the
+			// ledger total is unchanged from the baseline captured at its start.
+			if reconcileBaseline >= 0 && counts.total == reconcileBaseline {
+				state := "succeeded"
+				if counts.failed > 0 {
+					state = "partial"
+				}
+				return w.finishRun(ctx, run, state, errorSamples)
 			}
-			return w.finishRun(ctx, run, state, errorSamples)
+			// Either the initial forward scan just finished (baseline -1), or a
+			// reconcile pass surfaced new issues: start a fresh pass from the top
+			// with the current total as the new baseline, and yield the claim so
+			// cancel/other runs get a turn. Persist the reset cursor + baseline.
+			reconcileBaseline = counts.total
+			cursor = ""
+			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+				return err
+			}
+			return w.requeueRun(ctx, run, 0)
 		}
 	}
 
@@ -372,7 +394,7 @@ var errLeaseLost = errors.New("external-issue sync run lease lost")
 // worker's id. A zero-row update means the lease was stolen (or the run was
 // cancelled/finished elsewhere): return errLeaseLost so the caller aborts
 // WITHOUT finalizing — never mark succeeded on an unsaved cursor.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, reconcileBaseline int64) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
 		ID:             run.ID,
@@ -387,7 +409,8 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 		LeaseExpiresAt: lease,
 		// page_offset is retained for schema compatibility but no longer drives
 		// resume — the run-item ledger (keyed on stable issue id) does.
-		PageOffset: 0,
+		PageOffset:        0,
+		ReconcileBaseline: reconcileBaseline,
 	})
 	if err != nil {
 		return fmt.Errorf("advance run: %w", err)
@@ -418,16 +441,23 @@ func (w *ExternalIssueSyncWorker) ledgerCounts(ctx context.Context, runID pgtype
 
 // recordFailedItem records a failed outcome in the ledger for a remote issue
 // whose Apply returned a non-fenced, non-quota error (so Apply's own tx rolled
-// back without writing a ledger row). Its own tiny transaction is fine: a
-// duplicate failed record just upserts.
+// back without writing a ledger row). The write is FENCED on run ownership: a
+// stale/reclaimed/cancelled worker must not append failures to a run it no longer
+// drives, so when the fence blocks the write this returns errLeaseLost to stop
+// the claim (mirrors the success-path ledger write, which is fenced inside
+// Apply's own transaction).
 func (w *ExternalIssueSyncWorker) recordFailedItem(ctx context.Context, run db.ExternalIssueSyncRun, externalID string) error {
-	if _, err := w.h.Queries.UpsertExternalIssueSyncRunItem(ctx, db.UpsertExternalIssueSyncRunItemParams{
-		RunID:           run.ID,
+	ok, err := w.h.Queries.RecordFailedExternalIssueSyncRunItemFenced(ctx, db.RecordFailedExternalIssueSyncRunItemFencedParams{
+		ID:              run.ID,
 		WorkspaceID:     run.WorkspaceID,
 		ExternalIssueID: externalID,
-		Outcome:         "failed",
-	}); err != nil {
+		WorkerID:        w.id,
+	})
+	if err != nil {
 		return fmt.Errorf("record failed ledger item: %w", err)
+	}
+	if !ok {
+		return errLeaseLost
 	}
 	return nil
 }
