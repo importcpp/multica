@@ -67,6 +67,7 @@ vi.mock("@multica/core/workspace/hooks", () => ({
 }));
 
 vi.mock("../../i18n", () => ({
+  useLocale: () => "en",
   useT: () => ({ t: () => "Translated" }),
   useTimeAgo: () => () => "now",
 }));
@@ -97,6 +98,7 @@ const navigation: NavigationAdapter = {
   back: vi.fn(),
   pathname: "/acme/issues",
   searchParams: new URLSearchParams(),
+  hash: "",
   getShareableUrl: (path) => `https://app.example${path}`,
 };
 

@@ -23,6 +23,10 @@ const (
 	RuntimeSweepStageDelegatedFailureRecovery = "delegated_failure_recovery"
 	RuntimeSweepStageDeferredChatFinalization = "deferred_chat_finalize"
 	RuntimeSweepStageGC                       = "runtime_gc"
+
+	RuntimeGCSkipEligibilityChanged = "eligibility_changed"
+	RuntimeGCSkipNonTerminalTask    = "non_terminal_task"
+	RuntimeGCSkipWorkspaceMismatch  = "workspace_mismatch"
 )
 
 type activeTaskLabels struct {
@@ -47,25 +51,30 @@ type BusinessMetrics struct {
 	llmUnpricedTokens *prometheus.CounterVec
 	llmRequests       *prometheus.CounterVec
 
-	taskQueuedExpired                 *prometheus.CounterVec
-	taskLeaseExpired                  *prometheus.CounterVec
-	chatClaimSessionFallbackNeeded    prometheus.Counter
-	chatClaimSessionFallbackResult    *prometheus.CounterVec
-	chatClaimResumeQueryDuration      *prometheus.HistogramVec
-	runtimeSweepStageDuration         *prometheus.HistogramVec
-	runtimeSweepCandidateRows         *prometheus.CounterVec
-	runtimeSweepRowsChanged           *prometheus.CounterVec
-	runtimeGCDeleted                  prometheus.Counter
-	runtimeGCFailed                   prometheus.Counter
-	runtimeGCBlocked                  prometheus.Gauge
-	runtimeGCBlockedObservationFailed prometheus.Counter
-	entitlementConfigError            prometheus.Counter
-	entitlementCache                  *prometheus.CounterVec
-	entitlementRefresh                *prometheus.CounterVec
-	entitlementRefreshDuration        *prometheus.HistogramVec
-	entitlementDecision               *prometheus.CounterVec
-	entitlementVersionRegression      prometheus.Counter
-	autopilotQuotaDecision            *prometheus.CounterVec
+	taskQueuedExpired              *prometheus.CounterVec
+	taskLeaseExpired               *prometheus.CounterVec
+	chatClaimSessionFallbackNeeded prometheus.Counter
+	chatClaimSessionFallbackResult *prometheus.CounterVec
+	chatClaimResumeQueryDuration   *prometheus.HistogramVec
+	runtimeSweepStageDuration      *prometheus.HistogramVec
+	runtimeSweepCandidateRows      *prometheus.CounterVec
+	runtimeSweepRowsChanged        *prometheus.CounterVec
+	runtimeGCDeleted               prometheus.Counter
+	runtimeGCFailed                prometheus.Counter
+	runtimeGCSkipped               *prometheus.CounterVec
+	entitlementConfigError         prometheus.Counter
+	entitlementCache               *prometheus.CounterVec
+	entitlementRefresh             *prometheus.CounterVec
+	entitlementRefreshDuration     *prometheus.HistogramVec
+	entitlementDecision            *prometheus.CounterVec
+	entitlementVersionRegression   prometheus.Counter
+	autopilotQuotaDecision         *prometheus.CounterVec
+
+	// agentRuntimeLookup counts single-row agent_runtime reads by product
+	// source. Every source shares one SQL fingerprint, so this is the only
+	// place the split between daemon heartbeats, browser polling, and
+	// readiness gates is observable. See labels.go for the closed enum.
+	agentRuntimeLookup *prometheus.CounterVec
 
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
@@ -228,18 +237,12 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Name:      "failed_total",
 			Help:      "Total runtime garbage-collection operations that failed.",
 		}),
-		runtimeGCBlocked: prometheus.NewGauge(prometheus.GaugeOpts{
+		runtimeGCSkipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica",
 			Subsystem: "runtime_gc",
-			Name:      "blocked_runtimes",
-			Help:      "Bounded count of stale offline runtimes blocked from garbage collection by non-terminal tasks.",
-		}),
-		runtimeGCBlockedObservationFailed: prometheus.NewCounter(prometheus.CounterOpts{
-			Namespace: "multica",
-			Subsystem: "runtime_gc",
-			Name:      "blocked_observation_failed_total",
-			Help:      "Total failures while observing stale runtimes blocked from garbage collection.",
-		}),
+			Name:      "skipped_total",
+			Help:      "Total runtime garbage-collection candidates safely skipped by reason.",
+		}, metricLabels("multica_runtime_gc_skipped_total")),
 		entitlementConfigError: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: "multica", Subsystem: "entitlement", Name: "config_error_total",
 			Help: "Total startup failures caused by a malformed Multica Cloud URL for entitlement policy.",
@@ -268,10 +271,26 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Namespace: "multica", Subsystem: "autopilot_quota", Name: "decision_total",
 			Help: "Total autopilot quota admission outcomes.",
 		}, metricLabels("multica_autopilot_quota_decision_total")),
+		agentRuntimeLookup: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica", Subsystem: "agent_runtime", Name: "lookup_total",
+			Help: "Total single-row agent_runtime reads by product source and outcome.",
+		}, metricLabels("multica_agent_runtime_lookup_total")),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
 	m.prewarmFailureReasons()
+	for _, reason := range []string{RuntimeGCSkipEligibilityChanged, RuntimeGCSkipNonTerminalTask, RuntimeGCSkipWorkspaceMismatch} {
+		m.runtimeGCSkipped.WithLabelValues(reason).Add(0)
+	}
+	// Prewarm the full source x result grid (45 series) so a source that has
+	// not fired since this process started reads as zero rather than as a
+	// missing series — rate() over an absent series returns nothing, which on
+	// a dashboard is indistinguishable from "we never instrumented that path".
+	for _, source := range AllRuntimeLookupSources() {
+		for _, result := range AllRuntimeLookupResults() {
+			m.agentRuntimeLookup.WithLabelValues(source, result).Add(0)
+		}
+	}
 	return m
 }
 
@@ -301,8 +320,7 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.runtimeSweepRowsChanged,
 		m.runtimeGCDeleted,
 		m.runtimeGCFailed,
-		m.runtimeGCBlocked,
-		m.runtimeGCBlockedObservationFailed,
+		m.runtimeGCSkipped,
 		m.entitlementConfigError,
 		m.entitlementCache,
 		m.entitlementRefresh,
@@ -310,6 +328,7 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.entitlementDecision,
 		m.entitlementVersionRegression,
 		m.autopilotQuotaDecision,
+		m.agentRuntimeLookup,
 	}, m.events.collectors()...)
 }
 
@@ -337,6 +356,22 @@ func (m *BusinessMetrics) RecordEntitlementDecision(gate, action, reason string)
 	if m != nil {
 		m.entitlementDecision.WithLabelValues(gate, action, reason).Inc()
 	}
+}
+
+// RecordAgentRuntimeLookup counts one single-row agent_runtime read.
+//
+// Call it from service.RuntimeLookup and nowhere else: the point of the metric
+// is that every read is attributed, and a second entry point is how a call site
+// ends up counted twice or not at all. Both labels are normalized here, so a
+// typo at a call site degrades to "other"/"error" instead of minting a series.
+func (m *BusinessMetrics) RecordAgentRuntimeLookup(source, result string) {
+	if m == nil {
+		return
+	}
+	m.agentRuntimeLookup.WithLabelValues(
+		NormalizeAgentRuntimeLookupSource(source),
+		NormalizeAgentRuntimeLookupResult(result),
+	).Inc()
 }
 
 func (m *BusinessMetrics) RecordEntitlementVersionRegression() {
@@ -371,18 +406,20 @@ func (m *BusinessMetrics) RecordRuntimeGCFailed() {
 	m.runtimeGCFailed.Inc()
 }
 
-func (m *BusinessMetrics) SetRuntimeGCBlocked(count int64) {
+func (m *BusinessMetrics) RecordRuntimeGCSkipped(reason string) {
 	if m == nil {
 		return
 	}
-	m.runtimeGCBlocked.Set(float64(count))
+	m.runtimeGCSkipped.WithLabelValues(normalizeRuntimeGCSkipReason(reason)).Inc()
 }
 
-func (m *BusinessMetrics) RecordRuntimeGCBlockedObservationFailed() {
-	if m == nil {
-		return
+func normalizeRuntimeGCSkipReason(reason string) string {
+	switch reason {
+	case RuntimeGCSkipEligibilityChanged, RuntimeGCSkipNonTerminalTask, RuntimeGCSkipWorkspaceMismatch:
+		return reason
+	default:
+		return "unknown"
 	}
-	m.runtimeGCBlockedObservationFailed.Inc()
 }
 
 // ObserveRuntimeSweepStage records one bounded-cardinality maintenance stage.
