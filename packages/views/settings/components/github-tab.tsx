@@ -64,7 +64,12 @@ export function GitHubTab() {
   const configured = installationData?.configured ?? false;
   const canManage = installationData?.can_manage === true;
   const connected = installations.length > 0;
-  const primaryInstallation = installations[0] ?? null;
+  // The admin picks WHICH connected installation to import from; default to the
+  // first. A workspace can connect several GitHub installations (accounts/orgs),
+  // so hardcoding installations[0] made every one after the first unreachable.
+  const [selectedInstallationId, setSelectedInstallationId] = useState<string | null>(null);
+  const activeInstallation =
+    installations.find((i) => i.id === selectedInstallationId) ?? installations[0] ?? null;
 
   const flags = deriveGitHubSettings(workspace);
   const [savingKey, setSavingKey] = useState<SettingsKey | null>(null);
@@ -180,10 +185,10 @@ export function GitHubTab() {
                           login: installations.map((i) => i.account_login).join(", "),
                         })}
                       </p>
-                      {primaryInstallation?.connected_by && (
+                      {activeInstallation?.connected_by && (
                         <p className="text-caption text-muted-foreground">
                           {t(($) => $.github.connected_by, {
-                            name: primaryInstallation.connected_by!,
+                            name: activeInstallation.connected_by!,
                           })}
                         </p>
                       )}
@@ -206,19 +211,36 @@ export function GitHubTab() {
               </div>
               {canManage && (
                 <div className="flex items-center gap-2">
-                  {connected && primaryInstallation ? (
+                  {connected && activeInstallation ? (
                     // Disconnect must stay reachable even when the master switch
                     // is off — disconnect is a separate intent (revoke the App
                     // grant) from hiding the feature.
                     <>
+                      {installations.length > 1 && (
+                        <select
+                          aria-label={t(($) => $.github.installation_select_label)}
+                          className="border-input bg-background h-9 rounded-md border px-3 text-body"
+                          value={activeInstallation.id}
+                          onChange={(e) => setSelectedInstallationId(e.target.value)}
+                        >
+                          {installations.map((i) => (
+                            <option key={i.id} value={i.id}>
+                              {i.account_login}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       <GitHubImportIssuesDialog
+                        // Key on the installation so switching accounts remounts
+                        // the dialog, resetting repo/preview/run state.
+                        key={activeInstallation.id}
                         workspaceId={wsId}
-                        installationId={primaryInstallation.id}
+                        installationId={activeInstallation.id}
                       />
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => setDisconnectTarget(primaryInstallation.id)}
+                        onClick={() => setDisconnectTarget(activeInstallation.id)}
                       >
                         {t(($) => $.github.disconnect)}
                       </Button>

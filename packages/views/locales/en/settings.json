@@ -726,6 +726,7 @@
     "read_only_hint": "Read-only view. Only workspace admins and owners can connect or disconnect GitHub.",
     "contact_admin_to_connect": "GitHub is not connected for this workspace. Ask an admin or owner to set up the GitHub App.",
     "connected_by": "Connected by {{name}}",
+    "installation_select_label": "Installation to import from",
     "toast_not_configured": "GitHub integration is not configured for this deployment",
     "toast_open_failed": "Failed to open GitHub install",
     "toast_disconnect_failed": "Failed to disconnect GitHub App",

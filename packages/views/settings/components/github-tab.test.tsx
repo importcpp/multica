@@ -294,4 +294,47 @@ describe("GitHubTab", () => {
     await user.click(screen.getByRole("button", { name: /Manage repositories/ }));
     expect(mockNavPush).toHaveBeenCalledWith("/acme/settings?tab=repositories");
   });
+
+  // With more than one connected installation, an admin can pick which one to
+  // import from; switching updates the disconnect target too. Regression for
+  // codex56 round-4 P1 (installations[0] hardcoded made others unreachable).
+  it("offers an installation selector when multiple are connected", async () => {
+    const user = userEvent.setup();
+    installationsRef.current = {
+      configured: true,
+      can_manage: true,
+      installations: [
+        { id: "inst-1", account_login: "acme", installation_id: 1 },
+        { id: "inst-2", account_login: "beta-org", installation_id: 2 },
+      ],
+    };
+    mockDeleteInstallation.mockResolvedValue(undefined);
+    render(<GitHubTab />, { wrapper: I18nWrapper });
+
+    const select = screen.getByLabelText(/Installation to import from/i);
+    expect(select).toBeTruthy();
+    // Default is the first installation; switch to the second.
+    await user.selectOptions(select, "inst-2");
+
+    // Disconnect now targets the selected installation.
+    await user.click(screen.getByRole("button", { name: /^Disconnect$/ }));
+    const dialogConfirm = screen
+      .getAllByRole("button", { name: /^Disconnect$/ })
+      .find((b) => b.getAttribute("data-slot")?.includes("alert-dialog"));
+    await user.click(dialogConfirm ?? screen.getAllByRole("button", { name: /^Disconnect$/ })[1]!);
+    await waitFor(() => {
+      expect(mockDeleteInstallation).toHaveBeenCalledWith("workspace-1", "inst-2");
+    });
+  });
+
+  // A single installation shows no selector (no needless UI).
+  it("shows no installation selector with a single installation", () => {
+    installationsRef.current = {
+      configured: true,
+      can_manage: true,
+      installations: [{ id: "inst-1", account_login: "acme", installation_id: 1 }],
+    };
+    render(<GitHubTab />, { wrapper: I18nWrapper });
+    expect(screen.queryByLabelText(/Installation to import from/i)).toBeNull();
+  });
 });

@@ -207,19 +207,23 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		ExternalID:  snap.RepositoryExternalID,
 		FullPath:    snap.RepositoryFullPath,
 	}
-	filter := externalissue.IssueFilter{State: snap.State}
+	// Scan the STABLE SUPERSET (state=all) and filter to the requested state
+	// locally. A filtered scan (state=open) over "created asc" is NOT stable:
+	// closing an issue removes it from the filtered set and shifts every later
+	// issue into an already-consumed page, so a page-cursor scan can permanently
+	// miss a still-matching issue. state=all never loses a row on close and
+	// created_at is immutable, so page positions are stable and a single forward
+	// pass is complete — no fixpoint re-scan needed.
+	filter := externalissue.IssueFilter{State: "all"}
+	wantState := snap.State
+	if wantState == "" {
+		wantState = "open"
+	}
 
 	// errorSamples accumulates ACROSS claims: seed from the run's persisted
 	// sample so a failure in an earlier claim survives into the final state.
 	errorSamples := decodeErrorSamples(run.ErrorSample)
 	cursor := externalissue.Cursor(run.Cursor)
-	// reconcileBaseline carries the fixpoint-reconcile state across claims:
-	// -1 during the initial forward scan; >= 0 during a reconcile pass, holding
-	// the ledger total at the pass's start. A page-cursor scan can MISS an issue
-	// that shifts into an already-consumed page between claims, so after the
-	// cursor exhausts we re-scan from the start and repeat until a full pass
-	// discovers zero new identities (total unchanged vs the pass baseline).
-	reconcileBaseline := run.ReconcileBaseline
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
@@ -230,7 +234,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			if cerr != nil {
 				return cerr
 			}
-			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+			if err := w.advance(ctx, run, cursor, counts); err != nil {
 				return err
 			}
 			return w.finishRun(ctx, run, "cancelled", errorSamples)
@@ -241,6 +245,12 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			return w.handleListError(ctx, run, listErr)
 		}
 		for i, iss := range result.Issues {
+			// Superset scan: skip issues that don't match the requested state
+			// locally, so they never enter the ledger/counts (matches "import only
+			// <state>"). Skipping is O(1) and does not touch the DB.
+			if !importStateMatches(iss.State, wantState) {
+				continue
+			}
 			// In-page heartbeat: renew the lease periodically so a healthy but
 			// slow page is not reclaimed. The authoritative ownership check is
 			// inside Apply's own transaction (fence), so this is only a liveness
@@ -275,7 +285,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 					if cerr != nil {
 						return cerr
 					}
-					if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+					if err := w.advance(ctx, run, cursor, counts); err != nil {
 						return err
 					}
 					return w.finishRun(ctx, run, "quota_blocked", errorSamples)
@@ -295,42 +305,29 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		}
 		cursor = result.NextCursor
 		if cursor == "" {
-			// End of scan: aggregate the ledger once (authoritative counts) and
-			// decide between finishing and another reconcile pass. A pass
-			// "discovered nothing new" when the total is unchanged from the
-			// baseline captured at its start.
+			// End of a single, complete forward pass over the stable superset:
+			// aggregate the ledger once (authoritative counts) and finish. No
+			// re-scan is needed because the superset ordering is stable.
 			counts, cerr := w.ledgerCounts(ctx, run.ID)
 			if cerr != nil {
 				return cerr
 			}
-			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+			if err := w.advance(ctx, run, cursor, counts); err != nil {
 				return err
 			}
 			if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
 				return err
 			}
-			if reconcileBaseline >= 0 && counts.total == reconcileBaseline {
-				state := "succeeded"
-				if counts.failed > 0 {
-					state = "partial"
-				}
-				return w.finishRun(ctx, run, state, errorSamples)
+			state := "succeeded"
+			if counts.failed > 0 {
+				state = "partial"
 			}
-			// Either the initial forward scan just finished (baseline -1), or a
-			// reconcile pass surfaced new issues: start a fresh pass from the top
-			// with the current total as the new baseline, and yield the claim so
-			// cancel/other runs get a turn. Persist the reset cursor + baseline.
-			reconcileBaseline = counts.total
-			cursor = ""
-			if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
-				return err
-			}
-			return w.requeueRun(ctx, run, 0)
+			return w.finishRun(ctx, run, state, errorSamples)
 		}
 		// Interior page: keep the resume cursor crash-safe at O(1) without
 		// re-aggregating the ledger every page (that scan grows with the run). The
 		// run-row counts refresh authoritatively at the next exit / claim start.
-		if err := w.checkpointCursor(ctx, run, cursor, reconcileBaseline); err != nil {
+		if err := w.checkpointCursor(ctx, run, cursor); err != nil {
 			return err
 		}
 		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
@@ -346,10 +343,25 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	if cerr != nil {
 		return cerr
 	}
-	if err := w.advance(ctx, run, cursor, counts, reconcileBaseline); err != nil {
+	if err := w.advance(ctx, run, cursor, counts); err != nil {
 		return err
 	}
 	return w.requeueRun(ctx, run, 0)
+}
+
+// importStateMatches reports whether a superset-scanned issue should be imported
+// for the requested filter state. The worker fetches state=all (a stable
+// superset) and filters locally, so "open"/"closed" import only that state while
+// "all" imports everything.
+func importStateMatches(s externalissue.State, want string) bool {
+	switch want {
+	case "all":
+		return true
+	case "closed":
+		return s == externalissue.StateClosed
+	default: // "open"
+		return s == externalissue.StateOpen
+	}
 }
 
 // runInputSnapshot is the immutable execution input captured on the run at
@@ -411,7 +423,7 @@ var errLeaseLost = errors.New("external-issue sync run lease lost")
 // worker's id. A zero-row update means the lease was stolen (or the run was
 // cancelled/finished elsewhere): return errLeaseLost so the caller aborts
 // WITHOUT finalizing — never mark succeeded on an unsaved cursor.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, reconcileBaseline int64) error {
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
 		ID:             run.ID,
@@ -426,8 +438,7 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 		LeaseExpiresAt: lease,
 		// page_offset is retained for schema compatibility but no longer drives
 		// resume — the run-item ledger (keyed on stable issue id) does.
-		PageOffset:        0,
-		ReconcileBaseline: reconcileBaseline,
+		PageOffset: 0,
 	})
 	if err != nil {
 		return fmt.Errorf("advance run: %w", err)
@@ -439,17 +450,16 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 	return nil
 }
 
-// checkpointCursor persists ONLY the resume cursor + reconcile baseline and
-// renews the lease, without re-aggregating the identity ledger. Used for interior
-// pages so per-page cost stays O(1) as the run grows; fenced on worker_id.
-func (w *ExternalIssueSyncWorker) checkpointCursor(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, reconcileBaseline int64) error {
+// checkpointCursor persists ONLY the resume cursor and renews the lease, without
+// re-aggregating the identity ledger. Used for interior pages so per-page cost
+// stays O(1) as the run grows; fenced on worker_id.
+func (w *ExternalIssueSyncWorker) checkpointCursor(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.CheckpointExternalIssueSyncRunCursor(ctx, db.CheckpointExternalIssueSyncRunCursorParams{
-		ID:                run.ID,
-		WorkerID:          w.id,
-		Cursor:            string(cursor),
-		LeaseExpiresAt:    lease,
-		ReconcileBaseline: reconcileBaseline,
+		ID:             run.ID,
+		WorkerID:       w.id,
+		Cursor:         string(cursor),
+		LeaseExpiresAt: lease,
 	})
 	if err != nil {
 		return fmt.Errorf("checkpoint cursor: %w", err)
@@ -595,6 +605,24 @@ func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.External
 	if err != nil {
 		sample = []byte("[]")
 	}
+	// A non-resumable terminal run (succeeded/partial/cancelled) will never
+	// re-scan and its counts are already snapshotted on the run row, so finish AND
+	// purge its identity ledger in ONE atomic statement. Doing it atomically (vs.
+	// finish-then-best-effort-delete) means a crash can't leave a finished run with
+	// an orphaned ledger that is never reclaimed to clean up. Resumable terminal
+	// states keep their ledger so resume can still dedup already-accounted issues.
+	if isNonResumableTerminal(state) {
+		finished, err := w.h.Queries.FinishExternalIssueSyncRunAndPurgeLedger(ctx, db.FinishExternalIssueSyncRunAndPurgeLedgerParams{
+			ID: run.ID, WorkerID: w.id, State: state, ErrorSample: sample,
+		})
+		if err != nil {
+			return fmt.Errorf("finish run %s: %w", state, err)
+		}
+		if finished == 0 {
+			slog.Warn("external-issue sync worker: lease lost on finish", "run_id", util.UUIDToString(run.ID))
+		}
+		return nil
+	}
 	rows, err := w.h.Queries.FinishExternalIssueSyncRun(ctx, db.FinishExternalIssueSyncRunParams{
 		ID: run.ID, WorkerID: w.id, State: state, ErrorSample: sample,
 	})
@@ -603,18 +631,6 @@ func (w *ExternalIssueSyncWorker) finishRun(ctx context.Context, run db.External
 	}
 	if rows == 0 {
 		slog.Warn("external-issue sync worker: lease lost on finish", "run_id", util.UUIDToString(run.ID))
-		return nil
-	}
-	// Terminal retention: a non-resumable terminal run will never re-scan, and its
-	// counts are already snapshotted on the run row, so drop the per-issue identity
-	// ledger to bound growth. Resumable terminal states keep it so resume can still
-	// dedup already-accounted issues. Best-effort: a cleanup failure must not flip a
-	// successfully finished run back to an error.
-	if isNonResumableTerminal(state) {
-		if err := w.h.Queries.DeleteExternalIssueSyncRunItemsByRun(ctx, run.ID); err != nil {
-			slog.Warn("external-issue sync worker: ledger cleanup failed",
-				"run_id", util.UUIDToString(run.ID), "state", state, "err", err)
-		}
 	}
 	return nil
 }

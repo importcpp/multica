@@ -29,16 +29,62 @@ export function IssueSourceBadge({ issueId }: IssueSourceBadgeProps) {
   // No source (404) or not loaded yet → render nothing.
   if (isError || !source || !source.provider) return null;
 
-  const hasConflict = source.title_conflict === true || source.body_conflict === true;
+  // Per-field state: a field is actionable when it is in conflict OR the user
+  // previously chose "keep local" (locally-owned), which needs a Resume entry so
+  // sync can be re-enabled later. Resolution is submitted per field so acting on
+  // one field never touches the other's content or ownership.
+  const titleActionable = source.title_conflict === true || source.title_local_owned === true;
+  const bodyActionable = source.body_conflict === true || source.body_local_owned === true;
 
-  async function resolve(action: "keep_local" | "use_remote" | "resume_sync") {
+  async function resolve(
+    action: "keep_local" | "use_remote" | "resume_sync",
+    field: "title" | "body",
+  ) {
     try {
-      await api.resolveIssueExternalConflict(issueId, { action });
+      await api.resolveIssueExternalConflict(issueId, { action, fields: [field] });
       await qc.invalidateQueries({ queryKey: ["issue-external-source", issueId] });
       toast.success(t(($) => $.external_source.toast_resolved));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t(($) => $.external_source.toast_failed));
     }
+  }
+
+  function fieldRow(
+    field: "title" | "body",
+    conflict: boolean,
+    localOwned: boolean,
+    label: string,
+  ) {
+    if (conflict) {
+      return (
+        <div key={field} className="flex flex-wrap items-center gap-2">
+          <span className="text-caption text-destructive">
+            {t(($) => $.external_source.field_conflict, { field: label })}
+          </span>
+          <Button variant="outline" size="sm" onClick={() => resolve("keep_local", field)}>
+            {t(($) => $.external_source.keep_local)}
+          </Button>
+          <Button variant="outline" size="sm" onClick={() => resolve("use_remote", field)}>
+            {t(($) => $.external_source.use_remote)}
+          </Button>
+        </div>
+      );
+    }
+    // Locally-owned (kept local earlier), no active conflict: offer Resume so the
+    // user can re-enable remote sync for this field.
+    if (localOwned) {
+      return (
+        <div key={field} className="flex flex-wrap items-center gap-2">
+          <span className="text-caption text-muted-foreground">
+            {t(($) => $.external_source.field_local_owned, { field: label })}
+          </span>
+          <Button variant="ghost" size="sm" onClick={() => resolve("resume_sync", field)}>
+            {t(($) => $.external_source.resume_sync)}
+          </Button>
+        </div>
+      );
+    }
+    return null;
   }
 
   return (
@@ -62,22 +108,22 @@ export function IssueSourceBadge({ issueId }: IssueSourceBadgeProps) {
         ) : null}
       </div>
 
-      {hasConflict ? (
-        <div className="flex flex-wrap items-center gap-2">
-          <span className="text-caption text-destructive">
-            {t(($) => $.external_source.conflict)}
-          </span>
-          <Button variant="outline" size="sm" onClick={() => resolve("keep_local")}>
-            {t(($) => $.external_source.keep_local)}
-          </Button>
-          <Button variant="outline" size="sm" onClick={() => resolve("use_remote")}>
-            {t(($) => $.external_source.use_remote)}
-          </Button>
-          <Button variant="ghost" size="sm" onClick={() => resolve("resume_sync")}>
-            {t(($) => $.external_source.resume_sync)}
-          </Button>
-        </div>
-      ) : null}
+      {titleActionable
+        ? fieldRow(
+            "title",
+            source.title_conflict === true,
+            source.title_local_owned === true,
+            t(($) => $.external_source.field_title),
+          )
+        : null}
+      {bodyActionable
+        ? fieldRow(
+            "body",
+            source.body_conflict === true,
+            source.body_local_owned === true,
+            t(($) => $.external_source.field_body),
+          )
+        : null}
     </div>
   );
 }

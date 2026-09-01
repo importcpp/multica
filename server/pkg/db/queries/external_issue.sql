@@ -30,6 +30,13 @@ RETURNING *;
 SELECT * FROM external_issue_source
 WHERE id = $1 AND workspace_id = $2;
 
+-- name: GetExternalIssueSourceByIdentity :one
+-- Look up the existing source for a repo BEFORE upserting, so an import request
+-- can compare inputs against an already-active run without first mutating the
+-- source row. Matches the UpsertExternalIssueSource conflict key.
+SELECT * FROM external_issue_source
+WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND repository_external_id = $4;
+
 -- name: ListExternalIssueSourcesByWorkspace :many
 SELECT * FROM external_issue_source
 WHERE workspace_id = $1
@@ -82,6 +89,23 @@ WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND external_iss
 -- name: GetExternalIssueLinkByIssue :one
 SELECT * FROM external_issue_link
 WHERE workspace_id = $1 AND issue_id = $2;
+
+-- name: ResumeExternalIssueLinkField :exec
+-- resume_sync for the scoped fields: clear local ownership + conflict AND advance
+-- the baseline to the CURRENT local content hash. Advancing the baseline is what
+-- makes resume meaningful — otherwise local still differs from the stale baseline
+-- and the very next sync re-raises the same conflict. After this, local == the
+-- new baseline, so a later remote change flows in cleanly (remoteChanged &&
+-- !localChanged -> take remote). Out-of-scope fields are untouched.
+UPDATE external_issue_link SET
+    title_local_owned   = CASE WHEN sqlc.arg('title_in_scope') THEN false ELSE title_local_owned END,
+    body_local_owned    = CASE WHEN sqlc.arg('body_in_scope')  THEN false ELSE body_local_owned  END,
+    title_conflict      = CASE WHEN sqlc.arg('title_in_scope') THEN false ELSE title_conflict END,
+    body_conflict       = CASE WHEN sqlc.arg('body_in_scope')  THEN false ELSE body_conflict  END,
+    title_baseline_hash = CASE WHEN sqlc.arg('title_in_scope') THEN sqlc.arg('title_baseline') ELSE title_baseline_hash END,
+    body_baseline_hash  = CASE WHEN sqlc.arg('body_in_scope')  THEN sqlc.arg('body_baseline')  ELSE body_baseline_hash  END,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2;
 
 -- name: ResolveExternalIssueLinkField :exec
 -- Per-field conflict resolution. For a field IN SCOPE ($3 title, $5 body) the
@@ -206,29 +230,24 @@ WHERE id = (
 RETURNING *;
 
 -- name: CheckpointExternalIssueSyncRunCursor :execrows
--- Lightweight interior-page checkpoint: persist ONLY the cursor, reconcile
--- baseline, and refreshed lease, without re-aggregating the identity ledger.
--- Fenced on worker_id. Full count aggregation is expensive (a scan of the run's
--- ledger) and only needs to happen at claim EXIT points, so interior pages use
--- this to keep the resume cursor crash-safe at O(1); the counts on the run row
--- may lag within a claim and are refreshed authoritatively at the next exit /
--- next claim start (the ledger is the source of truth, so a crash mid-claim
--- re-aggregates correctly on resume).
+-- Lightweight interior-page checkpoint: persist ONLY the cursor and refreshed
+-- lease, without re-aggregating the identity ledger. Fenced on worker_id. Full
+-- count aggregation is expensive (a scan of the run's ledger) and only needs to
+-- happen at claim EXIT points, so interior pages use this to keep the resume
+-- cursor crash-safe at O(1); the counts on the run row may lag within a claim and
+-- are refreshed authoritatively at the next exit / next claim start.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     lease_expires_at = $3,
-    reconcile_baseline = sqlc.arg('reconcile_baseline'),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
 -- name: AdvanceExternalIssueSyncRun :execrows
--- Persist page progress: new cursor, refreshed lease, the running counts, and the
--- current fixpoint-reconcile baseline. Fenced on worker_id: if the lease was
--- stolen by another worker, this updates zero rows and the caller must stop
--- writing to the run. page_offset records how many items of the CURRENT page are
--- already accounted (0 once a full page commits) so a mid-page resume does not
--- re-count. reconcile_baseline carries the ledger total_seen at the start of the
--- CURRENT scan pass across claims (-1 during the initial forward scan).
+-- Persist page progress: new cursor, refreshed lease, and the running counts.
+-- Fenced on worker_id: if the lease was stolen by another worker, this updates
+-- zero rows and the caller must stop writing to the run. page_offset records how
+-- many items of the CURRENT page are already accounted (0 once a full page
+-- commits) so a mid-page resume does not re-count.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -239,7 +258,6 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     page_offset = sqlc.arg('page_offset'),
-    reconcile_baseline = sqlc.arg('reconcile_baseline'),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
@@ -265,6 +283,32 @@ UPDATE external_issue_sync_run SET
     finished_at = now(),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
+
+-- name: FinishExternalIssueSyncRunAndPurgeLedger :one
+-- Atomic finish + ledger purge for a NON-RESUMABLE terminal state
+-- (succeeded/partial/cancelled): the run row transition and the delete of its
+-- identity ledger happen in ONE statement, so a crash can never leave a finished
+-- run with an orphaned ledger (the old two-step "finish then best-effort delete"
+-- leaked rows permanently when it died between the steps, since a terminal run is
+-- never re-claimed). Fenced on worker_id. Returns finished=1 when this worker
+-- actually finalized the run (0 = lease lost), independent of how many ledger
+-- rows were purged.
+WITH finished AS (
+    UPDATE external_issue_sync_run AS r SET
+        state = $2,
+        error_sample = $3,
+        lease_expires_at = NULL,
+        worker_id = '',
+        finished_at = now(),
+        updated_at = now()
+    WHERE r.id = $1 AND r.worker_id = sqlc.arg('worker_id')
+    RETURNING r.id AS run_id
+), purged AS (
+    DELETE FROM external_issue_sync_run_item
+    WHERE run_id IN (SELECT run_id FROM finished)
+    RETURNING 1
+)
+SELECT (SELECT count(*) FROM finished) AS finished;
 
 -- name: RequeueExternalIssueSyncRun :execrows
 -- Fenced on worker_id; returns the run to the queue only if this worker still
@@ -443,16 +487,6 @@ SELECT EXISTS (
 
 -- name: DeleteExternalIssueSyncRunItemsByWorkspace :exec
 DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1;
-
--- name: DeleteExternalIssueSyncRunItemsByRun :exec
--- Terminal retention: drop a finished run's identity ledger once it can no longer
--- be resumed. The run's counts are already snapshotted on the run row, and a
--- non-resumable terminal run (succeeded / partial / cancelled) will never re-scan,
--- so the per-issue dedup rows are dead weight — deleting them bounds ledger growth
--- instead of accumulating one row per imported issue forever. Resumable terminal
--- states (quota_blocked / needs_reauth / failed) KEEP their ledger so resume can
--- still skip already-accounted issues.
-DELETE FROM external_issue_sync_run_item WHERE run_id = $1;
 
 -- name: SetExternalIssueSyncRunErrorSample :execrows
 -- Persist the accumulated error sample mid-run (page checkpoint), fenced on

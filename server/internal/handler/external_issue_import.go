@@ -292,6 +292,31 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Before mutating anything, check whether this repo already has an active run.
+	// If it does, compare the requested inputs against that run's snapshot: only a
+	// byte-identical request may coalesce onto the existing run; a DIFFERENT
+	// request (changed project / state) must NOT silently run under the old
+	// snapshot, and must NOT rewrite the source out from under the active run.
+	// This read is best-effort (no source yet => nothing active => fall through).
+	if existingSource, err := h.Queries.GetExternalIssueSourceByIdentity(r.Context(), db.GetExternalIssueSourceByIdentityParams{
+		WorkspaceID: workspaceUUID, Provider: "github", InstanceKey: repo.InstanceKey, RepositoryExternalID: repo.ExternalID,
+	}); err == nil {
+		if active, ok := h.activeRunForSource(r.Context(), workspaceUUID, existingSource.ID); ok {
+			requested := buildRunInputSnapshot("github", installationUUID, repo, projectID, actingUserID(r), state)
+			if sameRunExecutionInputs(active.InputSnapshot, requested) {
+				writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
+					SourceID: util.UUIDToString(existingSource.ID),
+					RunID:    util.UUIDToString(active.ID),
+					State:    active.State,
+				})
+				return
+			}
+			writeErrorCode(w, http.StatusConflict, "import_already_running",
+				"an import for this repository is already running with different settings; wait for it to finish or cancel it before importing with new settings")
+			return
+		}
+	}
+
 	// Create or reuse the source (dedup on stable identity). credential_id holds
 	// the installation UUID so the worker can mint a fresh token per claim.
 	source, err := h.Queries.UpsertExternalIssueSource(r.Context(), db.UpsertExternalIssueSourceParams{
@@ -574,6 +599,28 @@ func buildRunInputSnapshot(provider string, credentialID pgtype.UUID, repo exter
 	}
 	b, _ := json.Marshal(m)
 	return b
+}
+
+// sameRunExecutionInputs reports whether two run input snapshots describe the
+// same EXECUTION (provider, instance, repo identity, target project, state). It
+// deliberately ignores credential_id (a reconnect legitimately mints a new
+// installation UUID) and configured_by_user_id (who triggered it), so a second
+// import of the same repo/project/state coalesces onto the active run, while a
+// changed project or state is treated as a distinct request (409) rather than
+// silently running under the old snapshot.
+func sameRunExecutionInputs(existing []byte, requested []byte) bool {
+	parse := func(raw []byte) map[string]string {
+		var m map[string]string
+		_ = json.Unmarshal(raw, &m)
+		return m
+	}
+	a, b := parse(existing), parse(requested)
+	for _, k := range []string{"provider", "instance_key", "repository_external_id", "state", "target_project_id"} {
+		if a[k] != b[k] {
+			return false
+		}
+	}
+	return true
 }
 
 func toRemoteIssue(provider string, iss externalissue.Issue, repo externalissue.Repository) service.RemoteIssue {

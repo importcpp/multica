@@ -22,33 +22,29 @@ UPDATE external_issue_sync_run SET
     total_seen = $8,
     lease_expires_at = $9,
     page_offset = $10,
-    reconcile_baseline = $11,
     updated_at = now()
-WHERE id = $1 AND worker_id = $12
+WHERE id = $1 AND worker_id = $11
 `
 
 type AdvanceExternalIssueSyncRunParams struct {
-	ID                pgtype.UUID        `json:"id"`
-	Cursor            string             `json:"cursor"`
-	ImportedCount     int64              `json:"imported_count"`
-	UpdatedCount      int64              `json:"updated_count"`
-	ConflictCount     int64              `json:"conflict_count"`
-	SkippedCount      int64              `json:"skipped_count"`
-	FailedCount       int64              `json:"failed_count"`
-	TotalSeen         int64              `json:"total_seen"`
-	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
-	PageOffset        int32              `json:"page_offset"`
-	ReconcileBaseline int64              `json:"reconcile_baseline"`
-	WorkerID          string             `json:"worker_id"`
+	ID             pgtype.UUID        `json:"id"`
+	Cursor         string             `json:"cursor"`
+	ImportedCount  int64              `json:"imported_count"`
+	UpdatedCount   int64              `json:"updated_count"`
+	ConflictCount  int64              `json:"conflict_count"`
+	SkippedCount   int64              `json:"skipped_count"`
+	FailedCount    int64              `json:"failed_count"`
+	TotalSeen      int64              `json:"total_seen"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	PageOffset     int32              `json:"page_offset"`
+	WorkerID       string             `json:"worker_id"`
 }
 
-// Persist page progress: new cursor, refreshed lease, the running counts, and the
-// current fixpoint-reconcile baseline. Fenced on worker_id: if the lease was
-// stolen by another worker, this updates zero rows and the caller must stop
-// writing to the run. page_offset records how many items of the CURRENT page are
-// already accounted (0 once a full page commits) so a mid-page resume does not
-// re-count. reconcile_baseline carries the ledger total_seen at the start of the
-// CURRENT scan pass across claims (-1 during the initial forward scan).
+// Persist page progress: new cursor, refreshed lease, and the running counts.
+// Fenced on worker_id: if the lease was stolen by another worker, this updates
+// zero rows and the caller must stop writing to the run. page_offset records how
+// many items of the CURRENT page are already accounted (0 once a full page
+// commits) so a mid-page resume does not re-count.
 func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceExternalIssueSyncRunParams) (int64, error) {
 	result, err := q.db.Exec(ctx, advanceExternalIssueSyncRun,
 		arg.ID,
@@ -61,7 +57,6 @@ func (q *Queries) AdvanceExternalIssueSyncRun(ctx context.Context, arg AdvanceEx
 		arg.TotalSeen,
 		arg.LeaseExpiresAt,
 		arg.PageOffset,
-		arg.ReconcileBaseline,
 		arg.WorkerID,
 	)
 	if err != nil {
@@ -120,33 +115,28 @@ const checkpointExternalIssueSyncRunCursor = `-- name: CheckpointExternalIssueSy
 UPDATE external_issue_sync_run SET
     cursor = $2,
     lease_expires_at = $3,
-    reconcile_baseline = $4,
     updated_at = now()
-WHERE id = $1 AND worker_id = $5
+WHERE id = $1 AND worker_id = $4
 `
 
 type CheckpointExternalIssueSyncRunCursorParams struct {
-	ID                pgtype.UUID        `json:"id"`
-	Cursor            string             `json:"cursor"`
-	LeaseExpiresAt    pgtype.Timestamptz `json:"lease_expires_at"`
-	ReconcileBaseline int64              `json:"reconcile_baseline"`
-	WorkerID          string             `json:"worker_id"`
+	ID             pgtype.UUID        `json:"id"`
+	Cursor         string             `json:"cursor"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	WorkerID       string             `json:"worker_id"`
 }
 
-// Lightweight interior-page checkpoint: persist ONLY the cursor, reconcile
-// baseline, and refreshed lease, without re-aggregating the identity ledger.
-// Fenced on worker_id. Full count aggregation is expensive (a scan of the run's
-// ledger) and only needs to happen at claim EXIT points, so interior pages use
-// this to keep the resume cursor crash-safe at O(1); the counts on the run row
-// may lag within a claim and are refreshed authoritatively at the next exit /
-// next claim start (the ledger is the source of truth, so a crash mid-claim
-// re-aggregates correctly on resume).
+// Lightweight interior-page checkpoint: persist ONLY the cursor and refreshed
+// lease, without re-aggregating the identity ledger. Fenced on worker_id. Full
+// count aggregation is expensive (a scan of the run's ledger) and only needs to
+// happen at claim EXIT points, so interior pages use this to keep the resume
+// cursor crash-safe at O(1); the counts on the run row may lag within a claim and
+// are refreshed authoritatively at the next exit / next claim start.
 func (q *Queries) CheckpointExternalIssueSyncRunCursor(ctx context.Context, arg CheckpointExternalIssueSyncRunCursorParams) (int64, error) {
 	result, err := q.db.Exec(ctx, checkpointExternalIssueSyncRunCursor,
 		arg.ID,
 		arg.Cursor,
 		arg.LeaseExpiresAt,
-		arg.ReconcileBaseline,
 		arg.WorkerID,
 	)
 	if err != nil {
@@ -510,22 +500,6 @@ func (q *Queries) DeleteExternalIssueSyncEventsByWorkspace(ctx context.Context, 
 	return err
 }
 
-const deleteExternalIssueSyncRunItemsByRun = `-- name: DeleteExternalIssueSyncRunItemsByRun :exec
-DELETE FROM external_issue_sync_run_item WHERE run_id = $1
-`
-
-// Terminal retention: drop a finished run's identity ledger once it can no longer
-// be resumed. The run's counts are already snapshotted on the run row, and a
-// non-resumable terminal run (succeeded / partial / cancelled) will never re-scan,
-// so the per-issue dedup rows are dead weight — deleting them bounds ledger growth
-// instead of accumulating one row per imported issue forever. Resumable terminal
-// states (quota_blocked / needs_reauth / failed) KEEP their ledger so resume can
-// still skip already-accounted issues.
-func (q *Queries) DeleteExternalIssueSyncRunItemsByRun(ctx context.Context, runID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, deleteExternalIssueSyncRunItemsByRun, runID)
-	return err
-}
-
 const deleteExternalIssueSyncRunItemsByWorkspace = `-- name: DeleteExternalIssueSyncRunItemsByWorkspace :exec
 DELETE FROM external_issue_sync_run_item WHERE workspace_id = $1
 `
@@ -665,6 +639,52 @@ func (q *Queries) FinishExternalIssueSyncRun(ctx context.Context, arg FinishExte
 	return result.RowsAffected(), nil
 }
 
+const finishExternalIssueSyncRunAndPurgeLedger = `-- name: FinishExternalIssueSyncRunAndPurgeLedger :one
+WITH finished AS (
+    UPDATE external_issue_sync_run AS r SET
+        state = $2,
+        error_sample = $3,
+        lease_expires_at = NULL,
+        worker_id = '',
+        finished_at = now(),
+        updated_at = now()
+    WHERE r.id = $1 AND r.worker_id = $4
+    RETURNING r.id AS run_id
+), purged AS (
+    DELETE FROM external_issue_sync_run_item
+    WHERE run_id IN (SELECT run_id FROM finished)
+    RETURNING 1
+)
+SELECT (SELECT count(*) FROM finished) AS finished
+`
+
+type FinishExternalIssueSyncRunAndPurgeLedgerParams struct {
+	ID          pgtype.UUID `json:"id"`
+	State       string      `json:"state"`
+	ErrorSample []byte      `json:"error_sample"`
+	WorkerID    string      `json:"worker_id"`
+}
+
+// Atomic finish + ledger purge for a NON-RESUMABLE terminal state
+// (succeeded/partial/cancelled): the run row transition and the delete of its
+// identity ledger happen in ONE statement, so a crash can never leave a finished
+// run with an orphaned ledger (the old two-step "finish then best-effort delete"
+// leaked rows permanently when it died between the steps, since a terminal run is
+// never re-claimed). Fenced on worker_id. Returns finished=1 when this worker
+// actually finalized the run (0 = lease lost), independent of how many ledger
+// rows were purged.
+func (q *Queries) FinishExternalIssueSyncRunAndPurgeLedger(ctx context.Context, arg FinishExternalIssueSyncRunAndPurgeLedgerParams) (int64, error) {
+	row := q.db.QueryRow(ctx, finishExternalIssueSyncRunAndPurgeLedger,
+		arg.ID,
+		arg.State,
+		arg.ErrorSample,
+		arg.WorkerID,
+	)
+	var finished int64
+	err := row.Scan(&finished)
+	return finished, err
+}
+
 const getExternalIssueLinkByIdentity = `-- name: GetExternalIssueLinkByIdentity :one
 
 SELECT id, workspace_id, provider, instance_key, external_issue_id, source_id, issue_id, display_number, external_html_url, remote_state, remote_updated_at, title_baseline_hash, body_baseline_hash, title_conflict, body_conflict, title_local_owned, body_local_owned, moved, local_deleted_at, created_at, updated_at FROM external_issue_link
@@ -766,6 +786,50 @@ type GetExternalIssueSourceParams struct {
 
 func (q *Queries) GetExternalIssueSource(ctx context.Context, arg GetExternalIssueSourceParams) (ExternalIssueSource, error) {
 	row := q.db.QueryRow(ctx, getExternalIssueSource, arg.ID, arg.WorkspaceID)
+	var i ExternalIssueSource
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Provider,
+		&i.InstanceKey,
+		&i.CredentialID,
+		&i.RepositoryExternalID,
+		&i.RepositoryFullPath,
+		&i.TargetProjectID,
+		&i.Filter,
+		&i.Mode,
+		&i.State,
+		&i.ConfiguredByUserID,
+		&i.LastReconciledAt,
+		&i.NextReconcileAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getExternalIssueSourceByIdentity = `-- name: GetExternalIssueSourceByIdentity :one
+SELECT id, workspace_id, provider, instance_key, credential_id, repository_external_id, repository_full_path, target_project_id, filter, mode, state, configured_by_user_id, last_reconciled_at, next_reconcile_at, created_at, updated_at FROM external_issue_source
+WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND repository_external_id = $4
+`
+
+type GetExternalIssueSourceByIdentityParams struct {
+	WorkspaceID          pgtype.UUID `json:"workspace_id"`
+	Provider             string      `json:"provider"`
+	InstanceKey          string      `json:"instance_key"`
+	RepositoryExternalID string      `json:"repository_external_id"`
+}
+
+// Look up the existing source for a repo BEFORE upserting, so an import request
+// can compare inputs against an already-active run without first mutating the
+// source row. Matches the UpsertExternalIssueSource conflict key.
+func (q *Queries) GetExternalIssueSourceByIdentity(ctx context.Context, arg GetExternalIssueSourceByIdentityParams) (ExternalIssueSource, error) {
+	row := q.db.QueryRow(ctx, getExternalIssueSourceByIdentity,
+		arg.WorkspaceID,
+		arg.Provider,
+		arg.InstanceKey,
+		arg.RepositoryExternalID,
+	)
 	var i ExternalIssueSource
 	err := row.Scan(
 		&i.ID,
@@ -1226,6 +1290,45 @@ func (q *Queries) ResolveExternalIssueLinkField(ctx context.Context, arg Resolve
 		arg.TitleOwned,
 		arg.BodyInScope,
 		arg.BodyOwned,
+	)
+	return err
+}
+
+const resumeExternalIssueLinkField = `-- name: ResumeExternalIssueLinkField :exec
+UPDATE external_issue_link SET
+    title_local_owned   = CASE WHEN $3 THEN false ELSE title_local_owned END,
+    body_local_owned    = CASE WHEN $4  THEN false ELSE body_local_owned  END,
+    title_conflict      = CASE WHEN $3 THEN false ELSE title_conflict END,
+    body_conflict       = CASE WHEN $4  THEN false ELSE body_conflict  END,
+    title_baseline_hash = CASE WHEN $3 THEN $5 ELSE title_baseline_hash END,
+    body_baseline_hash  = CASE WHEN $4  THEN $6  ELSE body_baseline_hash  END,
+    updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+`
+
+type ResumeExternalIssueLinkFieldParams struct {
+	ID            pgtype.UUID `json:"id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	TitleInScope  bool        `json:"title_in_scope"`
+	BodyInScope   bool        `json:"body_in_scope"`
+	TitleBaseline string      `json:"title_baseline"`
+	BodyBaseline  string      `json:"body_baseline"`
+}
+
+// resume_sync for the scoped fields: clear local ownership + conflict AND advance
+// the baseline to the CURRENT local content hash. Advancing the baseline is what
+// makes resume meaningful — otherwise local still differs from the stale baseline
+// and the very next sync re-raises the same conflict. After this, local == the
+// new baseline, so a later remote change flows in cleanly (remoteChanged &&
+// !localChanged -> take remote). Out-of-scope fields are untouched.
+func (q *Queries) ResumeExternalIssueLinkField(ctx context.Context, arg ResumeExternalIssueLinkFieldParams) error {
+	_, err := q.db.Exec(ctx, resumeExternalIssueLinkField,
+		arg.ID,
+		arg.WorkspaceID,
+		arg.TitleInScope,
+		arg.BodyInScope,
+		arg.TitleBaseline,
+		arg.BodyBaseline,
 	)
 	return err
 }

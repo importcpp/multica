@@ -151,8 +151,12 @@ func writeIssuesJSON(w http.ResponseWriter, issues []map[string]any) {
 		if i > 0 {
 			fmt.Fprint(w, ",")
 		}
-		fmt.Fprintf(w, `{"id":%d,"number":%d,"title":%q,"state":"open","html_url":"h","updated_at":"2026-01-01T00:00:00Z"}`,
-			iss["id"], iss["number"], iss["title"])
+		state := "open"
+		if s, ok := iss["state"].(string); ok && s != "" {
+			state = s
+		}
+		fmt.Fprintf(w, `{"id":%d,"number":%d,"title":%q,"state":%q,"html_url":"h","updated_at":"2026-01-01T00:00:00Z"}`,
+			iss["id"], iss["number"], iss["title"], state)
 	}
 	fmt.Fprint(w, "]")
 }
@@ -734,13 +738,16 @@ func seedSyncWorkerFixtureDynamic(t *testing.T, pages *[][]map[string]any) (work
 	return workspaceID, sourceID
 }
 
-// A page-cursor scan can MISS an issue that shifts into an already-consumed page
-// between claims. Reproduction: N=syncRunPagesPerClaim+1 pages of one issue each;
-// the first claim consumes all but the last page, then the earliest issue closes
-// (drops out), pushing the final issue back one page — into a page the worker
-// already passed. Without a fixpoint reconcile the resume reads an empty tail and
-// finishes short. Regression for codex56 round-4 P0 #1.
-func TestSyncWorkerReconcilesPageShiftAcrossClaims(t *testing.T) {
+// Membership shifting mid-scan must NOT drop a still-matching issue. The worker
+// scans the STABLE SUPERSET (state=all, created asc) and filters locally, so an
+// issue closing during the scan stays in the served list at its immutable
+// position instead of vanishing and shifting the tail into an already-consumed
+// page. Reproduction of codex56 round-4 P0: N pages of one open issue each; after
+// the first claim consumes all but the last page, the earliest issue closes.
+// Under the old filtered (state=open) scan this shifted the final issue into a
+// consumed page and it was lost (imported=N-1, succeeded). Under the superset
+// scan every issue keeps its page, so all N are visited and imported.
+func TestSyncWorkerSupersetScanNoLossOnMidScanClose(t *testing.T) {
 	n := syncRunPagesPerClaim + 1
 	var pages [][]map[string]any
 	for i := 0; i < n; i++ {
@@ -762,13 +769,23 @@ func TestSyncWorkerReconcilesPageShiftAcrossClaims(t *testing.T) {
 		t.Fatalf("after first claim state = %q, want queued", st)
 	}
 
-	// The earliest issue closes: drop page 0, which shifts every later issue back
-	// one page. The final issue (id=n) now lives on a page the worker already
-	// consumed; a naive cursor resume from the tail would never re-fetch it.
-	live = live[1:]
+	// The earliest issue closes. In the state=all superset it STAYS in the list
+	// (only its state flips to closed) at the same created-position, so no later
+	// issue shifts pages. A deep-copy flip of page 0's single issue.
+	closed := make([][]map[string]any, len(live))
+	for i := range live {
+		row := make(map[string]any, len(live[i][0]))
+		for k, v := range live[i][0] {
+			row[k] = v
+		}
+		if i == 0 {
+			row["state"] = "closed"
+		}
+		closed[i] = []map[string]any{row}
+	}
+	live = closed
 
-	// Drain to terminal. The reconcile pass must re-scan from the top and pick up
-	// the shifted issue.
+	// Drain to terminal in a single forward pass — no reconcile re-scan.
 	for i := 0; i < 40; i++ {
 		if _, err := w.ProcessNext(context.Background()); err != nil {
 			t.Fatalf("drain claim: %v", err)
@@ -781,9 +798,11 @@ func TestSyncWorkerReconcilesPageShiftAcrossClaims(t *testing.T) {
 	if state != "succeeded" {
 		t.Fatalf("final state = %q, want succeeded", state)
 	}
-	// All n distinct issues must be imported exactly once — none lost to the shift.
+	// The final page's issue (id=n) must be imported — it never shifted pages. The
+	// issue that closed after already being imported stays imported (import is by
+	// identity, not current state). All n must be present.
 	if got := countWsIssues(t, workspaceID); got != n {
-		t.Fatalf("imported issues = %d, want %d (page-shifted issue must not be lost)", got, n)
+		t.Fatalf("imported issues = %d, want %d (superset scan must not lose the tail)", got, n)
 	}
 }
 
@@ -948,5 +967,41 @@ func TestSyncWorkerKeepsLedgerOnQuotaBlocked(t *testing.T) {
 	}
 	if n := ledgerRowCount(t, runID); n == 0 {
 		t.Fatal("ledger rows after quota_blocked = 0, want > 0 (resumable state must keep ledger)")
+	}
+}
+
+// The superset scan (state=all) must import ONLY issues matching the requested
+// state — closed issues in the superset are filtered locally when importing open.
+func TestSyncWorkerSupersetScanFiltersRequestedState(t *testing.T) {
+	// One page mixing open and closed; the source filter is state=open (default
+	// from seedSyncWorkerFixture's source row).
+	pages := [][]map[string]any{{
+		issue(1, 1, "open-a"),
+		{"id": 2, "number": 2, "title": "closed-b", "state": "closed"},
+		issue(3, 3, "open-c"),
+	}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	w := NewExternalIssueSyncWorker(testHandler)
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" {
+			break
+		}
+	}
+	state, imported, total := runState(t, runID)
+	if state != "succeeded" {
+		t.Fatalf("state = %q, want succeeded", state)
+	}
+	// Only the two open issues import; the closed one is filtered out (not counted).
+	if imported != 2 || total != 2 {
+		t.Fatalf("imported=%d total=%d, want 2/2 (closed issue filtered out)", imported, total)
+	}
+	if n := countWsIssues(t, workspaceID); n != 2 {
+		t.Fatalf("issue rows = %d, want 2", n)
 	}
 }

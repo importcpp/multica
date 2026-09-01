@@ -101,9 +101,17 @@ type ApplyParams struct {
 // The worker treats it as "stop this claim", not a per-issue failure.
 var ErrRunFenced = errors.New("external-issue sync run fence lost")
 
-func contentHash(s string) string {
+// ContentHash is the canonical baseline hash for external-issue content fields
+// (title/body): sha256 hex. The sync applier and the conflict-resolution handler
+// must agree on it so a resume that advances the baseline to the local value
+// matches what the next sync computes.
+func ContentHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
+}
+
+func contentHash(s string) string {
+	return ContentHash(s)
 }
 
 // Apply upserts one remote issue into Multica in a single transaction and

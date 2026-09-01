@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/integrations/externalissue"
+	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -108,11 +109,15 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 			return
 		}
 	case "resume_sync":
-		// Clear ownership so remote flows again; conflict cleared for those fields.
-		if err := h.Queries.ResolveExternalIssueLinkField(r.Context(), db.ResolveExternalIssueLinkFieldParams{
+		// Clear ownership so remote flows again, AND advance the baseline to the
+		// current local content for the scoped fields. Without advancing, local
+		// still differs from the stale baseline and the next sync re-raises the
+		// same conflict; advancing makes local == baseline so a later remote change
+		// applies cleanly. Hash must match the sync applier's (service.ContentHash).
+		if err := h.Queries.ResumeExternalIssueLinkField(r.Context(), db.ResumeExternalIssueLinkFieldParams{
 			ID: link.ID, WorkspaceID: issue.WorkspaceID,
-			TitleInScope: wantTitle, TitleOwned: false,
-			BodyInScope: wantBody, BodyOwned: false,
+			TitleInScope: wantTitle, TitleBaseline: service.ContentHash(issue.Title),
+			BodyInScope: wantBody, BodyBaseline: service.ContentHash(issue.Description.String),
 		}); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to resume sync")
 			return

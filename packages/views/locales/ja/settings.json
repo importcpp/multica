@@ -724,6 +724,7 @@
     "read_only_hint": "読み取り専用ビューです。GitHub を接続または解除できるのはワークスペースの admin と owner のみです。",
     "contact_admin_to_connect": "このワークスペースには GitHub が接続されていません。admin または owner に GitHub App のセットアップを依頼してください。",
     "connected_by": "{{name}} が接続",
+    "installation_select_label": "インポート元のインストール",
     "toast_not_configured": "このデプロイには GitHub 連携が設定されていません",
     "toast_open_failed": "GitHub のインストール画面を開けませんでした",
     "toast_disconnect_failed": "GitHub App の接続を解除できませんでした",
