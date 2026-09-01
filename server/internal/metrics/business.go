@@ -73,9 +73,10 @@ type BusinessMetrics struct {
 	// agentRuntimeLookup counts logical agent_runtime lookups by product
 	// source — one increment per requested runtime id, whether that id was
 	// resolved by its own point read or as one element of a batch query, so
-	// the counter is a lookup rate and NOT a database-query QPS. Every source
-	// shares one SQL fingerprint, so this is the only place the split between
-	// daemon heartbeats, browser polling, and readiness gates is observable.
+	// the counter is a lookup rate and NOT a database-query QPS. Point reads
+	// share one SQL fingerprint and batch reads use another; this counter adds
+	// the product-source attribution that neither query shape exposes on its
+	// own, including daemon heartbeats, browser polling, and readiness gates.
 	// See labels.go for the closed enum.
 	agentRuntimeLookup *prometheus.CounterVec
 

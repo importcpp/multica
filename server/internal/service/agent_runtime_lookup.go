@@ -15,13 +15,12 @@ import (
 // RuntimeLookup is the only way production code reads agent_runtime rows by id
 // (MUL-6884) — one row via Get, or many in one query via GetMany.
 //
-// The query itself is a primary-key point read and has never been the problem.
-// What is missing is attribution: daemon heartbeats, browser polling loops, and
-// a dozen readiness gates all issue the same statement, so pg_stat_statements
-// can report that agent_runtime is one of the busiest reads in the system while
-// saying nothing about which product behaviour is driving it. Routing every
-// read through one type, carrying the source with it, is what makes that
-// question answerable before anyone starts changing heartbeat intervals.
+// Point-read callers share one SQL fingerprint, while GetMany uses a separate
+// batch-query fingerprint. pg_stat_statements can show that either query is
+// busy, but not whether daemon heartbeats, browser polling loops, or readiness
+// gates are driving it. Routing both query shapes through one type, carrying
+// the source with each lookup, makes that question answerable before anyone
+// starts changing heartbeat intervals.
 //
 // Source is a closed enum from the metrics package (obsmetrics.RuntimeLookupSource*).
 // Metrics may be nil — tests and self-hosted deployments without the metrics
