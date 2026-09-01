@@ -59,7 +59,11 @@ vi.mock("@tanstack/react-query", () => ({
   useQueryClient: () => ({
     setQueryData: mockSetQueryData,
     invalidateQueries: mockInvalidate,
+    fetchQuery: (opts: { queryFn: () => unknown }) => opts.queryFn(),
   }),
+  // The import dialog's core mutation hooks call useMutation; return an inert
+  // mutation so the tab renders (this test never triggers an import).
+  useMutation: () => ({ mutateAsync: vi.fn(), mutate: vi.fn(), isPending: false }),
   queryOptions: <T,>(opts: T) => opts,
   infiniteQueryOptions: <T,>(opts: T) => opts,
 }));

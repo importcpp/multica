@@ -16,8 +16,18 @@ import (
 // adapter at an httptest server; production always uses the default.
 var apiBase = "https://api.github.com"
 
-// githubMaxPerPage is GitHub's hard cap for the issues list endpoint.
-const githubMaxPerPage = 100
+// githubMaxPerPage is GitHub's hard cap for the issues list endpoint. It is a
+// var (not const) only so tests can shrink it to force multi-page keyset
+// pagination without seeding hundreds of fixture issues; production is always 100.
+var githubMaxPerPage = 100
+
+// SetMaxPerPageForTest overrides the page size and returns a restore func.
+// Test-only.
+func SetMaxPerPageForTest(n int) func() {
+	prev := githubMaxPerPage
+	githubMaxPerPage = n
+	return func() { githubMaxPerPage = prev }
+}
 
 // githubProvider implements Provider against the GitHub REST API. It is
 // stateless: the resolved token arrives per-call in Credentials, so this
@@ -103,28 +113,73 @@ type githubIssue struct {
 }
 
 func (p githubProvider) ListIssues(ctx context.Context, creds Credentials, repo Repository, filter IssueFilter, cursor Cursor) (IssuePage, error) {
-	endpoint, err := p.listURL(creds, repo, filter, cursor)
+	since, err := parseKeysetCursor(cursor, filter)
+	if err != nil {
+		return IssuePage{}, err
+	}
+	endpoint, err := p.listURL(creds, repo, filter, since)
 	if err != nil {
 		return IssuePage{}, err
 	}
 	var raw []githubIssue
-	resp, err := p.doJSON(ctx, creds, endpoint, &raw)
-	if err != nil {
+	if _, err := p.doJSON(ctx, creds, endpoint, &raw); err != nil {
 		return IssuePage{}, err
 	}
 	page := IssuePage{Issues: make([]Issue, 0, len(raw))}
+	var maxUpdated time.Time
 	for _, gi := range raw {
 		if gi.PullRequest != nil {
 			continue // the issues endpoint mixes in PRs; drop them.
 		}
 		page.Issues = append(page.Issues, normalizeIssue(gi))
+		if t, perr := time.Parse(time.RFC3339, gi.UpdatedAt); perr == nil && t.After(maxUpdated) {
+			maxUpdated = t
+		}
 	}
-	next, err := p.nextCursor(creds, resp.Header.Get("Link"))
-	if err != nil {
-		return IssuePage{}, err
-	}
-	page.NextCursor = next
+	page.NextCursor = nextKeysetCursor(len(raw), since, maxUpdated)
 	return page, nil
+}
+
+// parseKeysetCursor decodes the value-anchored cursor, which is simply the
+// RFC3339 `since` lower bound (empty = the filter's UpdatedAfter, or zero = the
+// whole history). Enumerating by the updated_at VALUE — never a page offset into
+// a live list — is what makes the scan safe against a concurrent delete/transfer:
+// those only shrink the result set; a surviving issue keeps its updated_at, so it
+// still appears at or after the anchor we resume from. A page offset would, by
+// contrast, shift when an earlier issue disappears (that was the round-6 bug).
+func parseKeysetCursor(cursor Cursor, filter IssueFilter) (since time.Time, err error) {
+	if cursor == "" {
+		return filter.UpdatedAfter, nil
+	}
+	t, perr := time.Parse(time.RFC3339, string(cursor))
+	if perr != nil {
+		return time.Time{}, &Error{Kind: ErrPermanent, Err: fmt.Errorf("malformed cursor")}
+	}
+	return t, nil
+}
+
+// nextKeysetCursor computes the next `since`, or "" when the scan is complete.
+//
+//   - A short page (< per_page) is the last page → done.
+//   - Otherwise advance `since` to the newest updated_at on this page. GitHub's
+//     `since` is INCLUSIVE, so the boundary issue is re-fetched next round; the
+//     identity ledger dedupes it. This costs ~one duplicate per full page (≈1% at
+//     per_page=100) in exchange for delete/transfer safety.
+//   - If a FULL page shares the anchor second (maxUpdated == since, so the value
+//     cannot advance), bump `since` by one second to guarantee progress. This is
+//     the ONLY lossy edge: >per_page issues updated in the SAME second would skip
+//     the overflow. It is documented best-effort (see IssueFilter) and, for
+//     completeness, converges via the low-frequency reconcile/webhook path.
+func nextKeysetCursor(rawCount int, since time.Time, maxUpdated time.Time) Cursor {
+	if rawCount < githubMaxPerPage {
+		return ""
+	}
+	next := maxUpdated
+	if maxUpdated.IsZero() || !maxUpdated.After(since) {
+		// Whole page at/under the anchor second: force progress by one second.
+		next = since.Add(time.Second)
+	}
+	return Cursor(next.UTC().Format(time.RFC3339))
 }
 
 func (p githubProvider) GetIssue(ctx context.Context, creds Credentials, repo Repository, ref IssueRef) (Issue, error) {
@@ -143,17 +198,13 @@ func (p githubProvider) GetIssue(ctx context.Context, creds Credentials, repo Re
 	return normalizeIssue(gi), nil
 }
 
-// listURL builds the first-page URL from the filter, or reuses the opaque cursor
-// for subsequent pages. The cursor is a full GitHub-minted next URL; before
-// trusting it we confirm it stays on the same approved origin and path — a
-// server that returned a cross-host Link must not redirect our bearer token.
-func (p githubProvider) listURL(creds Credentials, repo Repository, filter IssueFilter, cursor Cursor) (string, error) {
-	if cursor != "" {
-		if err := p.assertSameEndpoint(creds, repo, string(cursor)); err != nil {
-			return "", err
-		}
-		return string(cursor), nil
-	}
+// listURL builds the issues list URL for a value-anchored keyset page. Every URL
+// is constructed here from the trusted API base + repo path and the cursor's
+// (since, page) VALUES — the cursor is never a server-minted URL, so there is no
+// Link-header SSRF surface to validate. We always sort by updated_at asc so the
+// `since` lower bound advances monotonically by value; deletions/transfers only
+// remove rows, they never reorder survivors past the anchor.
+func (p githubProvider) listURL(creds Credentials, repo Repository, filter IssueFilter, since time.Time) (string, error) {
 	owner, name, err := splitFullPath(repo.FullPath)
 	if err != nil {
 		return "", &Error{Kind: ErrPermanent, Err: err}
@@ -165,87 +216,15 @@ func (p githubProvider) listURL(creds Credentials, repo Repository, filter Issue
 	}
 	q.Set("state", state)
 	q.Set("per_page", strconv.Itoa(githubMaxPerPage))
-	q.Set("sort", "created")
+	q.Set("sort", "updated")
 	q.Set("direction", "asc")
 	if len(filter.Labels) > 0 {
 		q.Set("labels", strings.Join(filter.Labels, ","))
 	}
-	if !filter.UpdatedAfter.IsZero() {
-		q.Set("since", filter.UpdatedAfter.UTC().Format(time.RFC3339))
+	if !since.IsZero() {
+		q.Set("since", since.UTC().Format(time.RFC3339))
 	}
 	return fmt.Sprintf("%s/repos/%s/%s/issues?%s", p.base(creds), url.PathEscape(owner), url.PathEscape(name), q.Encode()), nil
-}
-
-// nextCursor extracts the rel="next" URL from a Link header, returning "" when
-// there is no next page. The returned URL is validated for same-origin/path on
-// the way back IN (listURL), not here, so a stored cursor is re-checked even if
-// it was persisted between runs.
-func (p githubProvider) nextCursor(creds Credentials, link string) (Cursor, error) {
-	next := parseLinkNext(link)
-	if next == "" {
-		return "", nil
-	}
-	if err := p.assertSameOriginPath(creds, next); err != nil {
-		return "", err
-	}
-	return Cursor(next), nil
-}
-
-// assertSameEndpoint validates a cursor URL points at the issues LIST endpoint
-// of THIS repository on the approved origin — not merely some path containing
-// "/issues". GitHub's own next link is one of:
-//   - /repos/{owner}/{name}/issues
-//   - /repositories/{externalID}/issues
-//
-// so we accept exactly those two shapes for this repo and reject anything else
-// (a same-host link to another repo, another resource, or a deeper path).
-func (p githubProvider) assertSameEndpoint(creds Credentials, repo Repository, raw string) error {
-	u, err := p.parseSameOrigin(creds, raw)
-	if err != nil {
-		return err
-	}
-	path := strings.TrimRight(u.Path, "/")
-	byFullPath := "/repos/" + repo.FullPath + "/issues"
-	byID := "/repositories/" + repo.ExternalID + "/issues"
-	if !strings.EqualFold(path, byFullPath) && path != byID {
-		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL path %q is not this repo's issues endpoint", u.Path)}
-	}
-	return nil
-}
-
-// assertSameOriginPath rejects any URL whose scheme/host differs from the
-// approved API base, or whose path is not an issues endpoint. Used for the
-// rel="next" URL when the concrete repo endpoint shapes are already known to
-// listURL; the stricter per-repo check is assertSameEndpoint.
-func (p githubProvider) assertSameOriginPath(creds Credentials, raw string) error {
-	u, err := p.parseSameOrigin(creds, raw)
-	if err != nil {
-		return err
-	}
-	// GitHub's own next link may point at /repositories/{id}/issues rather than
-	// /repos/{owner}/{name}/issues; both are legitimate REST issue paths.
-	if !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/issues") {
-		return &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL path %q is not an issues endpoint", u.Path)}
-	}
-	return nil
-}
-
-// parseSameOrigin parses raw and confirms it shares the approved API base's
-// scheme+host, blocking a malicious Link from redirecting an authenticated
-// request to an attacker host (SSRF / token exfiltration).
-func (p githubProvider) parseSameOrigin(creds Credentials, raw string) (*url.URL, error) {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid pagination URL: %w", err)}
-	}
-	baseU, err := url.Parse(p.base(creds))
-	if err != nil {
-		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("invalid api base: %w", err)}
-	}
-	if !strings.EqualFold(u.Scheme, baseU.Scheme) || !strings.EqualFold(u.Host, baseU.Host) {
-		return nil, &Error{Kind: ErrPermanent, Err: fmt.Errorf("pagination URL host %q not on approved origin %q", u.Host, baseU.Host)}
-	}
-	return u, nil
 }
 
 // doJSON performs a GET and decodes a 2xx body into out. Non-2xx responses are
@@ -351,32 +330,6 @@ func normalizeIssue(gi githubIssue) Issue {
 		RemoteUpdatedAt: gi.UpdatedAt,
 		ClosedAt:        gi.ClosedAt,
 	}
-}
-
-// parseLinkNext extracts the URL whose rel is "next" from an RFC 5988 Link
-// header, or "" when absent.
-func parseLinkNext(link string) string {
-	if link == "" {
-		return ""
-	}
-	for _, part := range strings.Split(link, ",") {
-		segs := strings.Split(strings.TrimSpace(part), ";")
-		if len(segs) < 2 {
-			continue
-		}
-		rawURL := strings.TrimSpace(segs[0])
-		if !strings.HasPrefix(rawURL, "<") || !strings.HasSuffix(rawURL, ">") {
-			continue
-		}
-		rawURL = rawURL[1 : len(rawURL)-1]
-		for _, attr := range segs[1:] {
-			attr = strings.TrimSpace(attr)
-			if attr == `rel="next"` || attr == "rel=next" {
-				return rawURL
-			}
-		}
-	}
-	return ""
 }
 
 func splitFullPath(full string) (owner, name string, err error) {

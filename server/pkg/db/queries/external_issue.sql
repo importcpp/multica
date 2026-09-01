@@ -37,6 +37,15 @@ WHERE id = $1 AND workspace_id = $2;
 SELECT * FROM external_issue_source
 WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND repository_external_id = $4;
 
+-- name: LockExternalIssueImportIdentity :exec
+-- Transaction-scoped advisory lock keyed on (workspace, provider, instance,
+-- repo). Serializes concurrent import requests for the SAME repository so the
+-- source upsert + active-run snapshot compare + run create happen without a
+-- TOCTOU race: two requests can no longer both pass the pre-check. Auto-released
+-- on commit/rollback. The two-int form namespaces on a constant so it can't
+-- collide with other advisory-lock users.
+SELECT pg_advisory_xact_lock(sqlc.arg('namespace')::int, sqlc.arg('identity')::int);
+
 -- name: ListExternalIssueSourcesByWorkspace :many
 SELECT * FROM external_issue_source
 WHERE workspace_id = $1
@@ -89,6 +98,17 @@ WHERE workspace_id = $1 AND provider = $2 AND instance_key = $3 AND external_iss
 -- name: GetExternalIssueLinkByIssue :one
 SELECT * FROM external_issue_link
 WHERE workspace_id = $1 AND issue_id = $2;
+
+-- name: LockExternalIssueLinkByIssue :one
+-- Like GetExternalIssueLinkByIssue but takes the link row FOR UPDATE. Every path
+-- that mutates a linked issue's content MUST acquire link BEFORE issue (the sync
+-- applier's claim locks link first, then issue): "use remote" previously read the
+-- link unlocked, locked the issue, then updated the link, which is the reverse
+-- order and deadlocks against a concurrent Apply. Locking link first here unifies
+-- the order to link -> issue.
+SELECT * FROM external_issue_link
+WHERE workspace_id = $1 AND issue_id = $2
+FOR UPDATE;
 
 -- name: ResumeExternalIssueLinkField :exec
 -- resume_sync for the scoped fields: clear local ownership + conflict AND advance
@@ -230,24 +250,26 @@ WHERE id = (
 RETURNING *;
 
 -- name: CheckpointExternalIssueSyncRunCursor :execrows
--- Lightweight interior-page checkpoint: persist ONLY the cursor and refreshed
--- lease, without re-aggregating the identity ledger. Fenced on worker_id. Full
--- count aggregation is expensive (a scan of the run's ledger) and only needs to
--- happen at claim EXIT points, so interior pages use this to keep the resume
--- cursor crash-safe at O(1); the counts on the run row may lag within a claim and
+-- Lightweight interior-page checkpoint: persist the cursor, the refreshed lease,
+-- and the running scanned_count (cheap, non-aggregated progress), WITHOUT
+-- re-aggregating the identity ledger. Fenced on worker_id. Full count
+-- aggregation is expensive (a scan of the run's ledger) and only needs to happen
+-- at claim EXIT points, so interior pages use this to keep the resume cursor
+-- crash-safe at O(1); the matched counts on the run row may lag within a claim and
 -- are refreshed authoritatively at the next exit / next claim start.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     lease_expires_at = $3,
+    scanned_count = sqlc.arg('scanned_count'),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 
 -- name: AdvanceExternalIssueSyncRun :execrows
--- Persist page progress: new cursor, refreshed lease, and the running counts.
+-- Persist scan progress: new cursor, refreshed lease, and the running counts.
 -- Fenced on worker_id: if the lease was stolen by another worker, this updates
--- zero rows and the caller must stop writing to the run. page_offset records how
--- many items of the CURRENT page are already accounted (0 once a full page
--- commits) so a mid-page resume does not re-count.
+-- zero rows and the caller must stop writing to the run. The cursor is the
+-- provider's value-anchored keyset token; resume replays from it, and the
+-- identity ledger dedupes the inclusive-boundary overlap.
 UPDATE external_issue_sync_run SET
     cursor = $2,
     imported_count = $3,
@@ -257,7 +279,7 @@ UPDATE external_issue_sync_run SET
     failed_count = $7,
     total_seen = $8,
     lease_expires_at = $9,
-    page_offset = sqlc.arg('page_offset'),
+    scanned_count = sqlc.arg('scanned_count'),
     updated_at = now()
 WHERE id = $1 AND worker_id = sqlc.arg('worker_id');
 

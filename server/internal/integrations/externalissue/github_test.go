@@ -57,75 +57,78 @@ func TestListIssuesFiltersPullRequests(t *testing.T) {
 	}
 }
 
-func TestListIssuesPaginationStops(t *testing.T) {
+// The keyset cursor advances by the updated_at VALUE (since=), not a page
+// offset, so a full page yields a NextCursor anchored at that page's newest
+// updated_at, and a short page ends the scan.
+func TestListIssuesKeysetAdvancesBySinceValue(t *testing.T) {
+	// Page 1: a full page (per_page) all sharing distinct updated_at; page 2:
+	// short page ends the scan. Assert the second request carries since=<max of
+	// page 1> and sort=updated&direction=asc.
+	var sawSecondSince string
 	var hits int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits++
-		if r.URL.Query().Get("page") == "2" {
-			// last page: no Link header
-			fmt.Fprint(w, `[{"id":9,"number":9,"title":"last","state":"open"}]`)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("sort") != "updated" || r.URL.Query().Get("direction") != "asc" {
+			t.Errorf("want sort=updated&direction=asc, got %q", r.URL.RawQuery)
+		}
+		if since := r.URL.Query().Get("since"); since != "" {
+			sawSecondSince = since
+			// Second page: one issue, short -> ends scan.
+			fmt.Fprint(w, `[{"id":999,"number":999,"title":"tail","state":"open","updated_at":"2026-03-01T00:00:00Z"}]`)
 			return
 		}
-		// first page advertises a same-origin next
-		w.Header().Set("Link", fmt.Sprintf(`<%s/repos/o/r/issues?page=2>; rel="next"`, apiBaseForLink(r)))
-		fmt.Fprint(w, `[{"id":8,"number":8,"title":"first","state":"open"}]`)
+		// First page: exactly per_page issues so the scan continues; newest is
+		// 2026-02-02.
+		fmt.Fprint(w, "[")
+		for i := 0; i < githubMaxPerPage; i++ {
+			if i > 0 {
+				fmt.Fprint(w, ",")
+			}
+			day := 1
+			if i == githubMaxPerPage-1 {
+				day = 2
+			}
+			fmt.Fprintf(w, `{"id":%d,"number":%d,"title":"i%d","state":"open","updated_at":"2026-02-0%dT00:00:00Z"}`, i+1, i+1, i+1, day)
+		}
+		fmt.Fprint(w, "]")
 	}))
 	defer srv.Close()
 	withAPIBase(t, srv.URL)
 
 	p := githubProvider{}
 	repo := Repository{FullPath: "o/r"}
-	var cursor Cursor
-	var all []Issue
-	for {
-		page, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{}, cursor)
-		if err != nil {
-			t.Fatalf("ListIssues: %v", err)
-		}
-		all = append(all, page.Issues...)
-		if page.NextCursor == "" {
-			break
-		}
-		cursor = page.NextCursor
+	page1, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, "")
+	if err != nil {
+		t.Fatalf("page1: %v", err)
 	}
-	if len(all) != 2 {
-		t.Fatalf("want 2 issues across 2 pages, got %d", len(all))
+	if page1.NextCursor == "" {
+		t.Fatal("full first page must yield a next cursor")
+	}
+	page2, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, page1.NextCursor)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if page2.NextCursor != "" {
+		t.Fatalf("short second page must end the scan, got cursor %q", page2.NextCursor)
+	}
+	if sawSecondSince != "2026-02-02T00:00:00Z" {
+		t.Fatalf("second request since = %q, want the newest updated_at from page 1", sawSecondSince)
 	}
 	if hits != 2 {
-		t.Fatalf("want exactly 2 requests, got %d", hits)
+		t.Fatalf("want 2 requests, got %d", hits)
 	}
 }
 
-// apiBaseForLink returns the server origin the test handler is being hit on, so
-// the injected Link stays same-origin (the SSRF guard requires it).
-func apiBaseForLink(r *http.Request) string {
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
-}
-
-func TestNextCursorRejectsForeignHost(t *testing.T) {
-	withAPIBase(t, "https://api.github.com")
-	p := githubProvider{}
-	_, err := p.nextCursor(Credentials{}, `<https://evil.example.com/repos/o/r/issues?page=2>; rel="next"`)
-	if err == nil {
-		t.Fatal("expected rejection of cross-host cursor")
-	}
-	var e *Error
-	if !errors.As(err, &e) || e.Kind != ErrPermanent {
-		t.Fatalf("want ErrPermanent, got %v", err)
-	}
-}
-
-func TestListIssuesRejectsMaliciousCursor(t *testing.T) {
+// A malformed persisted cursor is rejected as permanent (not silently treated as
+// a fresh scan), so a corrupted checkpoint fails loudly rather than re-importing.
+func TestListIssuesRejectsMalformedCursor(t *testing.T) {
 	withAPIBase(t, "https://api.github.com")
 	p := githubProvider{}
 	repo := Repository{FullPath: "o/r"}
-	_, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{}, Cursor("https://evil.example.com/steal?token=1"))
+	_, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{}, Cursor("not-a-cursor"))
 	if err == nil {
-		t.Fatal("expected malicious cursor to be rejected before any request")
+		t.Fatal("expected malformed cursor to be rejected")
 	}
 	var e *Error
 	if !errors.As(err, &e) || e.Kind != ErrPermanent {
@@ -228,14 +231,13 @@ func TestListURLBuildsFilter(t *testing.T) {
 	p := githubProvider{}
 	withAPIBase(t, "https://api.github.com")
 	u, err := p.listURL(Credentials{}, Repository{FullPath: "o/r"}, IssueFilter{
-		State:        "all",
-		Labels:       []string{"bug", "p0"},
-		UpdatedAfter: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC),
-	}, "")
+		State:  "all",
+		Labels: []string{"bug", "p0"},
+	}, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"state=all", "per_page=100", "labels=bug%2Cp0", "since=2026-01-02T03%3A04%3A05Z"} {
+	for _, want := range []string{"state=all", "per_page=100", "sort=updated", "direction=asc", "labels=bug%2Cp0", "since=2026-01-02T03%3A04%3A05Z"} {
 		if !strings.Contains(u, want) {
 			t.Errorf("listURL missing %q in %s", want, u)
 		}

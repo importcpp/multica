@@ -759,6 +759,7 @@
       "close": "閉じる",
       "submit": "インポート",
       "summary": "{{imported}} 件作成 · {{updated}} 件更新 · {{conflicts}} 件競合 · {{skipped}} 件スキップ · {{failed}} 件失敗",
+      "scanned": "リモート issue を {{scanned}} 件スキャン…",
       "toast_permission": "この GitHub インストールには Issues の読み取り権限がありません。アプリを再認可してから再試行してください。",
       "toast_failed": "インポートに失敗しました",
       "toast_queued": "インポートをキューに追加しました。進捗は下に表示されます。",

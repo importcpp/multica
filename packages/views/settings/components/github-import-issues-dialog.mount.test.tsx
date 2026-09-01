@@ -10,13 +10,19 @@ const mockImport = vi.hoisted(() => vi.fn());
 const mockResume = vi.hoisted(() => vi.fn());
 const mockGetRun = vi.hoisted(() => vi.fn());
 const mockPreview = vi.hoisted(() => vi.fn());
+const mockCancel = vi.hoisted(() => vi.fn());
 const mockInvalidate = vi.hoisted(() => vi.fn());
 // Repos surfaced by the installation picker; empty by default so tests that
 // don't care fall back to the manual owner/repo <Input>.
 const repoState = vi.hoisted(() => ({ repositories: [] as { id: number; full_name: string }[] }));
 
 vi.mock("@tanstack/react-query", () => ({
-  useQueryClient: () => ({ invalidateQueries: mockInvalidate }),
+  useQueryClient: () => ({
+    invalidateQueries: mockInvalidate,
+    // The dialog polls via qc.fetchQuery(externalIssueSyncRunOptions(...)); the
+    // options carry the queryFn, so invoke it to reach the mocked getRun.
+    fetchQuery: (opts: { queryFn: () => unknown }) => opts.queryFn(),
+  }),
   queryOptions: <T,>(opts: T) => opts,
   infiniteQueryOptions: <T,>(opts: T) => opts,
   useInfiniteQuery: () => ({
@@ -28,19 +34,17 @@ vi.mock("@tanstack/react-query", () => ({
   }),
 }));
 
-vi.mock("@multica/core/api", () => ({
-  api: {
-    importGitHubIssues: (...a: unknown[]) => mockImport(...a),
-    resumeExternalIssueSyncRun: (...a: unknown[]) => mockResume(...a),
-    getExternalIssueSyncRun: (...a: unknown[]) => mockGetRun(...a),
-    previewGitHubIssues: (...a: unknown[]) => mockPreview(...a),
-    cancelExternalIssueSyncRun: vi.fn(),
-  },
-}));
-
 vi.mock("@multica/core/github", () => ({
   githubKeys: { all: () => ["github"] },
   githubInstallationRepositoriesOptions: () => ({ queryKey: ["repos"] }),
+  externalIssueSyncRunOptions: (wsId: string, runId: string) => ({
+    queryKey: ["run", wsId, runId],
+    queryFn: () => mockGetRun(wsId, runId),
+  }),
+  usePreviewGitHubIssues: () => ({ mutateAsync: (b: unknown) => mockPreview(b) }),
+  useImportGitHubIssues: () => ({ mutateAsync: (b: unknown) => mockImport(b) }),
+  useResumeExternalIssueSyncRun: () => ({ mutateAsync: (id: unknown) => mockResume(id) }),
+  useCancelExternalIssueSyncRun: () => ({ mutateAsync: (id: unknown) => mockCancel(id) }),
 }));
 vi.mock("@multica/core/issues/queries", () => ({ issueKeys: { all: () => ["issues"] } }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() } }));
@@ -173,9 +177,8 @@ describe("GitHubImportIssuesDialog resume poll", () => {
     await user.click(screen.getByRole("button", { name: "Preview" }));
 
     await waitFor(() => expect(mockPreview).toHaveBeenCalled());
+    // The hook is bound to ws+installation; mutateAsync receives just the body.
     expect(mockPreview).toHaveBeenCalledWith(
-      "ws-1",
-      "inst-1",
       expect.objectContaining({ owner: "acme", repo: "gadgets" }),
     );
   });

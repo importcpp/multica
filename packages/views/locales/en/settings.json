@@ -761,6 +761,7 @@
       "close": "Close",
       "submit": "Import",
       "summary": "{{imported}} imported · {{updated}} updated · {{conflicts}} conflicts · {{skipped}} skipped · {{failed}} failed",
+      "scanned": "Scanned {{scanned}} remote issues…",
       "toast_permission": "This GitHub installation has not granted Issues read access. Re-authorize the app, then try again.",
       "toast_failed": "Import failed",
       "toast_queued": "Import queued. Progress will update below.",

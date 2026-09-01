@@ -759,6 +759,7 @@
       "close": "닫기",
       "submit": "가져오기",
       "summary": "{{imported}}개 생성 · {{updated}}개 업데이트 · {{conflicts}}개 충돌 · {{skipped}}개 건너뜀 · {{failed}}개 실패",
+      "scanned": "원격 이슈 {{scanned}}개 스캔…",
       "toast_permission": "이 GitHub 설치에 Issues 읽기 권한이 없습니다. 앱을 다시 승인한 후 다시 시도하세요.",
       "toast_failed": "가져오기 실패",
       "toast_queued": "가져오기가 대기열에 추가되었습니다. 진행 상황이 아래에 표시됩니다.",

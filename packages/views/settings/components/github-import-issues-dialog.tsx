@@ -17,8 +17,15 @@ import {
 import { Input } from "@multica/ui/components/ui/input";
 import { Label } from "@multica/ui/components/ui/label";
 import type { PreviewGitHubIssuesResponse } from "@multica/core/types";
-import { api } from "@multica/core/api";
-import { githubKeys, githubInstallationRepositoriesOptions } from "@multica/core/github";
+import {
+  githubKeys,
+  githubInstallationRepositoriesOptions,
+  externalIssueSyncRunOptions,
+  usePreviewGitHubIssues,
+  useImportGitHubIssues,
+  useResumeExternalIssueSyncRun,
+  useCancelExternalIssueSyncRun,
+} from "@multica/core/github";
 import { issueKeys } from "@multica/core/issues/queries";
 import type { SyncRunStatus } from "@multica/core/types";
 import { useT } from "../../i18n";
@@ -65,6 +72,11 @@ export function GitHubImportIssuesDialog({
 }: GitHubImportIssuesDialogProps) {
   const { t } = useT("settings");
   const qc = useQueryClient();
+  // Server writes go through core mutations (repo rule: views don't call api.*).
+  const previewMutation = usePreviewGitHubIssues(workspaceId, installationId);
+  const importMutation = useImportGitHubIssues(workspaceId, installationId);
+  const resumeMutation = useResumeExternalIssueSyncRun(workspaceId);
+  const cancelMutation = useCancelExternalIssueSyncRun(workspaceId);
   const [open, setOpen] = useState(false);
   const [fullPath, setFullPath] = useState(defaultFullPath ?? "");
   const [state, setState] = useState<ImportState>("open");
@@ -157,7 +169,7 @@ export function GitHubImportIssuesDialog({
     setPollError(false);
     async function tick() {
       try {
-        const s = await api.getExternalIssueSyncRun(workspaceId, runId!);
+        const s = await qc.fetchQuery(externalIssueSyncRunOptions(workspaceId, runId!));
         if (stopped) return;
         errorPolls = 0;
         setPollError(false);
@@ -205,7 +217,7 @@ export function GitHubImportIssuesDialog({
     if (!runId) return;
     setResuming(true);
     try {
-      const res = await api.resumeExternalIssueSyncRun(workspaceId, runId);
+      const res = await resumeMutation.mutateAsync(runId);
       if (!res.run_id) {
         toast.error(t(($) => $.github.import_issues.toast_failed));
         return;
@@ -230,7 +242,7 @@ export function GitHubImportIssuesDialog({
     setPreview(null);
     setPreviewKey(null);
     try {
-      const res = await api.previewGitHubIssues(workspaceId, installationId, {
+      const res = await previewMutation.mutateAsync({
         owner: parsed.owner,
         repo: parsed.repo,
         state,
@@ -254,7 +266,7 @@ export function GitHubImportIssuesDialog({
     setStarting(true);
     setStatus(null);
     try {
-      const res = await api.importGitHubIssues(workspaceId, installationId, {
+      const res = await importMutation.mutateAsync({
         owner: parsed.owner,
         repo: parsed.repo,
         state,
@@ -286,7 +298,7 @@ export function GitHubImportIssuesDialog({
     if (!runId) return;
     setCancelling(true);
     try {
-      await api.cancelExternalIssueSyncRun(workspaceId, runId);
+      await cancelMutation.mutateAsync(runId);
       toast.success(t(($) => $.github.import_issues.toast_cancel_requested));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t(($) => $.github.import_issues.toast_failed));
@@ -442,6 +454,13 @@ export function GitHubImportIssuesDialog({
                   failed: status.failed,
                 })}
               </span>
+              {/* While the run is active, show how many remote issues have been
+                  scanned so a large repo with few matches still shows progress. */}
+              {isRunning && status.scanned > 0 && (
+                <span className="text-caption text-muted-foreground">
+                  {t(($) => $.github.import_issues.scanned, { scanned: status.scanned })}
+                </span>
+              )}
               {status.errors && status.errors.length > 0 && (
                 <ul className="text-caption text-destructive flex flex-col gap-0.5">
                   {status.errors.slice(0, 5).map((e, i) => (

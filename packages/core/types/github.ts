@@ -172,6 +172,9 @@ export interface SyncRunStatus {
   skipped: number;
   failed: number;
   total: number;
+  /** Remote issues visited so far (matched or filtered); shows progress on a
+   * large repo where `total` (matched issues) stays near 0 for a while. */
+  scanned: number;
   cancel_requested: boolean;
   /** Bounded sample of per-issue failure diagnostics for a partial/failed run. */
   errors: string[];

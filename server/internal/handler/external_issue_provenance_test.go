@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -109,7 +110,7 @@ func TestUseRemoteAppliesRemoteContent(t *testing.T) {
 	if remote.Title != "remote-v2" {
 		t.Fatalf("fetched remote title = %q, want remote-v2", remote.Title)
 	}
-	if err := h.ExternalIssueSync.UseRemoteFields(ctx, util.MustParseUUID(workspaceID), util.MustParseUUID(issueID), remote.Title, remote.Body, true, false); err != nil {
+	if err := h.ExternalIssueSync.UseRemoteFields(ctx, util.MustParseUUID(workspaceID), util.MustParseUUID(issueID), remote.Title, remote.Body, time.Time{}, true, false); err != nil {
 		t.Fatalf("UseRemoteFields: %v", err)
 	}
 	_ = rec
@@ -262,7 +263,7 @@ func TestResumeSyncAdvancesBaseline(t *testing.T) {
 		t.Fatalf("link: %v", err)
 	}
 
-	h := &Handler{Queries: db.New(testPool)}
+	h := &Handler{Queries: db.New(testPool), TxStarter: testPool}
 	body, _ := json.Marshal(map[string]any{"action": "resume_sync", "fields": []string{"title"}})
 	req := httptest.NewRequest("POST", "/x", strings.NewReader(string(body)))
 	rctx := chi.NewRouteContext()
@@ -358,7 +359,7 @@ func TestImportGitHubIssuesActiveRunSnapshotCompare(t *testing.T) {
 	t.Setenv("GITHUB_APP_ID", "1")
 	t.Setenv("GITHUB_APP_PRIVATE_KEY", "x")
 
-	h := &Handler{Queries: db.New(testPool)}
+	h := &Handler{Queries: db.New(testPool), TxStarter: testPool}
 	call := func(state string) *httptest.ResponseRecorder {
 		body, _ := json.Marshal(map[string]any{"owner": "acme", "repo": "widgets", "state": state})
 		req := httptest.NewRequest("POST", "/x", strings.NewReader(string(body)))
@@ -395,5 +396,197 @@ func TestImportGitHubIssuesActiveRunSnapshotCompare(t *testing.T) {
 	}
 	if out.RunID != runID {
 		t.Fatalf("coalesced run = %q, want existing %q", out.RunID, runID)
+	}
+}
+
+// UseRemoteFields must acquire link BEFORE issue, matching the sync applier's
+// lock order, so a concurrent Apply and a "use remote" can never deadlock. This
+// reproduces the ordering: a holder tx locks the LINK first, then (after
+// UseRemoteFields has started) locks the ISSUE. With the correct link->issue
+// order, UseRemoteFields blocks on the link lock and proceeds once the holder
+// commits — no deadlock. Under the old issue-first order this deadlocked
+// (40P01). Regression for codex56 round-6 blocker.
+func TestUseRemoteFieldsLockOrderNoDeadlock(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"dl", "dl-"+suffix+"@t.local").Scan(&userID); err != nil {
+		t.Fatalf("user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"dl-ws", "dl-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationID); err != nil {
+		t.Fatalf("installation: %v", err)
+	}
+	var sourceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_source
+		(workspace_id,provider,instance_key,credential_id,repository_external_id,repository_full_path,configured_by_user_id,filter)
+		VALUES($1,'github','github.com',$2,'555','acme/widgets',$3,'{"state":"open"}') RETURNING id`,
+		workspaceID, installationID, userID).Scan(&sourceID); err != nil {
+		t.Fatalf("source: %v", err)
+	}
+	var issueID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO issue(workspace_id,number,title,description,status,priority,creator_type,creator_id,position)
+		VALUES($1,1,'local','b','backlog','none','member',$2,-1) RETURNING id`,
+		workspaceID, userID).Scan(&issueID); err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	var linkID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_link
+		(workspace_id,provider,instance_key,external_issue_id,source_id,issue_id,display_number,external_html_url,remote_state,title_baseline_hash,body_baseline_hash,title_conflict)
+		VALUES($1,'github','github.com','900',$2,$3,900,'h','open','oldhash','bhash',true) RETURNING id`,
+		workspaceID, sourceID, issueID).Scan(&linkID); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	q := db.New(testPool)
+	bus := events.New()
+	issues := &service.IssueService{Queries: q, TxStarter: testPool, Bus: bus}
+	svc := service.NewExternalIssueSyncService(q, testPool, bus, issues)
+
+	// Holder tx: lock the LINK first (like the applier's claim).
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx, `SELECT id FROM external_issue_link WHERE id=$1 FOR UPDATE`, linkID); err != nil {
+		t.Fatalf("holder lock link: %v", err)
+	}
+
+	// Run UseRemoteFields concurrently: it must block on the link lock (link-first
+	// order), NOT grab the issue and deadlock.
+	done := make(chan error, 1)
+	go func() {
+		done <- svc.UseRemoteFields(context.Background(), util.MustParseUUID(workspaceID), util.MustParseUUID(issueID),
+			"remote-v2", "b", time.Time{}, true, false)
+	}()
+
+	// Give the goroutine time to reach (and block on) the link lock.
+	time.Sleep(300 * time.Millisecond)
+	// Now the holder locks the ISSUE (order link->issue) and commits. Under the
+	// old reverse order in UseRemoteFields this is where the deadlock fired.
+	if _, err := holder.Exec(ctx, `SELECT id FROM issue WHERE id=$1 FOR UPDATE`, issueID); err != nil {
+		t.Fatalf("holder lock issue: %v", err)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("holder commit: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("UseRemoteFields returned error (deadlock?): %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("UseRemoteFields did not complete — likely deadlocked")
+	}
+
+	var title string
+	if err := testPool.QueryRow(ctx, `SELECT title FROM issue WHERE id=$1`, issueID).Scan(&title); err != nil {
+		t.Fatalf("read issue: %v", err)
+	}
+	if title != "remote-v2" {
+		t.Fatalf("issue title = %q, want remote-v2 (use_remote applied after lock)", title)
+	}
+}
+
+// Two concurrent imports for the same repo with DIFFERENT settings must be
+// serialized: exactly one wins (202) and the other is rejected (409) — never two
+// 202s coalesced onto the same run, and the source must not be left mutated by
+// the loser. Regression for codex56 round-6 TOCTOU blocker.
+func TestImportGitHubIssuesConcurrentDifferentInputs(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"cc", "cc-"+suffix+"@t.local").Scan(&userID); err != nil {
+		t.Fatalf("user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"cc-ws", "cc-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_sync_run WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationRowID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationRowID); err != nil {
+		t.Fatalf("installation: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
+	}))
+	defer srv.Close()
+	defer externalissue.SetGitHubAPIBaseForTest(srv.URL)()
+	withFakeToken(t)
+	t.Setenv("GITHUB_APP_ID", "1")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", "x")
+
+	h := &Handler{Queries: db.New(testPool), TxStarter: testPool}
+	call := func(state string) int {
+		body, _ := json.Marshal(map[string]any{"owner": "acme", "repo": "widgets", "state": state})
+		req := httptest.NewRequest("POST", "/x", strings.NewReader(string(body)))
+		rctx := chi.NewRouteContext()
+		rctx.URLParams.Add("id", workspaceID)
+		rctx.URLParams.Add("installationId", installationRowID)
+		req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+		rec := httptest.NewRecorder()
+		h.ImportGitHubIssues(rec, req)
+		return rec.Code
+	}
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	states := []string{"open", "all"}
+	for i := range states {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); codes[i] = call(states[i]) }(i)
+	}
+	wg.Wait()
+
+	got := map[int]int{}
+	got[codes[0]]++
+	got[codes[1]]++
+	if got[http.StatusAccepted] != 1 || got[http.StatusConflict] != 1 {
+		t.Fatalf("concurrent different-input imports = %v, want exactly one 202 and one 409", codes)
+	}
+	// Exactly one active run exists.
+	var runCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM external_issue_sync_run WHERE workspace_id=$1 AND state IN ('queued','running')`, workspaceID).Scan(&runCount); err != nil {
+		t.Fatalf("count runs: %v", err)
+	}
+	if runCount != 1 {
+		t.Fatalf("active runs = %d, want 1 (no double-create under concurrency)", runCount)
 	}
 }

@@ -478,12 +478,12 @@ func (s *ExternalIssueSyncService) publishUpdated(ctx context.Context, issue db.
 
 // UseRemoteFields overwrites the linked issue's title and/or body with the
 // caller-provided remote content (fetched by the handler via the provider),
-// through the shared transaction: it locks the issue row, updates the requested
-// fields, advances the link's baseline to the remote hashes, clears the field's
-// conflict + local-ownership, and publishes issue:updated after commit. This is
-// the real "use remote" — it applies remote content and emits an event, rather
-// than only nudging a baseline. Fields not requested are left untouched.
-func (s *ExternalIssueSyncService) UseRemoteFields(ctx context.Context, workspaceID pgtype.UUID, issueID pgtype.UUID, remoteTitle, remoteBody string, applyTitle, applyBody bool) error {
+// through the shared transaction. Lock order is link -> issue (matching the sync
+// applier) so a concurrent Apply and a "use remote" can never deadlock. It also
+// takes remoteUpdatedAt: if the link's recorded remote timestamp is already newer
+// (a background sync advanced it after the handler fetched), the fetched snapshot
+// is stale and the write is skipped rather than regressing to old content.
+func (s *ExternalIssueSyncService) UseRemoteFields(ctx context.Context, workspaceID pgtype.UUID, issueID pgtype.UUID, remoteTitle, remoteBody string, remoteUpdatedAt time.Time, applyTitle, applyBody bool) error {
 	tx, err := s.TxStarter.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
@@ -491,11 +491,20 @@ func (s *ExternalIssueSyncService) UseRemoteFields(ctx context.Context, workspac
 	defer tx.Rollback(ctx)
 	qtx := s.Queries.WithTx(tx)
 
-	link, err := qtx.GetExternalIssueLinkByIssue(ctx, db.GetExternalIssueLinkByIssueParams{
+	// Lock the link FIRST (link -> issue order), so this can never deadlock
+	// against the sync applier which also acquires link before issue.
+	link, err := qtx.LockExternalIssueLinkByIssue(ctx, db.LockExternalIssueLinkByIssueParams{
 		WorkspaceID: workspaceID, IssueID: issueID,
 	})
 	if err != nil {
-		return fmt.Errorf("load link: %w", err)
+		return fmt.Errorf("lock link: %w", err)
+	}
+	// Stale-fetch guard: if a concurrent sync already recorded a remote update at
+	// or after the snapshot the handler fetched, do not overwrite with the older
+	// content. Clearing conflict without a write is fine — the newer sync already
+	// reconciled it.
+	if link.RemoteUpdatedAt.Valid && !remoteUpdatedAt.IsZero() && remoteUpdatedAt.Before(link.RemoteUpdatedAt.Time) {
+		return nil
 	}
 	issue, err := qtx.LockIssueForDescriptionUpdate(ctx, db.LockIssueForDescriptionUpdateParams{
 		ID: issueID, WorkspaceID: workspaceID,

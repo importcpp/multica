@@ -224,6 +224,10 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	// sample so a failure in an earlier claim survives into the final state.
 	errorSamples := decodeErrorSamples(run.ErrorSample)
 	cursor := externalissue.Cursor(run.Cursor)
+	// scanned counts every remote issue VISITED (matched or filtered), seeded from
+	// prior claims, so the UI shows forward progress during a long superset scan
+	// even when few issues match the requested state.
+	scanned := run.ScannedCount
 
 	for page := 0; page < syncRunPagesPerClaim; page++ {
 		// Re-check cancellation between pages so a cancel lands promptly.
@@ -234,7 +238,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			if cerr != nil {
 				return cerr
 			}
-			if err := w.advance(ctx, run, cursor, counts); err != nil {
+			if err := w.advance(ctx, run, cursor, counts, scanned); err != nil {
 				return err
 			}
 			return w.finishRun(ctx, run, "cancelled", errorSamples)
@@ -245,6 +249,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			return w.handleListError(ctx, run, listErr)
 		}
 		for i, iss := range result.Issues {
+			scanned++
 			// Superset scan: skip issues that don't match the requested state
 			// locally, so they never enter the ledger/counts (matches "import only
 			// <state>"). Skipping is O(1) and does not touch the DB.
@@ -285,7 +290,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 					if cerr != nil {
 						return cerr
 					}
-					if err := w.advance(ctx, run, cursor, counts); err != nil {
+					if err := w.advance(ctx, run, cursor, counts, scanned); err != nil {
 						return err
 					}
 					return w.finishRun(ctx, run, "quota_blocked", errorSamples)
@@ -312,7 +317,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 			if cerr != nil {
 				return cerr
 			}
-			if err := w.advance(ctx, run, cursor, counts); err != nil {
+			if err := w.advance(ctx, run, cursor, counts, scanned); err != nil {
 				return err
 			}
 			if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
@@ -327,7 +332,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		// Interior page: keep the resume cursor crash-safe at O(1) without
 		// re-aggregating the ledger every page (that scan grows with the run). The
 		// run-row counts refresh authoritatively at the next exit / claim start.
-		if err := w.checkpointCursor(ctx, run, cursor); err != nil {
+		if err := w.checkpointCursor(ctx, run, cursor, scanned); err != nil {
 			return err
 		}
 		if err := w.persistErrorSamples(ctx, run, errorSamples); err != nil {
@@ -343,7 +348,7 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 	if cerr != nil {
 		return cerr
 	}
-	if err := w.advance(ctx, run, cursor, counts); err != nil {
+	if err := w.advance(ctx, run, cursor, counts, scanned); err != nil {
 		return err
 	}
 	return w.requeueRun(ctx, run, 0)
@@ -423,7 +428,7 @@ var errLeaseLost = errors.New("external-issue sync run lease lost")
 // worker's id. A zero-row update means the lease was stolen (or the run was
 // cancelled/finished elsewhere): return errLeaseLost so the caller aborts
 // WITHOUT finalizing — never mark succeeded on an unsaved cursor.
-func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts) error {
+func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, c runCounts, scanned int64) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.AdvanceExternalIssueSyncRun(ctx, db.AdvanceExternalIssueSyncRunParams{
 		ID:             run.ID,
@@ -436,9 +441,7 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 		FailedCount:    c.failed,
 		TotalSeen:      c.total,
 		LeaseExpiresAt: lease,
-		// page_offset is retained for schema compatibility but no longer drives
-		// resume — the run-item ledger (keyed on stable issue id) does.
-		PageOffset: 0,
+		ScannedCount:   scanned,
 	})
 	if err != nil {
 		return fmt.Errorf("advance run: %w", err)
@@ -450,16 +453,17 @@ func (w *ExternalIssueSyncWorker) advance(ctx context.Context, run db.ExternalIs
 	return nil
 }
 
-// checkpointCursor persists ONLY the resume cursor and renews the lease, without
-// re-aggregating the identity ledger. Used for interior pages so per-page cost
-// stays O(1) as the run grows; fenced on worker_id.
-func (w *ExternalIssueSyncWorker) checkpointCursor(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor) error {
+// checkpointCursor persists the resume cursor + scanned progress and renews the
+// lease, without re-aggregating the identity ledger. Used for interior pages so
+// per-page cost stays O(1) as the run grows; fenced on worker_id.
+func (w *ExternalIssueSyncWorker) checkpointCursor(ctx context.Context, run db.ExternalIssueSyncRun, cursor externalissue.Cursor, scanned int64) error {
 	lease := pgtype.Timestamptz{Time: time.Now().Add(syncRunLease), Valid: true}
 	rows, err := w.h.Queries.CheckpointExternalIssueSyncRunCursor(ctx, db.CheckpointExternalIssueSyncRunCursorParams{
 		ID:             run.ID,
 		WorkerID:       w.id,
 		Cursor:         string(cursor),
 		LeaseExpiresAt: lease,
+		ScannedCount:   scanned,
 	})
 	if err != nil {
 		return fmt.Errorf("checkpoint cursor: %w", err)

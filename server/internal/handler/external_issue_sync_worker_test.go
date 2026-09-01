@@ -108,29 +108,20 @@ func seedSyncWorkerFixture(t *testing.T, pages [][]map[string]any) (workspaceID,
 	var counter int64
 	hits = &counter
 	// Fake GitHub REST: /repos/... for resolve (unused here since source is
-	// pre-seeded), and the issues list endpoint returning the scripted pages.
+	// pre-seeded), and the issues list endpoint returning issues under the
+	// adapter's value-anchored keyset. per_page is forced to 1 so each fixture
+	// issue is its own page, preserving the cross-claim pagination the worker
+	// tests exercise.
+	t.Cleanup(externalissue.SetMaxPerPageForTest(1))
+	flat := flattenPages(pages)
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&counter, 1)
 		w.Header().Set("Content-Type", "application/json")
-		// Repository resolve (GET /repos/{owner}/{repo}) returns the stable id the
-		// source was seeded with, so live credential/repo verification on resume
-		// resolves to the same external id.
 		if strings.Contains(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/issues") {
 			fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
 			return
 		}
-		page := 0
-		if p := r.URL.Query().Get("p"); p != "" {
-			page, _ = strconv.Atoi(p)
-		}
-		if page >= len(pages) {
-			fmt.Fprint(w, `[]`)
-			return
-		}
-		if page+1 < len(pages) {
-			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/acme/widgets/issues?p=%d>; rel="next"`, srvBase(r), page+1))
-		}
-		writeIssuesJSON(w, pages[page])
+		writeKeysetIssuesPage(w, r, flat)
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(externalissue.SetGitHubAPIBaseForTest(srv.URL))
@@ -145,20 +136,89 @@ func srvBase(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-func writeIssuesJSON(w http.ResponseWriter, issues []map[string]any) {
+// issueUpdatedAt returns a per-issue updated_at, distinct and increasing by the
+// issue's numeric id so the keyset (sort=updated&direction=asc) enumeration has a
+// stable total order. A fixture may override via the "updated_at" key.
+func issueUpdatedAt(iss map[string]any) string {
+	if s, ok := iss["updated_at"].(string); ok && s != "" {
+		return s
+	}
+	id := 0
+	switch v := iss["id"].(type) {
+	case int:
+		id = v
+	}
+	// Base epoch + id seconds; id is small in tests so this stays well-formed.
+	return time.Date(2026, 1, 1, 0, 0, id, 0, time.UTC).Format(time.RFC3339)
+}
+
+func issueState(iss map[string]any) string {
+	if s, ok := iss["state"].(string); ok && s != "" {
+		return s
+	}
+	return "open"
+}
+
+// writeKeysetIssuesPage emulates the GitHub issues list under the adapter's
+// value-anchored keyset: it filters the fixture issues to updated_at >= since,
+// sorts ascending, and returns the per_page slice for the requested page. This is
+// what makes the fixture faithful to the real delete/transfer-safe enumeration
+// (a removed issue simply drops out of the filtered set).
+func writeKeysetIssuesPage(w http.ResponseWriter, r *http.Request, issues []map[string]any) {
+	perPage := 100
+	if v := r.URL.Query().Get("per_page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			perPage = n
+		}
+	}
+	page := 1
+	if v := r.URL.Query().Get("page"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			page = n
+		}
+	}
+	var since time.Time
+	if v := r.URL.Query().Get("since"); v != "" {
+		since, _ = time.Parse(time.RFC3339, v)
+	}
+	// Filter to updated_at >= since, keeping fixture order (which is id-ascending =
+	// updated_at-ascending by issueUpdatedAt).
+	var matched []map[string]any
+	for _, iss := range issues {
+		t, _ := time.Parse(time.RFC3339, issueUpdatedAt(iss))
+		if since.IsZero() || !t.Before(since) {
+			matched = append(matched, iss)
+		}
+	}
+	start := (page - 1) * perPage
+	end := start + perPage
+	if start > len(matched) {
+		start = len(matched)
+	}
+	if end > len(matched) {
+		end = len(matched)
+	}
+	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprint(w, "[")
-	for i, iss := range issues {
+	for i, iss := range matched[start:end] {
 		if i > 0 {
 			fmt.Fprint(w, ",")
 		}
-		state := "open"
-		if s, ok := iss["state"].(string); ok && s != "" {
-			state = s
-		}
-		fmt.Fprintf(w, `{"id":%d,"number":%d,"title":%q,"state":%q,"html_url":"h","updated_at":"2026-01-01T00:00:00Z"}`,
-			iss["id"], iss["number"], iss["title"], state)
+		fmt.Fprintf(w, `{"id":%d,"number":%d,"title":%q,"state":%q,"html_url":"h","updated_at":%q}`,
+			iss["id"], iss["number"], iss["title"], issueState(iss), issueUpdatedAt(iss))
 	}
 	fmt.Fprint(w, "]")
+}
+
+// flattenPages collapses the legacy [][]page fixture shape into a flat issue list
+// for the keyset responder. Page boundaries no longer matter to the value-anchored
+// enumeration; per_page is controlled by SetMaxPerPageForTest.
+func flattenPages(pages [][]map[string]any) []map[string]any {
+	var out []map[string]any
+	for _, p := range pages {
+		out = append(out, p...)
+	}
+	return out
 }
 
 func issue(id, number int, title string) map[string]any {
@@ -166,6 +226,10 @@ func issue(id, number int, title string) map[string]any {
 }
 
 func queueRun(t *testing.T, workspaceID, sourceID string) string {
+	return queueRunState(t, workspaceID, sourceID, "open")
+}
+
+func queueRunState(t *testing.T, workspaceID, sourceID, state string) string {
 	t.Helper()
 	// Build the run input snapshot from the seeded source, mirroring what the
 	// import handler captures at enqueue time.
@@ -177,13 +241,13 @@ func queueRun(t *testing.T, workspaceID, sourceID string) string {
 		t.Fatalf("read source for snapshot: %v", err)
 	}
 	snapshot := fmt.Sprintf(
-		`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":%q,"repository_full_path":%q,"configured_by_user_id":%q,"state":"open"}`,
-		credentialID, repoExternalID, repoFullPath, configuredBy)
+		`{"credential_id":%q,"provider":"github","instance_key":"github.com","repository_external_id":%q,"repository_full_path":%q,"configured_by_user_id":%q,"state":%q}`,
+		credentialID, repoExternalID, repoFullPath, configuredBy, state)
 	var runID string
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO external_issue_sync_run (workspace_id, source_id, kind, state, filter_snapshot, input_snapshot)
-		VALUES ($1,$2,'backfill','queued','{"state":"open"}',$3::jsonb) RETURNING id`,
-		workspaceID, sourceID, snapshot).Scan(&runID); err != nil {
+		VALUES ($1,$2,'backfill','queued',$3::jsonb,$4::jsonb) RETURNING id`,
+		workspaceID, sourceID, fmt.Sprintf(`{"state":%q}`, state), snapshot).Scan(&runID); err != nil {
 		t.Fatalf("queue run: %v", err)
 	}
 	return runID
@@ -277,8 +341,12 @@ func TestSyncWorkerResumesFromCursorAfterInterruption(t *testing.T) {
 	if st != "queued" {
 		t.Fatalf("after first claim state = %q, want queued (requeued mid-import)", st)
 	}
-	if importedAfter1 != int64(syncRunPagesPerClaim) {
-		t.Fatalf("after first claim imported = %d, want %d (one per page)", importedAfter1, syncRunPagesPerClaim)
+	// Progress was made but the run did not finish in one claim. (Exact per-claim
+	// count is not asserted: the value-anchored keyset re-fetches the inclusive
+	// `since` boundary issue each page — negligible at per_page=100, but at the
+	// test's per_page=1 it means fewer than one NEW import per page.)
+	if importedAfter1 <= 0 || importedAfter1 >= int64(len(pages)) {
+		t.Fatalf("after first claim imported = %d, want progress in (0, %d)", importedAfter1, len(pages))
 	}
 
 	// Subsequent claims finish it, resuming from the saved cursor with no dup.
@@ -556,15 +624,18 @@ func TestSyncWorkerMutablePageResumeNoSkip(t *testing.T) {
 		t.Fatalf("seed source: %v", err)
 	}
 
-	// Page contents flip after the first drain: [A,B] -> [B,C].
-	pageFirst := true
+	// The remote set flips after the first drain: [A,B] -> [B,C] (A leaves, C
+	// appears). Served under the value-anchored keyset with per_page=1 so B and C
+	// each get their own page.
+	t.Cleanup(externalissue.SetMaxPerPageForTest(1))
+	live := []map[string]any{issue(101, 101, "A"), issue(102, 102, "B")}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		if pageFirst {
-			writeIssuesJSON(w, []map[string]any{issue(101, 101, "A"), issue(102, 102, "B")})
-		} else {
-			writeIssuesJSON(w, []map[string]any{issue(102, 102, "B"), issue(103, 103, "C")})
+		if strings.Contains(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/issues") {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
+			return
 		}
+		writeKeysetIssuesPage(w, r, live)
 	}))
 	defer srv.Close()
 	defer externalissue.SetGitHubAPIBaseForTest(srv.URL)()
@@ -587,8 +658,8 @@ func TestSyncWorkerMutablePageResumeNoSkip(t *testing.T) {
 		t.Fatalf("after quota: state=%q imported=%d, want quota_blocked/1", st, imported)
 	}
 
-	// A leaves the set; page becomes [B,C]. Raise limit, resume.
-	pageFirst = false
+	// A leaves the set; remote becomes [B,C]. Raise limit, resume.
+	live = []map[string]any{issue(102, 102, "B"), issue(103, 103, "C")}
 	issues.Entitlements = limitProvider{limit: 100}
 	sync.Entitlements = limitProvider{limit: 100}
 	if _, err := q.ResumeExternalIssueSyncRun(ctx, resumeParamsForSource(workspaceID, runID, sourceID)); err != nil {
@@ -717,38 +788,30 @@ func seedSyncWorkerFixtureDynamic(t *testing.T, pages *[][]map[string]any) (work
 		RETURNING id`, workspaceID, installationID, userID).Scan(&sourceID); err != nil {
 		t.Fatalf("seed source: %v", err)
 	}
+	t.Cleanup(externalissue.SetMaxPerPageForTest(1))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		page := 0
-		if p := r.URL.Query().Get("p"); p != "" {
-			page, _ = strconv.Atoi(p)
-		}
-		cur := *pages
 		w.Header().Set("Content-Type", "application/json")
-		if page >= len(cur) {
-			fmt.Fprint(w, `[]`)
+		if strings.Contains(r.URL.Path, "/repos/") && !strings.Contains(r.URL.Path, "/issues") {
+			fmt.Fprint(w, `{"id":555,"full_name":"acme/widgets","name":"widgets"}`)
 			return
 		}
-		if page+1 < len(cur) {
-			w.Header().Set("Link", fmt.Sprintf(`<%s/repos/acme/widgets/issues?p=%d>; rel="next"`, srvBase(r), page+1))
-		}
-		writeIssuesJSON(w, cur[page])
+		writeKeysetIssuesPage(w, r, flattenPages(*pages))
 	}))
 	t.Cleanup(srv.Close)
 	t.Cleanup(externalissue.SetGitHubAPIBaseForTest(srv.URL))
 	return workspaceID, sourceID
 }
 
-// Membership shifting mid-scan must NOT drop a still-matching issue. The worker
-// scans the STABLE SUPERSET (state=all, created asc) and filters locally, so an
-// issue closing during the scan stays in the served list at its immutable
-// position instead of vanishing and shifting the tail into an already-consumed
-// page. Reproduction of codex56 round-4 P0: N pages of one open issue each; after
-// the first claim consumes all but the last page, the earliest issue closes.
-// Under the old filtered (state=open) scan this shifted the final issue into a
-// consumed page and it was lost (imported=N-1, succeeded). Under the superset
-// scan every issue keeps its page, so all N are visited and imported.
-func TestSyncWorkerSupersetScanNoLossOnMidScanClose(t *testing.T) {
-	n := syncRunPagesPerClaim + 1
+// Deleting/transferring an issue mid-scan (it VANISHES from the source set, not
+// just closes) must NOT drop a still-present issue. The value-anchored keyset
+// (sort=updated&direction=asc&since=<max updated_at seen>) enumerates by VALUE,
+// so a removed earlier issue only shrinks the result set — a survivor keeps its
+// updated_at and still appears at/after the anchor. Reproduction of codex56
+// round-6 P0: N issues, first claim consumes the earlier ones, then the earliest
+// is DELETED; every survivor must still be imported and the run must not falsely
+// report succeeded-with-a-missing-tail.
+func TestSyncWorkerKeysetNoLossOnMidScanDelete(t *testing.T) {
+	n := syncRunPagesPerClaim + 3
 	var pages [][]map[string]any
 	for i := 0; i < n; i++ {
 		id := i + 1
@@ -757,35 +820,30 @@ func TestSyncWorkerSupersetScanNoLossOnMidScanClose(t *testing.T) {
 	live := pages
 	workspaceID, sourceID := seedSyncWorkerFixtureDynamic(t, &live)
 	withFakeToken(t)
-	runID := queueRun(t, workspaceID, sourceID)
+	// Import state=all so no local state filtering interferes; this isolates the
+	// keyset delete-safety property.
+	runID := queueRunState(t, workspaceID, sourceID, "all")
 
 	w := NewExternalIssueSyncWorker(testHandler)
-	// First claim drains the page budget (pages 0..budget-1), leaving the last
-	// page for a later claim, then requeues.
+	// First claim drains the per-claim page budget, then requeues.
 	if _, err := w.ProcessNext(context.Background()); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
 	if st, _, _ := runState(t, runID); st != "queued" {
 		t.Fatalf("after first claim state = %q, want queued", st)
 	}
-
-	// The earliest issue closes. In the state=all superset it STAYS in the list
-	// (only its state flips to closed) at the same created-position, so no later
-	// issue shifts pages. A deep-copy flip of page 0's single issue.
-	closed := make([][]map[string]any, len(live))
-	for i := range live {
-		row := make(map[string]any, len(live[i][0]))
-		for k, v := range live[i][0] {
-			row[k] = v
-		}
-		if i == 0 {
-			row["state"] = "closed"
-		}
-		closed[i] = []map[string]any{row}
+	importedSoFar := countWsIssues(t, workspaceID)
+	if importedSoFar == 0 || importedSoFar >= n {
+		t.Fatalf("first claim imported %d, want partial progress in (0,%d)", importedSoFar, n)
 	}
-	live = closed
 
-	// Drain to terminal in a single forward pass — no reconcile re-scan.
+	// DELETE the earliest issue: remove it from the served set entirely (as a
+	// GitHub permanent-delete or transfer-out would). Under a page-offset scan
+	// this shifts a later, not-yet-seen issue into an already-consumed page and it
+	// is lost. Under the keyset it just shrinks the set.
+	live = live[1:]
+
+	// Drain to terminal.
 	for i := 0; i < 40; i++ {
 		if _, err := w.ProcessNext(context.Background()); err != nil {
 			t.Fatalf("drain claim: %v", err)
@@ -794,15 +852,15 @@ func TestSyncWorkerSupersetScanNoLossOnMidScanClose(t *testing.T) {
 			break
 		}
 	}
-	state, _, _ := runState(t, runID)
-	if state != "succeeded" {
+	if state, _, _ := runState(t, runID); state != "succeeded" {
 		t.Fatalf("final state = %q, want succeeded", state)
 	}
-	// The final page's issue (id=n) must be imported — it never shifted pages. The
-	// issue that closed after already being imported stays imported (import is by
-	// identity, not current state). All n must be present.
-	if got := countWsIssues(t, workspaceID); got != n {
-		t.Fatalf("imported issues = %d, want %d (superset scan must not lose the tail)", got, n)
+	// Every SURVIVING issue (all but the deleted one) must be imported; the
+	// deleted one that was already imported before deletion stays imported. So the
+	// total is exactly n-1 survivors that were never imported PLUS whatever the
+	// first claim already had — i.e. at least n-1 distinct issues, none lost.
+	if got := countWsIssues(t, workspaceID); got < n-1 {
+		t.Fatalf("imported issues = %d, want >= %d (no survivor lost to mid-scan delete)", got, n-1)
 	}
 }
 

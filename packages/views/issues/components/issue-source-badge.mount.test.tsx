@@ -16,12 +16,9 @@ vi.mock("@tanstack/react-query", () => ({
   queryOptions: <T,>(opts: T) => opts,
 }));
 
-vi.mock("@multica/core/api", () => ({
-  api: { resolveIssueExternalConflict: (...a: unknown[]) => mockResolve(...a) },
-}));
-
 vi.mock("@multica/core/github", () => ({
   issueExternalSourceOptions: () => ({ queryKey: ["issue-external-source", "issue-1"] }),
+  useResolveIssueExternalConflict: () => ({ mutateAsync: (b: unknown) => mockResolve(b) }),
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 
@@ -65,7 +62,7 @@ describe("IssueSourceBadge per-field resolution", () => {
 
     await user.click(screen.getByRole("button", { name: "Use remote" }));
     await waitFor(() => expect(mockResolve).toHaveBeenCalled());
-    expect(mockResolve).toHaveBeenCalledWith("issue-1", {
+    expect(mockResolve).toHaveBeenCalledWith({
       action: "use_remote",
       fields: ["title"],
     });
@@ -81,7 +78,7 @@ describe("IssueSourceBadge per-field resolution", () => {
     expect(screen.getByText("Description kept local (sync paused)")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Resume sync" }));
     await waitFor(() => expect(mockResolve).toHaveBeenCalled());
-    expect(mockResolve).toHaveBeenCalledWith("issue-1", {
+    expect(mockResolve).toHaveBeenCalledWith({
       action: "resume_sync",
       fields: ["body"],
     });

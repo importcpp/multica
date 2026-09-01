@@ -416,6 +416,7 @@ export const SyncRunStatusSchema = z.object({
   skipped: z.number().optional().default(0),
   failed: z.number().optional().default(0),
   total: z.number().optional().default(0),
+  scanned: z.number().optional().default(0),
   cancel_requested: z.boolean().optional().default(false),
   errors: z.array(z.string()).optional().default([]),
 }).loose();
@@ -430,6 +431,7 @@ export const EMPTY_SYNC_RUN_STATUS: SyncRunStatus = {
   skipped: 0,
   failed: 0,
   total: 0,
+  scanned: 0,
   cancel_requested: false,
   errors: [],
 };

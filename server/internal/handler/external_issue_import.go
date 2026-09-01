@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"net/http"
 	"strings"
@@ -292,34 +293,54 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Before mutating anything, check whether this repo already has an active run.
-	// If it does, compare the requested inputs against that run's snapshot: only a
-	// byte-identical request may coalesce onto the existing run; a DIFFERENT
-	// request (changed project / state) must NOT silently run under the old
-	// snapshot, and must NOT rewrite the source out from under the active run.
-	// This read is best-effort (no source yet => nothing active => fall through).
-	if existingSource, err := h.Queries.GetExternalIssueSourceByIdentity(r.Context(), db.GetExternalIssueSourceByIdentityParams{
+	// Serialize the whole source-upsert + active-run compare + run-create for this
+	// repository in ONE transaction, gated by a transaction-scoped advisory lock on
+	// the repo identity. This closes the TOCTOU where two concurrent requests both
+	// passed a best-effort pre-check: now the second request blocks until the first
+	// commits, sees its active run, and is compared/coalesced or rejected. The
+	// source is only mutated once we've decided this request may proceed.
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start import")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+
+	if err := qtx.LockExternalIssueImportIdentity(r.Context(), db.LockExternalIssueImportIdentityParams{
+		Namespace: importIdentityLockNamespace,
+		Identity:  importIdentityLockKey(workspaceUUID, repo),
+	}); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to lock import")
+		return
+	}
+
+	requested := buildRunInputSnapshot("github", installationUUID, repo, projectID, actingUserID(r), state)
+
+	// If this repo already has an active run, compare execution inputs: identical
+	// -> coalesce (202 + existing run); different -> 409 WITHOUT mutating the
+	// source. Only when there is no active run do we upsert the source and create.
+	if existingSource, err := qtx.GetExternalIssueSourceByIdentity(r.Context(), db.GetExternalIssueSourceByIdentityParams{
 		WorkspaceID: workspaceUUID, Provider: "github", InstanceKey: repo.InstanceKey, RepositoryExternalID: repo.ExternalID,
 	}); err == nil {
-		if active, ok := h.activeRunForSource(r.Context(), workspaceUUID, existingSource.ID); ok {
-			requested := buildRunInputSnapshot("github", installationUUID, repo, projectID, actingUserID(r), state)
-			if sameRunExecutionInputs(active.InputSnapshot, requested) {
-				writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
-					SourceID: util.UUIDToString(existingSource.ID),
-					RunID:    util.UUIDToString(active.ID),
-					State:    active.State,
-				})
+		if active, ok := activeRunForSourceTx(r.Context(), qtx, workspaceUUID, existingSource.ID); ok {
+			if !sameRunExecutionInputs(active.InputSnapshot, requested) {
+				writeErrorCode(w, http.StatusConflict, "import_already_running",
+					"an import for this repository is already running with different settings; wait for it to finish or cancel it before importing with new settings")
 				return
 			}
-			writeErrorCode(w, http.StatusConflict, "import_already_running",
-				"an import for this repository is already running with different settings; wait for it to finish or cancel it before importing with new settings")
+			writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
+				SourceID: util.UUIDToString(existingSource.ID),
+				RunID:    util.UUIDToString(active.ID),
+				State:    active.State,
+			})
 			return
 		}
 	}
 
-	// Create or reuse the source (dedup on stable identity). credential_id holds
-	// the installation UUID so the worker can mint a fresh token per claim.
-	source, err := h.Queries.UpsertExternalIssueSource(r.Context(), db.UpsertExternalIssueSourceParams{
+	// No active run: create or reuse the source (dedup on stable identity).
+	// credential_id holds the installation UUID so the worker can mint per claim.
+	source, err := qtx.UpsertExternalIssueSource(r.Context(), db.UpsertExternalIssueSourceParams{
 		WorkspaceID:          workspaceUUID,
 		Provider:             "github",
 		InstanceKey:          repo.InstanceKey,
@@ -337,32 +358,23 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Snapshot the execution inputs onto the run so a later import request that
-	// mutates the source (credential / project / filter) cannot redirect this
-	// run mid-flight; the worker reads only this snapshot. project/user ids are
-	// stored as strings and empty when unset.
-	inputSnapshot := buildRunInputSnapshot("github", installationUUID, repo, projectID, actingUserID(r), state)
-
-	// A source allows only one active run (partial unique index). If one is
-	// already queued/running, report it instead of failing the request.
-	run, err := h.Queries.CreateExternalIssueSyncRun(r.Context(), db.CreateExternalIssueSyncRunParams{
+	// A source allows only one active run (partial unique index). Under the
+	// advisory lock a concurrent active run cannot exist, so a unique-conflict here
+	// is unexpected — surface it rather than silently coalescing without comparing.
+	run, err := qtx.CreateExternalIssueSyncRun(r.Context(), db.CreateExternalIssueSyncRunParams{
 		WorkspaceID:    workspaceUUID,
 		SourceID:       source.ID,
 		Kind:           "backfill",
 		State:          "queued",
 		FilterSnapshot: []byte(fmt.Sprintf(`{"state":%q}`, state)),
-		InputSnapshot:  inputSnapshot,
+		InputSnapshot:  requested,
 	})
 	if err != nil {
-		if existing, ok := h.activeRunForSource(r.Context(), workspaceUUID, source.ID); ok {
-			writeJSON(w, http.StatusAccepted, importGitHubIssuesResponse{
-				SourceID: util.UUIDToString(source.ID),
-				RunID:    util.UUIDToString(existing.ID),
-				State:    existing.State,
-			})
-			return
-		}
 		writeError(w, http.StatusInternalServerError, "failed to create import run")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit import")
 		return
 	}
 
@@ -378,7 +390,14 @@ func (h *Handler) ImportGitHubIssues(w http.ResponseWriter, r *http.Request) {
 
 // activeRunForSource returns the source's single active (queued/running) run.
 func (h *Handler) activeRunForSource(ctx context.Context, workspaceID, sourceID pgtype.UUID) (db.ExternalIssueSyncRun, bool) {
-	runs, err := h.Queries.ListExternalIssueSyncRunsBySource(ctx, db.ListExternalIssueSyncRunsBySourceParams{
+	return activeRunForSourceTx(ctx, h.Queries, workspaceID, sourceID)
+}
+
+// activeRunForSourceTx is the *db.Queries-scoped variant so the import handler can
+// read the active run inside its serializing transaction (under the advisory
+// lock) rather than on the pool, keeping the check-and-create atomic.
+func activeRunForSourceTx(ctx context.Context, q *db.Queries, workspaceID, sourceID pgtype.UUID) (db.ExternalIssueSyncRun, bool) {
+	runs, err := q.ListExternalIssueSyncRunsBySource(ctx, db.ListExternalIssueSyncRunsBySourceParams{
 		SourceID: sourceID, Limit: 5,
 	})
 	if err != nil {
@@ -392,6 +411,25 @@ func (h *Handler) activeRunForSource(ctx context.Context, workspaceID, sourceID 
 	return db.ExternalIssueSyncRun{}, false
 }
 
+// importIdentityLockNamespace namespaces the transaction-scoped advisory lock the
+// import handler uses to serialize concurrent requests for the same repository,
+// so its key space can't collide with other pg_advisory_xact_lock users.
+const importIdentityLockNamespace int32 = 0x4549 // "EI" (external issue)
+
+// importIdentityLockKey derives a stable 32-bit advisory-lock key from the repo
+// identity (workspace + instance + external id). Distinct repos hash to distinct
+// keys with overwhelming probability; a rare collision only over-serializes two
+// unrelated imports, which is harmless.
+func importIdentityLockKey(workspaceID pgtype.UUID, repo externalissue.Repository) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(util.UUIDToString(workspaceID)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(repo.InstanceKey))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(repo.ExternalID))
+	return int32(h.Sum32())
+}
+
 type syncRunStatusResponse struct {
 	RunID     string `json:"run_id"`
 	SourceID  string `json:"source_id"`
@@ -402,7 +440,11 @@ type syncRunStatusResponse struct {
 	Skipped   int64  `json:"skipped"`
 	Failed    int64  `json:"failed"`
 	Total     int64  `json:"total"`
-	Cancel    bool   `json:"cancel_requested"`
+	// Scanned is how many remote issues have been VISITED (matched or filtered).
+	// For an open-only import of a large repo it advances even while Total (matched
+	// issues) sits near 0, so the UI can show real progress instead of a stuck 0.
+	Scanned int64 `json:"scanned"`
+	Cancel  bool  `json:"cancel_requested"`
 	// Errors is a bounded sample of per-issue failure diagnostics so a partial
 	// run tells the user which issues failed and why, not just a count.
 	Errors []string `json:"errors"`
@@ -436,6 +478,7 @@ func (h *Handler) GetSyncRun(w http.ResponseWriter, r *http.Request) {
 		Skipped:   run.SkippedCount,
 		Failed:    run.FailedCount,
 		Total:     run.TotalSeen,
+		Scanned:   run.ScannedCount,
 		Cancel:    run.CancelRequested,
 		Errors:    decodeErrorSamples(run.ErrorSample),
 	})

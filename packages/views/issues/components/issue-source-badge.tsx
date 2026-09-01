@@ -1,12 +1,14 @@
 "use client";
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ExternalLink, GitMerge } from "lucide-react";
 import { Badge } from "@multica/ui/components/ui/badge";
 import { Button } from "@multica/ui/components/ui/button";
-import { api } from "@multica/core/api";
-import { issueExternalSourceOptions } from "@multica/core/github";
+import {
+  issueExternalSourceOptions,
+  useResolveIssueExternalConflict,
+} from "@multica/core/github";
 import { useT } from "../../i18n";
 
 interface IssueSourceBadgeProps {
@@ -23,8 +25,8 @@ interface IssueSourceBadgeProps {
  */
 export function IssueSourceBadge({ issueId }: IssueSourceBadgeProps) {
   const { t } = useT("issues");
-  const qc = useQueryClient();
   const { data: source, isError } = useQuery(issueExternalSourceOptions(issueId));
+  const resolveMutation = useResolveIssueExternalConflict(issueId);
 
   // No source (404) or not loaded yet → render nothing.
   if (isError || !source || !source.provider) return null;
@@ -41,8 +43,7 @@ export function IssueSourceBadge({ issueId }: IssueSourceBadgeProps) {
     field: "title" | "body",
   ) {
     try {
-      await api.resolveIssueExternalConflict(issueId, { action, fields: [field] });
-      await qc.invalidateQueries({ queryKey: ["issue-external-source", issueId] });
+      await resolveMutation.mutateAsync({ action, fields: [field] });
       toast.success(t(($) => $.external_source.toast_resolved));
     } catch (e) {
       toast.error(e instanceof Error ? e.message : t(($) => $.external_source.toast_failed));

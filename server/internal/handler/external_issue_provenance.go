@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -130,8 +131,14 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 			writeError(w, status, "failed to fetch remote issue")
 			return
 		}
+		var remoteUpdated time.Time
+		if remote.RemoteUpdatedAt != "" {
+			if t, perr := time.Parse(time.RFC3339, remote.RemoteUpdatedAt); perr == nil {
+				remoteUpdated = t
+			}
+		}
 		if err := h.ExternalIssueSync.UseRemoteFields(
-			r.Context(), issue.WorkspaceID, issue.ID, remote.Title, remote.Body, wantTitle, wantBody,
+			r.Context(), issue.WorkspaceID, issue.ID, remote.Title, remote.Body, remoteUpdated, wantTitle, wantBody,
 		); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to apply remote content")
 			return

@@ -759,6 +759,7 @@
       "close": "关闭",
       "submit": "导入",
       "summary": "新建 {{imported}} · 更新 {{updated}} · 冲突 {{conflicts}} · 跳过 {{skipped}} · 失败 {{failed}}",
+      "scanned": "已扫描 {{scanned}} 个远端 issue…",
       "toast_permission": "该 GitHub 安装尚未授予 Issues 读取权限。请重新授权应用后再试。",
       "toast_failed": "导入失败",
       "toast_queued": "导入已排队，进度将在下方更新。",
