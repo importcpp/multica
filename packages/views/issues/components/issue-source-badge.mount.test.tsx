@@ -38,7 +38,7 @@ function baseSource(over: Record<string, unknown> = {}) {
 function renderBadge() {
   return render(
     <I18nProvider locale="en" resources={{ en: { common: enCommon, issues: enIssues } }}>
-      <IssueSourceBadge issueId="issue-1" />
+      <IssueSourceBadge wsId="ws-1" issueId="issue-1" />
     </I18nProvider>,
   );
 }

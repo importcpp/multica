@@ -112,8 +112,11 @@ func TestListIssuesKeysetAdvancesBySinceValue(t *testing.T) {
 	if page2.NextCursor != "" {
 		t.Fatalf("short second page must end the scan, got cursor %q", page2.NextCursor)
 	}
-	if sawSecondSince != "2026-02-02T00:00:00Z" {
-		t.Fatalf("second request since = %q, want the newest updated_at from page 1", sawSecondSince)
+	// Page 1 spans two seconds (2026-02-01 x99, 2026-02-02 x1), so the value
+	// transition lets us advance to just-before the last second. GitHub `since` is
+	// EXCLUSIVE, so since = lastSecond-1s re-includes the whole last-second bucket.
+	if sawSecondSince != "2026-02-01T23:59:59Z" {
+		t.Fatalf("second request since = %q, want lastSecond-1s (exclusive re-include)", sawSecondSince)
 	}
 	if hits != 2 {
 		t.Fatalf("want 2 requests, got %d", hits)
@@ -241,5 +244,107 @@ func TestListURLBuildsFilter(t *testing.T) {
 		if !strings.Contains(u, want) {
 			t.Errorf("listURL missing %q in %s", want, u)
 		}
+	}
+}
+
+// A full page consisting ENTIRELY of PRs must still advance the cursor by VALUE.
+// PRs are dropped from output but they occupy the raw GitHub feed, so the
+// boundary is computed from the raw page; deriving it from non-PR issues only
+// would leave a PR-only page unable to advance and the worker would requeue
+// forever. Regression for codex56 round-7.
+func TestListIssuesPROnlyPageStillAdvances(t *testing.T) {
+	t.Cleanup(SetMaxPerPageForTest(2))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		since := r.URL.Query().Get("since")
+		// First page (no since): two PRs spanning two seconds -> full page, advances
+		// by value to the last second.
+		if since == "" {
+			fmt.Fprint(w, `[
+				{"id":1,"number":1,"title":"pr-a","state":"open","updated_at":"2026-02-01T00:00:00Z","pull_request":{"url":"x"}},
+				{"id":2,"number":2,"title":"pr-b","state":"open","updated_at":"2026-02-01T00:00:01Z","pull_request":{"url":"y"}}
+			]`)
+			return
+		}
+		// After advancing: one real issue, short page -> ends the scan.
+		fmt.Fprint(w, `[{"id":3,"number":3,"title":"real","state":"open","updated_at":"2026-02-01T00:00:01Z"}]`)
+	}))
+	defer srv.Close()
+	withAPIBase(t, srv.URL)
+
+	p := githubProvider{}
+	repo := Repository{FullPath: "o/r"}
+	page1, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, "")
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if len(page1.Issues) != 0 {
+		t.Fatalf("page1 issues = %d, want 0 (all PRs filtered)", len(page1.Issues))
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("PR-only full page must still yield a next cursor (value advance), not stall")
+	}
+	if page1.IncompleteBucket {
+		t.Fatal("PR-only page spanning two seconds is a clean value advance, not incomplete")
+	}
+	page2, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, page1.NextCursor)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if len(page2.Issues) != 1 || page2.Issues[0].Number != 3 {
+		t.Fatalf("page2 issues = %+v, want the real issue #3", page2.Issues)
+	}
+	if page2.NextCursor != "" {
+		t.Fatalf("short page must end scan, got %q", page2.NextCursor)
+	}
+}
+
+// A full page entirely within ONE updated_at second is a bucket larger than a
+// page that a second-granular `since` cannot enumerate safely. The adapter
+// advances PAST the second (guaranteeing progress + delete-safety) and flags
+// IncompleteBucket so the worker marks the run partial. Regression for codex56
+// round-7 "same-second cross-page".
+func TestListIssuesSameSecondOverflowFlagsIncomplete(t *testing.T) {
+	t.Cleanup(SetMaxPerPageForTest(2))
+	var sawSecondSince string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		since := r.URL.Query().Get("since")
+		if since == "" {
+			// Full page (per_page=2) both in the same second -> overflow bucket.
+			fmt.Fprint(w, `[
+				{"id":1,"number":1,"title":"a","state":"open","updated_at":"2026-02-01T00:00:00Z"},
+				{"id":2,"number":2,"title":"b","state":"open","updated_at":"2026-02-01T00:00:00Z"}
+			]`)
+			return
+		}
+		sawSecondSince = since
+		fmt.Fprint(w, `[]`)
+	}))
+	defer srv.Close()
+	withAPIBase(t, srv.URL)
+
+	p := githubProvider{}
+	repo := Repository{FullPath: "o/r"}
+	page1, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, "")
+	if err != nil {
+		t.Fatalf("page1: %v", err)
+	}
+	if !page1.IncompleteBucket {
+		t.Fatal("same-second full page must flag IncompleteBucket")
+	}
+	if page1.NextCursor == "" {
+		t.Fatal("same-second overflow must still advance past the second, not stall")
+	}
+	page2, err := p.ListIssues(context.Background(), Credentials{}, repo, IssueFilter{State: "all"}, page1.NextCursor)
+	if err != nil {
+		t.Fatalf("page2: %v", err)
+	}
+	if page2.NextCursor != "" {
+		t.Fatalf("empty page must end scan, got %q", page2.NextCursor)
+	}
+	// It advanced PAST the second (exclusive since = S), guaranteeing progress.
+	if sawSecondSince != "2026-02-01T00:00:00Z" {
+		t.Fatalf("second request since = %q, want the overflow second (advance past)", sawSecondSince)
 	}
 }

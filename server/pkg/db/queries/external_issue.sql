@@ -110,6 +110,16 @@ SELECT * FROM external_issue_link
 WHERE workspace_id = $1 AND issue_id = $2
 FOR UPDATE;
 
+-- name: LockExternalIssueLinksForIssueDelete :exec
+-- Take FOR UPDATE on any link rows bound to this issue BEFORE the delete path
+-- locks the issue row, so issue deletion follows the same link -> issue lock
+-- order as the sync applier / use-remote and cannot deadlock against a concurrent
+-- Apply. A no-op (locks nothing) when the issue has no external link, so it is
+-- safe to call unconditionally on every delete.
+SELECT id FROM external_issue_link
+WHERE workspace_id = $1 AND issue_id = $2
+FOR UPDATE;
+
 -- name: ResumeExternalIssueLinkField :exec
 -- resume_sync for the scoped fields: clear local ownership + conflict AND advance
 -- the baseline to the CURRENT local content hash. Advancing the baseline is what

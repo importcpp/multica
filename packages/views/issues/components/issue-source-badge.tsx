@@ -12,6 +12,7 @@ import {
 import { useT } from "../../i18n";
 
 interface IssueSourceBadgeProps {
+  wsId: string;
   issueId: string;
 }
 
@@ -23,10 +24,10 @@ interface IssueSourceBadgeProps {
  * surfaced instead of appending "Imported from ..." into the description.
  * Renders nothing when the issue was not imported (404 → no source).
  */
-export function IssueSourceBadge({ issueId }: IssueSourceBadgeProps) {
+export function IssueSourceBadge({ wsId, issueId }: IssueSourceBadgeProps) {
   const { t } = useT("issues");
   const { data: source, isError } = useQuery(issueExternalSourceOptions(issueId));
-  const resolveMutation = useResolveIssueExternalConflict(issueId);
+  const resolveMutation = useResolveIssueExternalConflict(wsId, issueId);
 
   // No source (404) or not loaded yet → render nothing.
   if (isError || !source || !source.provider) return null;

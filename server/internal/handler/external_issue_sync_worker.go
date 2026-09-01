@@ -248,6 +248,13 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 		if listErr != nil {
 			return w.handleListError(ctx, run, listErr)
 		}
+		if result.IncompleteBucket && !hasIncompleteMarker(errorSamples) {
+			// A full page fell entirely within one updated_at second: the overflow
+			// cannot be enumerated safely, so the scan will skip past it. Record a
+			// durable marker (survives claims via error_sample) so the run finishes
+			// PARTIAL, never a falsely-complete succeeded.
+			errorSamples = append(errorSamples, incompleteBucketMarker)
+		}
 		for i, iss := range result.Issues {
 			scanned++
 			// Superset scan: skip issues that don't match the requested state
@@ -324,7 +331,9 @@ func (w *ExternalIssueSyncWorker) drainRun(ctx context.Context, run db.ExternalI
 				return err
 			}
 			state := "succeeded"
-			if counts.failed > 0 {
+			if counts.failed > 0 || hasIncompleteMarker(errorSamples) {
+				// A skipped same-second overflow bucket makes the scan incomplete →
+				// partial, so the UI never shows a possibly-lossy scan as succeeded.
 				state = "partial"
 			}
 			return w.finishRun(ctx, run, state, errorSamples)
@@ -523,6 +532,21 @@ func decodeErrorSamples(raw []byte) []string {
 		_ = json.Unmarshal(raw, &out)
 	}
 	return out
+}
+
+// incompleteBucketMarker is a sentinel error sample recorded when the provider
+// reports it skipped a same-second overflow bucket it could not enumerate. It
+// persists across claims via error_sample, so the run finishes partial (not
+// succeeded) and the user is told the scan was incomplete.
+const incompleteBucketMarker = "scan incomplete: a same-second update bucket exceeded one page and was skipped"
+
+func hasIncompleteMarker(samples []string) bool {
+	for _, s := range samples {
+		if s == incompleteBucketMarker {
+			return true
+		}
+	}
+	return false
 }
 
 // persistErrorSamples writes the accumulated sample at a page checkpoint (fenced)

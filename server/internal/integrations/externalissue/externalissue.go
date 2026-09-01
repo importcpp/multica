@@ -134,6 +134,13 @@ type Cursor string
 type IssuePage struct {
 	Issues     []Issue
 	NextCursor Cursor
+	// IncompleteBucket is set when a full page was entirely within ONE
+	// updated_at second: more issues may share that second than a page holds, and
+	// GitHub's second-granular `since` cannot enumerate the overflow without an
+	// offset walk that a concurrent delete would corrupt. The sync engine advances
+	// past the second (guaranteeing progress + delete-safety) and marks the run
+	// PARTIAL rather than reporting a possibly-incomplete scan as succeeded.
+	IncompleteBucket bool
 }
 
 // ErrorKind is the normalized failure taxonomy every provider maps onto, so the

@@ -17,14 +17,18 @@ export const externalIssueKeys = {
 };
 
 // externalIssueSyncRunOptions polls one run's progress. The dialog drives its own
-// serial poll cadence (Resume can restart it), so it reads via fetchQuery/the
-// query fn rather than a mounted useQuery; this options object is the single
-// definition of the key + fetcher.
+// serial poll cadence (Resume can restart it), reading via qc.fetchQuery. It
+// MUST set staleTime:0 to override the app's global staleTime:Infinity — otherwise
+// fetchQuery returns the first cached snapshot forever and the run state, scanned
+// count, cancel and terminal transitions never update. gcTime:0 keeps the cache
+// from accumulating one entry per finished run.
 export const externalIssueSyncRunOptions = (wsId: string, runId: string) =>
   queryOptions({
     queryKey: externalIssueKeys.syncRun(wsId, runId),
     queryFn: () => api.getExternalIssueSyncRun(wsId, runId),
     enabled: !!wsId && !!runId,
+    staleTime: 0,
+    gcTime: 0,
   });
 
 export function usePreviewGitHubIssues(wsId: string, installationId: string) {
@@ -62,7 +66,7 @@ export function useCancelExternalIssueSyncRun(wsId: string) {
   });
 }
 
-export function useResolveIssueExternalConflict(issueId: string) {
+export function useResolveIssueExternalConflict(wsId: string, issueId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (body: {
@@ -70,9 +74,13 @@ export function useResolveIssueExternalConflict(issueId: string) {
       fields?: string[];
     }) => api.resolveIssueExternalConflict(issueId, body),
     onSuccess: () => {
-      // The badge reads the source provenance; refresh it plus the issue itself
-      // (use_remote overwrites content).
+      // Refresh the source provenance (badge) AND the issue itself: use_remote
+      // overwrites the issue's title/body, and under the app's global
+      // staleTime:Infinity the issue detail would otherwise stay the old value
+      // until a WS event or manual refetch. Invalidate detail + the list caches.
       void qc.invalidateQueries({ queryKey: externalIssueKeys.issueSource(issueId) });
+      void qc.invalidateQueries({ queryKey: issueKeys.detail(wsId, issueId) });
+      void qc.invalidateQueries({ queryKey: issueKeys.all(wsId) });
     },
   });
 }

@@ -126,27 +126,26 @@ func (p githubProvider) ListIssues(ctx context.Context, creds Credentials, repo 
 		return IssuePage{}, err
 	}
 	page := IssuePage{Issues: make([]Issue, 0, len(raw))}
-	var maxUpdated time.Time
 	for _, gi := range raw {
 		if gi.PullRequest != nil {
-			continue // the issues endpoint mixes in PRs; drop them.
+			continue // the issues endpoint mixes in PRs; drop them from OUTPUT only.
 		}
 		page.Issues = append(page.Issues, normalizeIssue(gi))
-		if t, perr := time.Parse(time.RFC3339, gi.UpdatedAt); perr == nil && t.After(maxUpdated) {
-			maxUpdated = t
-		}
 	}
-	page.NextCursor = nextKeysetCursor(len(raw), since, maxUpdated)
+	// The cursor is derived from the RAW feed (PRs included). GitHub paginates the
+	// raw feed, so a PR-only page still consumes the timeline; deriving the
+	// boundary from non-PR issues only would leave a PR-only page unable to advance
+	// and the worker would requeue forever.
+	page.NextCursor, page.IncompleteBucket = nextKeysetCursor(raw, since)
 	return page, nil
 }
 
-// parseKeysetCursor decodes the value-anchored cursor, which is simply the
-// RFC3339 `since` lower bound (empty = the filter's UpdatedAfter, or zero = the
-// whole history). Enumerating by the updated_at VALUE — never a page offset into
+// parseKeysetCursor decodes the value-anchored cursor: the RFC3339 EXCLUSIVE
+// updated_at lower bound (empty = the filter's UpdatedAfter, or zero = whole
+// history). Enumerating purely by the updated_at VALUE — never a page offset into
 // a live list — is what makes the scan safe against a concurrent delete/transfer:
 // those only shrink the result set; a surviving issue keeps its updated_at, so it
-// still appears at or after the anchor we resume from. A page offset would, by
-// contrast, shift when an earlier issue disappears (that was the round-6 bug).
+// still appears after the anchor we resume from.
 func parseKeysetCursor(cursor Cursor, filter IssueFilter) (since time.Time, err error) {
 	if cursor == "" {
 		return filter.UpdatedAfter, nil
@@ -158,28 +157,59 @@ func parseKeysetCursor(cursor Cursor, filter IssueFilter) (since time.Time, err 
 	return t, nil
 }
 
-// nextKeysetCursor computes the next `since`, or "" when the scan is complete.
+// nextKeysetCursor computes the next `since` (or "" when the scan is complete)
+// and whether the page was an incomplete same-second bucket. raw is the FULL page
+// (PRs included), sorted updated_at asc.
 //
-//   - A short page (< per_page) is the last page → done.
-//   - Otherwise advance `since` to the newest updated_at on this page. GitHub's
-//     `since` is INCLUSIVE, so the boundary issue is re-fetched next round; the
-//     identity ledger dedupes it. This costs ~one duplicate per full page (≈1% at
-//     per_page=100) in exchange for delete/transfer safety.
-//   - If a FULL page shares the anchor second (maxUpdated == since, so the value
-//     cannot advance), bump `since` by one second to guarantee progress. This is
-//     the ONLY lossy edge: >per_page issues updated in the SAME second would skip
-//     the overflow. It is documented best-effort (see IssueFilter) and, for
-//     completeness, converges via the low-frequency reconcile/webhook path.
-func nextKeysetCursor(rawCount int, since time.Time, maxUpdated time.Time) Cursor {
-	if rawCount < githubMaxPerPage {
-		return ""
+//   - Short page (< per_page): scan reached the end → done, "".
+//   - Full page spanning >1 second (firstSec < lastSec): re-anchor `since` to
+//     lastSecond-1s. GitHub `since` is EXCLUSIVE, so -1s re-includes the whole
+//     last-second bucket; every earlier second was fully returned (bounded above
+//     by a present later second). Pure value advance → delete/transfer-safe; the
+//     re-read prefix is deduped by the identity ledger.
+//   - Full page entirely within ONE second S: a same-second bucket larger than a
+//     page. A second-granular `since` cannot enumerate the overflow, and a page
+//     offset walk would be corrupted by a concurrent delete. So advance PAST the
+//     second (since = S, exclusive) to guarantee progress + delete-safety, and
+//     flag IncompleteBucket so the run is marked partial, not succeeded. In
+//     practice >per_page(=100) issues sharing one second is pathological.
+func nextKeysetCursor(raw []githubIssue, since time.Time) (Cursor, bool) {
+	if len(raw) < githubMaxPerPage {
+		return "", false
 	}
-	next := maxUpdated
-	if maxUpdated.IsZero() || !maxUpdated.After(since) {
-		// Whole page at/under the anchor second: force progress by one second.
-		next = since.Add(time.Second)
+	firstSec := truncateToSecond(raw[0].UpdatedAt)
+	lastSec := truncateToSecond(raw[len(raw)-1].UpdatedAt)
+	if firstSec.IsZero() || lastSec.IsZero() {
+		// Unparseable timestamps: advance one second past the anchor so we cannot
+		// stall, and flag incomplete since we can't reason about the boundary.
+		return Cursor(since.Add(time.Second).UTC().Format(time.RFC3339)), true
 	}
-	return Cursor(next.UTC().Format(time.RFC3339))
+	if lastSec.After(firstSec) {
+		// Value transition present → advance by value to the last-second bucket.
+		return Cursor(lastSec.Add(-time.Second).UTC().Format(time.RFC3339)), false
+	}
+	// firstSec == lastSec: the whole full page is one second. Only treat it as an
+	// unenumerable OVERFLOW when the page actually holds ≥2 same-second items —
+	// that is the evidence the bucket could exceed a page. (A per_page of 1 can
+	// never provide that evidence; real GitHub per_page is 100, so this fires only
+	// for the pathological >per_page-in-one-second case.) Advance past S (exclusive
+	// since = S) to guarantee progress + delete-safety, and flag it incomplete.
+	if len(raw) >= 2 {
+		return Cursor(firstSec.UTC().Format(time.RFC3339)), true
+	}
+	// A full page of a single item in one second: advance past that second by
+	// value (exclusive), no overflow evidence.
+	return Cursor(firstSec.UTC().Format(time.RFC3339)), false
+}
+
+// truncateToSecond parses an RFC3339 timestamp to second precision (GitHub
+// timestamps are second-granular). Returns the zero time on parse failure.
+func truncateToSecond(s string) time.Time {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t.Truncate(time.Second)
 }
 
 func (p githubProvider) GetIssue(ctx context.Context, creds Credentials, repo Repository, ref IssueRef) (Issue, error) {

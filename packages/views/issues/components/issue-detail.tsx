@@ -2515,7 +2515,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
       {/* Provenance for an imported issue: source badge + conflict actions.
           Renders nothing when the issue was not imported. */}
-      <IssueSourceBadge issueId={issue.id} />
+      <IssueSourceBadge wsId={wsId} issueId={issue.id} />
 
       {/* Parent issue — standalone section, only when the issue has a
           parent. Setting a parent is reachable via the issue actions menu;

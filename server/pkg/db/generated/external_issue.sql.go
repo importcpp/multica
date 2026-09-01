@@ -1114,6 +1114,27 @@ func (q *Queries) LockExternalIssueLinkByIssue(ctx context.Context, arg LockExte
 	return i, err
 }
 
+const lockExternalIssueLinksForIssueDelete = `-- name: LockExternalIssueLinksForIssueDelete :exec
+SELECT id FROM external_issue_link
+WHERE workspace_id = $1 AND issue_id = $2
+FOR UPDATE
+`
+
+type LockExternalIssueLinksForIssueDeleteParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	IssueID     pgtype.UUID `json:"issue_id"`
+}
+
+// Take FOR UPDATE on any link rows bound to this issue BEFORE the delete path
+// locks the issue row, so issue deletion follows the same link -> issue lock
+// order as the sync applier / use-remote and cannot deadlock against a concurrent
+// Apply. A no-op (locks nothing) when the issue has no external link, so it is
+// safe to call unconditionally on every delete.
+func (q *Queries) LockExternalIssueLinksForIssueDelete(ctx context.Context, arg LockExternalIssueLinksForIssueDeleteParams) error {
+	_, err := q.db.Exec(ctx, lockExternalIssueLinksForIssueDelete, arg.WorkspaceID, arg.IssueID)
+	return err
+}
+
 const lockExternalIssueSyncRunForApply = `-- name: LockExternalIssueSyncRunForApply :one
 
 SELECT id, workspace_id, source_id, kind, state, filter_snapshot, cutoff, cursor, imported_count, updated_count, conflict_count, skipped_count, failed_count, total_seen, error_sample, attempt, worker_id, lease_expires_at, next_attempt_at, cancel_requested, created_at, updated_at, started_at, finished_at, input_snapshot, scanned_count FROM external_issue_sync_run

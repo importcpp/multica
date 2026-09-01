@@ -3915,6 +3915,16 @@ func (h *Handler) deleteIssuesAndCollectAttachmentURLs(ctx context.Context, issu
 
 	result := issueDeleteResult{}
 	for _, issue := range issues {
+		// Lock any external-issue link rows for this issue BEFORE the issue row, so
+		// deletion follows the same link -> issue order as the sync applier and
+		// use-remote; issues are pre-sorted by id above, keeping batch order
+		// deterministic. Without this the delete (issue -> link) deadlocks against a
+		// concurrent worker Apply (link -> issue). No-op when the issue has no link.
+		if err := qtx.LockExternalIssueLinksForIssueDelete(ctx, db.LockExternalIssueLinksForIssueDeleteParams{
+			WorkspaceID: issue.WorkspaceID, IssueID: issue.ID,
+		}); err != nil {
+			return issueDeleteResult{}, fmt.Errorf("lock external issue links for delete: %w", err)
+		}
 		if _, err := qtx.LockIssueForDelete(ctx, db.LockIssueForDeleteParams{
 			ID: issue.ID, WorkspaceID: issue.WorkspaceID,
 		}); err != nil {

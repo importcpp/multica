@@ -160,10 +160,11 @@ func issueState(iss map[string]any) string {
 }
 
 // writeKeysetIssuesPage emulates the GitHub issues list under the adapter's
-// value-anchored keyset: it filters the fixture issues to updated_at >= since,
-// sorts ascending, and returns the per_page slice for the requested page. This is
-// what makes the fixture faithful to the real delete/transfer-safe enumeration
-// (a removed issue simply drops out of the filtered set).
+// value-anchored keyset: it filters the fixture issues to updated_at > since
+// (GitHub `since` is EXCLUSIVE — "updated after"), sorts ascending, and returns
+// the per_page slice for the requested page. This is what makes the fixture
+// faithful to the real delete/transfer-safe enumeration (a removed issue simply
+// drops out of the filtered set).
 func writeKeysetIssuesPage(w http.ResponseWriter, r *http.Request, issues []map[string]any) {
 	perPage := 100
 	if v := r.URL.Query().Get("per_page"); v != "" {
@@ -181,12 +182,12 @@ func writeKeysetIssuesPage(w http.ResponseWriter, r *http.Request, issues []map[
 	if v := r.URL.Query().Get("since"); v != "" {
 		since, _ = time.Parse(time.RFC3339, v)
 	}
-	// Filter to updated_at >= since, keeping fixture order (which is id-ascending =
-	// updated_at-ascending by issueUpdatedAt).
+	// Filter to updated_at > since (exclusive), keeping fixture order (id-ascending
+	// = updated_at-ascending by issueUpdatedAt).
 	var matched []map[string]any
 	for _, iss := range issues {
 		t, _ := time.Parse(time.RFC3339, issueUpdatedAt(iss))
-		if since.IsZero() || !t.Before(since) {
+		if since.IsZero() || t.After(since) {
 			matched = append(matched, iss)
 		}
 	}
@@ -855,12 +856,31 @@ func TestSyncWorkerKeysetNoLossOnMidScanDelete(t *testing.T) {
 	if state, _, _ := runState(t, runID); state != "succeeded" {
 		t.Fatalf("final state = %q, want succeeded", state)
 	}
-	// Every SURVIVING issue (all but the deleted one) must be imported; the
-	// deleted one that was already imported before deletion stays imported. So the
-	// total is exactly n-1 survivors that were never imported PLUS whatever the
-	// first claim already had — i.e. at least n-1 distinct issues, none lost.
-	if got := countWsIssues(t, workspaceID); got < n-1 {
-		t.Fatalf("imported issues = %d, want >= %d (no survivor lost to mid-scan delete)", got, n-1)
+	// Assert EVERY identity is present, not a loose count: id=1 (the earliest) was
+	// imported during the first claim before it was deleted, and ids 2..n are
+	// survivors the keyset must still reach. Check each external_issue_id in the
+	// link table so a silently-dropped survivor cannot pass.
+	rows, err := testPool.Query(context.Background(),
+		`SELECT external_issue_id FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+	if err != nil {
+		t.Fatalf("query links: %v", err)
+	}
+	defer rows.Close()
+	present := map[string]bool{}
+	for rows.Next() {
+		var extID string
+		if err := rows.Scan(&extID); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		present[extID] = true
+	}
+	for id := 1; id <= n; id++ {
+		if !present[fmt.Sprintf("%d", id)] {
+			t.Fatalf("issue identity %d missing after mid-scan delete; present=%v", id, present)
+		}
+	}
+	if got := countWsIssues(t, workspaceID); got != n {
+		t.Fatalf("imported issues = %d, want exactly %d (id=1 imported before delete + all survivors)", got, n)
 	}
 }
 
@@ -1061,5 +1081,52 @@ func TestSyncWorkerSupersetScanFiltersRequestedState(t *testing.T) {
 	}
 	if n := countWsIssues(t, workspaceID); n != 2 {
 		t.Fatalf("issue rows = %d, want 2", n)
+	}
+}
+
+// A same-second overflow bucket (more issues in one updated_at second than a page
+// holds) cannot be safely enumerated, so the provider skips past it and the run
+// finishes PARTIAL with an explanatory error sample — never a falsely-complete
+// succeeded. Regression for codex56 round-7 (no reconcile consumer exists yet, so
+// an incomplete scan must not report success).
+func TestSyncWorkerSameSecondOverflowMarksPartial(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	// per_page=2 with three issues sharing ONE second => the first full page is an
+	// overflow bucket the keyset cannot split.
+	sameSecond := "2026-02-01T00:00:00Z"
+	pages := [][]map[string]any{{
+		{"id": 1, "number": 1, "title": "a", "state": "open", "updated_at": sameSecond},
+		{"id": 2, "number": 2, "title": "b", "state": "open", "updated_at": sameSecond},
+		{"id": 3, "number": 3, "title": "c", "state": "open", "updated_at": sameSecond},
+	}}
+	workspaceID, sourceID, _, _ := seedSyncWorkerFixture(t, pages)
+	// seedSyncWorkerFixture forces per_page=1; override to 2 so the same-second
+	// page is a genuine overflow (>=2 items in one second).
+	t.Cleanup(externalissue.SetMaxPerPageForTest(2))
+	withFakeToken(t)
+	runID := queueRun(t, workspaceID, sourceID)
+
+	w := NewExternalIssueSyncWorker(testHandler)
+	for i := 0; i < 8; i++ {
+		if _, err := w.ProcessNext(context.Background()); err != nil {
+			t.Fatalf("ProcessNext: %v", err)
+		}
+		if st, _, _ := runState(t, runID); st == "succeeded" || st == "partial" {
+			break
+		}
+	}
+	state, _, _ := runState(t, runID)
+	if state != "partial" {
+		t.Fatalf("state = %q, want partial (incomplete same-second bucket)", state)
+	}
+	var sample string
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT error_sample::text FROM external_issue_sync_run WHERE id=$1`, runID).Scan(&sample); err != nil {
+		t.Fatalf("read error_sample: %v", err)
+	}
+	if !strings.Contains(sample, "same-second") {
+		t.Fatalf("error_sample = %q, want the incomplete-bucket marker", sample)
 	}
 }

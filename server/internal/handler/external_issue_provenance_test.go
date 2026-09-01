@@ -590,3 +590,206 @@ func TestImportGitHubIssuesConcurrentDifferentInputs(t *testing.T) {
 		t.Fatalf("active runs = %d, want 1 (no double-create under concurrency)", runCount)
 	}
 }
+
+// use_remote must reject a stale snapshot even when the concurrent sync landed in
+// the SAME wall-clock second. The optimistic token is the link's updated_at read
+// before the remote fetch; if a sync bumps the link's updated_at (to the same
+// second) after that read, UseRemoteFields returns ErrRemoteStale and does NOT
+// overwrite the issue with the older fetched content. Regression for codex56
+// round-7 same-second stale overwrite.
+func TestUseRemoteFieldsRejectsStaleSameSecond(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"st", "st-"+suffix+"@t.local").Scan(&userID); err != nil {
+		t.Fatalf("user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"st-ws", "st-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationID); err != nil {
+		t.Fatalf("installation: %v", err)
+	}
+	var sourceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_source
+		(workspace_id,provider,instance_key,credential_id,repository_external_id,repository_full_path,configured_by_user_id,filter)
+		VALUES($1,'github','github.com',$2,'555','acme/widgets',$3,'{"state":"open"}') RETURNING id`,
+		workspaceID, installationID, userID).Scan(&sourceID); err != nil {
+		t.Fatalf("source: %v", err)
+	}
+	var issueID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO issue(workspace_id,number,title,description,status,priority,creator_type,creator_id,position)
+		VALUES($1,1,'v2-current','b','backlog','none','member',$2,-1) RETURNING id`,
+		workspaceID, userID).Scan(&issueID); err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	// Link with a FIXED updated_at (the token the handler would have read).
+	fixed := "2026-02-01T00:00:00Z"
+	var linkID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_link
+		(workspace_id,provider,instance_key,external_issue_id,source_id,issue_id,display_number,external_html_url,remote_state,title_baseline_hash,body_baseline_hash,title_conflict,updated_at)
+		VALUES($1,'github','github.com','900',$2,$3,900,'h','open','oldhash','bhash',true,$4::timestamptz) RETURNING id`,
+		workspaceID, sourceID, issueID, fixed).Scan(&linkID); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	q := db.New(testPool)
+	issues := &service.IssueService{Queries: q, TxStarter: testPool, Bus: events.New()}
+	svc := service.NewExternalIssueSyncService(q, testPool, events.New(), issues)
+
+	// The handler read the link at t0=fixed. Now a concurrent sync bumps the link's
+	// updated_at to the SAME second (a different microsecond within it).
+	staleToken, _ := time.Parse(time.RFC3339, fixed)
+	if _, err := testPool.Exec(ctx, `UPDATE external_issue_link SET updated_at=$2::timestamptz WHERE id=$1`,
+		linkID, "2026-02-01T00:00:00.500000Z"); err != nil {
+		t.Fatalf("bump link: %v", err)
+	}
+
+	// use_remote with the stale token must be rejected and must NOT overwrite.
+	err := svc.UseRemoteFields(ctx, util.MustParseUUID(workspaceID), util.MustParseUUID(issueID),
+		"v1-stale", "b", staleToken, true, false)
+	if !errorsIs(err, service.ErrRemoteStale) {
+		t.Fatalf("UseRemoteFields err = %v, want ErrRemoteStale", err)
+	}
+	var title string
+	if err := testPool.QueryRow(ctx, `SELECT title FROM issue WHERE id=$1`, issueID).Scan(&title); err != nil {
+		t.Fatalf("read issue: %v", err)
+	}
+	if title != "v2-current" {
+		t.Fatalf("issue title = %q, want v2-current (stale use_remote must not overwrite)", title)
+	}
+}
+
+// Deleting an imported issue must follow the link -> issue lock order (same as
+// the sync applier / use-remote) so it cannot deadlock against a concurrent
+// worker Apply. A holder tx locks the LINK first, then (after the delete has
+// started) the ISSUE; with the correct order the delete blocks on the link lock
+// and proceeds once the holder commits — no 40P01. Regression for codex56
+// round-7 Delete/Apply deadlock.
+func TestDeleteIssueLockOrderNoDeadlock(t *testing.T) {
+	if testPool == nil {
+		t.Skip("database unavailable")
+	}
+	ctx := context.Background()
+	suffix := util.UUIDToString(dbid.NewV7())
+	var userID, workspaceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO "user"(name,email) VALUES($1,$2) RETURNING id`,
+		"dd", "dd-"+suffix+"@t.local").Scan(&userID); err != nil {
+		t.Fatalf("user: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM "user" WHERE id=$1`, userID) })
+	if err := testPool.QueryRow(ctx, `INSERT INTO workspace(name,slug,description) VALUES($1,$2,'') RETURNING id`,
+		"dd-ws", "dd-"+suffix).Scan(&workspaceID); err != nil {
+		t.Fatalf("workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_link WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM external_issue_source WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM issue WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM github_installation WHERE workspace_id=$1`, workspaceID)
+		_, _ = testPool.Exec(c, `DELETE FROM workspace WHERE id=$1`, workspaceID)
+	})
+	var installationID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO github_installation(workspace_id,installation_id,account_login,account_type,connected_by_id)
+		VALUES($1,$2,'acme','Organization',$3) RETURNING id`,
+		workspaceID, time.Now().UnixNano()%1_000_000_000, userID).Scan(&installationID); err != nil {
+		t.Fatalf("installation: %v", err)
+	}
+	var sourceID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_source
+		(workspace_id,provider,instance_key,credential_id,repository_external_id,repository_full_path,configured_by_user_id,filter)
+		VALUES($1,'github','github.com',$2,'555','acme/widgets',$3,'{"state":"open"}') RETURNING id`,
+		workspaceID, installationID, userID).Scan(&sourceID); err != nil {
+		t.Fatalf("source: %v", err)
+	}
+	var issueID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO issue(workspace_id,number,title,description,status,priority,creator_type,creator_id,position)
+		VALUES($1,1,'x','b','backlog','none','member',$2,-1) RETURNING id`,
+		workspaceID, userID).Scan(&issueID); err != nil {
+		t.Fatalf("issue: %v", err)
+	}
+	var linkID string
+	if err := testPool.QueryRow(ctx, `INSERT INTO external_issue_link
+		(workspace_id,provider,instance_key,external_issue_id,source_id,issue_id,display_number,external_html_url,remote_state,title_baseline_hash,body_baseline_hash)
+		VALUES($1,'github','github.com','900',$2,$3,900,'h','open','th','bh') RETURNING id`,
+		workspaceID, sourceID, issueID).Scan(&linkID); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+
+	issueRow, err := db.New(testPool).GetIssueInWorkspace(ctx, db.GetIssueInWorkspaceParams{
+		ID: util.MustParseUUID(issueID), WorkspaceID: util.MustParseUUID(workspaceID),
+	})
+	if err != nil {
+		t.Fatalf("load issue: %v", err)
+	}
+	h := &Handler{Queries: db.New(testPool), TxStarter: testPool}
+
+	// Holder tx: lock the LINK first (like a worker Apply claim).
+	holder, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin holder: %v", err)
+	}
+	defer holder.Rollback(ctx)
+	if _, err := holder.Exec(ctx, `SELECT id FROM external_issue_link WHERE id=$1 FOR UPDATE`, linkID); err != nil {
+		t.Fatalf("holder lock link: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, derr := h.deleteIssuesAndCollectAttachmentURLs(context.Background(), []db.Issue{issueRow}, nil)
+		done <- derr
+	}()
+
+	time.Sleep(300 * time.Millisecond)
+	// Holder locks the ISSUE (order link->issue) then commits. Under the old
+	// issue-first delete order this deadlocked here.
+	if _, err := holder.Exec(ctx, `SELECT id FROM issue WHERE id=$1 FOR UPDATE`, issueID); err != nil {
+		t.Fatalf("holder lock issue: %v", err)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatalf("holder commit: %v", err)
+	}
+
+	select {
+	case derr := <-done:
+		if derr != nil {
+			t.Fatalf("delete returned error (deadlock?): %v", derr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("delete did not complete — likely deadlocked")
+	}
+
+	var n int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE id=$1`, issueID).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("issue not deleted, count=%d", n)
+	}
+	// The import link is tombstoned (issue_id cleared), not dropped.
+	var linkIssueID *string
+	if err := testPool.QueryRow(ctx, `SELECT issue_id::text FROM external_issue_link WHERE id=$1`, linkID).Scan(&linkIssueID); err != nil {
+		t.Fatalf("read link: %v", err)
+	}
+	if linkIssueID != nil {
+		t.Fatalf("link issue_id = %v, want NULL (tombstoned)", *linkIssueID)
+	}
+}

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -126,20 +127,26 @@ func (h *Handler) ResolveIssueExternalConflict(w http.ResponseWriter, r *http.Re
 	case "use_remote":
 		// Fetch the CURRENT remote content and apply it through the shared,
 		// event-emitting update path — a real overwrite, not just a baseline nudge.
+		// The link's updated_at (read above, pre-fetch) is the optimistic token: if
+		// a concurrent sync bumps the link while we fetch, UseRemoteFields rejects
+		// the write as stale and we 409 so the client re-fetches.
+		var linkToken time.Time
+		if link.UpdatedAt.Valid {
+			linkToken = link.UpdatedAt.Time
+		}
 		remote, status, err := h.fetchRemoteIssue(r, issue.WorkspaceID, link)
 		if err != nil {
 			writeError(w, status, "failed to fetch remote issue")
 			return
 		}
-		var remoteUpdated time.Time
-		if remote.RemoteUpdatedAt != "" {
-			if t, perr := time.Parse(time.RFC3339, remote.RemoteUpdatedAt); perr == nil {
-				remoteUpdated = t
-			}
-		}
 		if err := h.ExternalIssueSync.UseRemoteFields(
-			r.Context(), issue.WorkspaceID, issue.ID, remote.Title, remote.Body, remoteUpdated, wantTitle, wantBody,
+			r.Context(), issue.WorkspaceID, issue.ID, remote.Title, remote.Body, linkToken, wantTitle, wantBody,
 		); err != nil {
+			if errors.Is(err, service.ErrRemoteStale) {
+				writeErrorCode(w, http.StatusConflict, "remote_changed",
+					"this issue was synced again while resolving; reopen the conflict and try again")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "failed to apply remote content")
 			return
 		}
