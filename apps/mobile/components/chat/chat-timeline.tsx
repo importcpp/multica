@@ -174,11 +174,38 @@ function ToolCallRow({ item }: { item: TaskMessagePayload }) {
   );
 }
 
+// Rendering limit for a collapsed tool result. Unrelated to the server's
+// persistence budget, which output_truncated reports separately — a collapsed
+// body is not lost data, and the two must not read as the same thing.
+const DISPLAY_CLIP_CHARS = 4000;
+
+/**
+ * Badge text for a tool result whose stored output is only a preview.
+ *
+ * Says "source truncated" rather than just "truncated" so it cannot be read as
+ * the row being collapsed for layout — that is a different thing and is
+ * labelled separately.
+ */
+function formatSourceTruncated(originalBytes?: number): string {
+  if (typeof originalBytes !== "number" || !Number.isFinite(originalBytes) || originalBytes < 0) {
+    return "source truncated";
+  }
+  if (originalBytes < 1024) return `source truncated · ${originalBytes} B total`;
+  if (originalBytes < 1024 * 1024) {
+    return `source truncated · ${Math.round(originalBytes / 1024)} KB total`;
+  }
+  return `source truncated · ${(originalBytes / (1024 * 1024)).toFixed(1)} MB total`;
+}
+
 function ToolResultRow({ item }: { item: TaskMessagePayload }) {
   const output = item.output ?? "";
   if (!output) return null;
   const preview = output.length > 80 ? `${output.slice(0, 80)}…` : output;
   const prefix = item.tool ? `${item.tool} result: ` : "result: ";
+  const isClipped = output.length > DISPLAY_CLIP_CHARS;
+  // === true, not a truthy check: undefined means an older daemon could not
+  // report, which is not the same as confirming the output is complete.
+  const sourceTruncated = item.output_truncated === true;
   return (
     <Collapsible>
       <CollapsibleTrigger asChild>
@@ -196,15 +223,23 @@ function ToolResultRow({ item }: { item: TaskMessagePayload }) {
             <Text className="text-xs text-muted-foreground">{prefix}</Text>
             {preview}
           </Text>
+          {sourceTruncated && (
+            <Text className="shrink-0 text-[10px] text-amber-600 dark:text-amber-500">
+              {formatSourceTruncated(item.output_original_bytes)}
+            </Text>
+          )}
         </View>
       </CollapsibleTrigger>
       <CollapsibleContent>
         <View className="ml-4 mt-1 rounded bg-muted/40 px-2 py-1.5">
           <Text className="text-xs text-muted-foreground">
-            {output.length > 4000
-              ? `${output.slice(0, 4000)}\n…(truncated)`
-              : output}
+            {isClipped ? output.slice(0, DISPLAY_CLIP_CHARS) : output}
           </Text>
+          {isClipped && (
+            <Text className="mt-1 text-[10px] text-muted-foreground/70">
+              {`Showing the first ${DISPLAY_CLIP_CHARS} characters of the stored preview.`}
+            </Text>
+          )}
         </View>
       </CollapsibleContent>
     </Collapsible>
