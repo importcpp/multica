@@ -4,71 +4,191 @@ package redact
 
 import (
 	"regexp"
+	"strings"
 )
 
 // secretPattern pairs a compiled regex with its replacement text.
+//
+// partialAtEOF recognises a *prefix* of this pattern's secret sitting at the
+// very end of a string — text that is not yet a full match but would become one
+// if more bytes followed. PreviewPrefix uses it to decide where a bounded
+// window has to be cut: a secret whose tail was left outside the window can
+// never be matched by re, so the visible head would survive redaction in
+// plaintext. See PreviewPrefix for the full argument.
+//
+// Every entry MUST supply either partialAtEOF or an entry in
+// multilinePartialFuncs. TestEverySecretPatternHasPartial enforces this, so a
+// newly added rule cannot silently ship without truncation coverage.
 type secretPattern struct {
-	re          *regexp.Regexp
-	replacement string
+	re           *regexp.Regexp
+	partialAtEOF *regexp.Regexp
+	replacement  string
 }
+
+// partialFor builds an EOF-anchored matcher for "an incomplete occurrence of a
+// secret that starts with one of lits".
+//
+// Two shapes are accepted, and the distinction is load-bearing:
+//
+//   - a STRICT prefix of a literal, with nothing after it ("Beare", "AKI").
+//     Nothing may follow, because the literal itself is still unfinished.
+//   - the COMPLETE literal followed by an optional, partial value ("AKIA1234").
+//     The value tail must be optional: the window can end exactly at the
+//     literal, before the separator or value has been emitted.
+//
+// Letting a strict prefix carry a value charset is what makes this dangerous
+// rather than merely conservative: "a" is a prefix of "amqp://", so
+// `a[^\s]*\z` matches the tail of any single-line output and would cut the
+// whole preview away.
+func partialFor(lits []string, valueTail string) *regexp.Regexp {
+	strict := make([]string, 0, 16)
+	full := make([]string, 0, len(lits))
+	for _, lit := range lits {
+		for i := len(lit) - 1; i >= 1; i-- {
+			strict = append(strict, regexp.QuoteMeta(lit[:i]))
+		}
+		full = append(full, regexp.QuoteMeta(lit))
+	}
+	return regexp.MustCompile(`(?i)\b(?:` +
+		`(?:` + strings.Join(strict, "|") + `)` +
+		`|` +
+		`(?:` + strings.Join(full, "|") + `)(?:` + valueTail + `)?` +
+		`)\z`)
+}
+
+// Literal openers, kept next to the rules that consume them so the two cannot
+// drift apart.
+var (
+	awsSecretKeyNames = []string{"aws_secret_access_key", "secret_access_key", "secretaccesskey", "secret_accesskey", "secretaccess_key"}
+	githubTokenPrefix = []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
+	slackTokenPrefix  = []string{"xoxb-", "xoxp-", "xoxo-", "xoxr-", "xoxa-", "xoxs-", "xoxe-"}
+	stripeKeyPrefix   = []string{"sk_live_", "rk_live_"}
+	connectionSchemes = []string{"postgresql://", "postgres://", "mysql://", "mongodb://", "redis://", "amqp://"}
+	genericSecretKeys = []string{
+		"API_KEY", "API_SECRET", "SECRET_KEY", "SECRET", "ACCESS_TOKEN", "AUTH_TOKEN",
+		"PRIVATE_KEY", "DATABASE_URL", "DB_PASSWORD", "DB_URL", "REDIS_URL", "PASSWORD", "TOKEN",
+	}
+)
 
 // Patterns are checked in order; first match wins per position.
 var patterns = []secretPattern{
 	// AWS access key IDs (always start with AKIA)
-	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "[REDACTED AWS KEY]"},
+	{
+		re:           regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+		partialAtEOF: partialFor([]string{"AKIA"}, `[0-9A-Z]{0,16}`),
+		replacement:  "[REDACTED AWS KEY]",
+	},
 
 	// AWS secret access keys (40 char base64-ish, preceded by a common separator)
-	{regexp.MustCompile(`(?i)(?:aws_secret_access_key|secret_?access_?key)\s*[=:]\s*[A-Za-z0-9/+=]{40}`), "[REDACTED AWS SECRET]"},
+	{
+		re:           regexp.MustCompile(`(?i)(?:aws_secret_access_key|secret_?access_?key)\s*[=:]\s*[A-Za-z0-9/+=]{40}`),
+		partialAtEOF: partialFor(awsSecretKeyNames, `\s*(?:[=:]\s*[A-Za-z0-9/+=]{0,40})?`),
+		replacement:  "[REDACTED AWS SECRET]",
+	},
 
 	// PEM private keys (multi-line)
-	{regexp.MustCompile(`(?s)-----BEGIN[A-Z\s]*PRIVATE KEY-----.*?-----END[A-Z\s]*PRIVATE KEY-----`), "[REDACTED PRIVATE KEY]"},
+	// The partial case is handled by pemPartialStart rather than a
+	// partialAtEOF regex: RE2 has no lookahead, so "a BEGIN marker with no
+	// matching END" cannot be expressed as one anchored pattern.
+	{
+		re:          regexp.MustCompile(`(?s)-----BEGIN[A-Z\s]*PRIVATE KEY-----.*?-----END[A-Z\s]*PRIVATE KEY-----`),
+		replacement: "[REDACTED PRIVATE KEY]",
+	},
 
 	// GitHub tokens (classic PAT, OAuth, user-to-server, server-to-server, refresh)
-	{regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b`), "[REDACTED GITHUB TOKEN]"},
+	{
+		re:           regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b`),
+		partialAtEOF: partialFor(githubTokenPrefix, `[A-Za-z0-9_]{0,255}`),
+		replacement:  "[REDACTED GITHUB TOKEN]",
+	},
 
 	// GitHub fine-grained personal access tokens use the github_pat_ prefix,
 	// which the classic ghp_/gho_/... pattern above does not cover. Without
 	// this line a fine-grained PAT emitted in agent output leaks unredacted
 	// to the database and WebSocket broadcast.
-	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,255}\b`), "[REDACTED GITHUB TOKEN]"},
+	{
+		re:           regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,255}\b`),
+		partialAtEOF: partialFor([]string{"github_pat_"}, `[A-Za-z0-9_]{0,255}`),
+		replacement:  "[REDACTED GITHUB TOKEN]",
+	},
 
 	// OpenAI / Anthropic API keys
-	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`), "[REDACTED API KEY]"},
+	{
+		re:           regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`),
+		partialAtEOF: partialFor([]string{"sk-"}, `[A-Za-z0-9_-]*`),
+		replacement:  "[REDACTED API KEY]",
+	},
 
 	// Slack bot/user/legacy tokens. The char class includes 'e' so the
 	// newer xoxe- config/refresh tokens are covered alongside xoxb/p/o/r/a/s.
-	{regexp.MustCompile(`\bxox[bporase]-[A-Za-z0-9\-]{10,}\b`), "[REDACTED SLACK TOKEN]"},
+	{
+		re:           regexp.MustCompile(`\bxox[bporase]-[A-Za-z0-9\-]{10,}\b`),
+		partialAtEOF: partialFor(slackTokenPrefix, `[A-Za-z0-9\-]*`),
+		replacement:  "[REDACTED SLACK TOKEN]",
+	},
 
 	// Slack app-level tokens use the xapp- prefix, which the xox*- rule above
 	// does not match. Without this an app-level token echoed in agent output
 	// leaks unredacted to the DB / WebSocket broadcast.
-	{regexp.MustCompile(`\bxapp-[A-Za-z0-9-]{10,}\b`), "[REDACTED SLACK TOKEN]"},
+	{
+		re:           regexp.MustCompile(`\bxapp-[A-Za-z0-9-]{10,}\b`),
+		partialAtEOF: partialFor([]string{"xapp-"}, `[A-Za-z0-9-]*`),
+		replacement:  "[REDACTED SLACK TOKEN]",
+	},
 
 	// GitLab personal access tokens
-	{regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}\b`), "[REDACTED GITLAB TOKEN]"},
+	{
+		re:           regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}\b`),
+		partialAtEOF: partialFor([]string{"glpat-"}, `[A-Za-z0-9_-]*`),
+		replacement:  "[REDACTED GITLAB TOKEN]",
+	},
 
 	// Google API keys always start with the AIza prefix and are 39 chars total
 	// (AIza + 35). Capture and restore the trailing delimiter so keys ending in
 	// a non-word character such as '-' are still redacted.
-	{regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}([^0-9A-Za-z_-]|$)`), "[REDACTED GOOGLE API KEY]$1"},
+	{
+		re:           regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}([^0-9A-Za-z_-]|$)`),
+		partialAtEOF: partialFor([]string{"AIza"}, `[0-9A-Za-z_-]{0,35}`),
+		replacement:  "[REDACTED GOOGLE API KEY]$1",
+	},
 
 	// Stripe secret / restricted live keys (sk_live_ / rk_live_). The sk-
 	// rule above only matches the hyphen form used by OpenAI/Anthropic; Stripe
 	// uses an underscore, so live keys are not covered without this. Publishable
 	// keys (pk_live_) are intentionally excluded — they are not secret.
-	{regexp.MustCompile(`\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b`), "[REDACTED STRIPE KEY]"},
+	{
+		re:           regexp.MustCompile(`\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b`),
+		partialAtEOF: partialFor(stripeKeyPrefix, `[0-9A-Za-z]*`),
+		replacement:  "[REDACTED STRIPE KEY]",
+	},
 
 	// JWT tokens (three base64url segments)
-	{regexp.MustCompile(`\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`), "[REDACTED JWT]"},
+	{
+		re:           regexp.MustCompile(`\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`),
+		partialAtEOF: partialFor([]string{"ey"}, `[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}`),
+		replacement:  "[REDACTED JWT]",
+	},
 
 	// Generic "Bearer <token>" in output
-	{regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b`), "Bearer [REDACTED]"},
+	{
+		re:           regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b`),
+		partialAtEOF: partialFor([]string{"Bearer"}, `\s+[A-Za-z0-9\-._~+/]*=*`),
+		replacement:  "Bearer [REDACTED]",
+	},
 
 	// Connection strings with embedded passwords
-	{regexp.MustCompile(`(?i)(?:postgres|mysql|mongodb|redis|amqp)(?:ql)?://[^:\s]+:[^@\s]+@`), "[REDACTED CONNECTION STRING]@"},
+	{
+		re:           regexp.MustCompile(`(?i)(?:postgres|mysql|mongodb|redis|amqp)(?:ql)?://[^:\s]+:[^@\s]+@`),
+		partialAtEOF: partialFor(connectionSchemes, `[^\s]*`),
+		replacement:  "[REDACTED CONNECTION STRING]@",
+	},
 
 	// Generic key=value patterns for common secret env var names
-	{regexp.MustCompile(`(?i)(?:API_KEY|API_SECRET|SECRET_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DATABASE_URL|DB_PASSWORD|DB_URL|REDIS_URL|PASSWORD|TOKEN)\s*[=:]\s*\S+`), "[REDACTED CREDENTIAL]"},
+	{
+		re:           regexp.MustCompile(`(?i)(?:API_KEY|API_SECRET|SECRET_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DATABASE_URL|DB_PASSWORD|DB_URL|REDIS_URL|PASSWORD|TOKEN)\s*[=:]\s*\S+`),
+		partialAtEOF: partialFor(genericSecretKeys, `\s*(?:[=:]\s*\S*)?`),
+		replacement:  "[REDACTED CREDENTIAL]",
+	},
 }
 
 // maxRedactDepth bounds the walk in redactValue. Tool inputs are decoded from
@@ -166,4 +286,115 @@ func Text(s string) string {
 		s = p.re.ReplaceAllString(s, p.replacement)
 	}
 	return s
+}
+
+// pemBeginMarker / pemEndMarker locate the delimiters of the multi-line PEM
+// rule. The end marker must be matched as a whole: a window cut in the middle
+// of "-----END RSA PRIVATE KEY-----" contains the substring "-----END" while
+// the key is in fact still open, and a substring test would call it closed.
+var (
+	pemBeginMarker = regexp.MustCompile(`-----BEGIN[A-Z\s]*PRIVATE KEY-----`)
+	pemEndMarker   = regexp.MustCompile(`-----END[A-Z\s]*PRIVATE KEY-----`)
+
+	// pemBeginPartial matches a strict prefix of a BEGIN marker at end of
+	// string, generated from the canonical marker spellings rather than
+	// hand-nested, which is both unreadable and easy to get wrong.
+	pemBeginPartial = regexp.MustCompile(strictPrefixAlternation([]string{
+		"-----BEGIN RSA PRIVATE KEY-----",
+		"-----BEGIN EC PRIVATE KEY-----",
+		"-----BEGIN DSA PRIVATE KEY-----",
+		"-----BEGIN OPENSSH PRIVATE KEY-----",
+		"-----BEGIN PGP PRIVATE KEY BLOCK-----",
+		"-----BEGIN ENCRYPTED PRIVATE KEY-----",
+		"-----BEGIN PRIVATE KEY-----",
+	}) + `\z`)
+)
+
+// strictPrefixAlternation returns a group matching any strict prefix of any
+// literal, longest first so the regex engine prefers the longest cut.
+func strictPrefixAlternation(lits []string) string {
+	seen := make(map[string]bool)
+	alts := make([]string, 0, 64)
+	longest := 0
+	for _, lit := range lits {
+		if len(lit) > longest {
+			longest = len(lit)
+		}
+	}
+	for n := longest - 1; n >= 1; n-- {
+		for _, lit := range lits {
+			if n >= len(lit) {
+				continue
+			}
+			p := lit[:n]
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			alts = append(alts, regexp.QuoteMeta(p))
+		}
+	}
+	return "(?:" + strings.Join(alts, "|") + ")"
+}
+
+// pemPartialStart reports where an unterminated PEM private key begins, or -1.
+// This is the multi-line counterpart to partialAtEOF; see secretPattern.
+func pemPartialStart(s string) int {
+	// Skip past any complete key first. Its END marker ends in "-----", which
+	// is itself a strict prefix of a BEGIN marker, so a scan over the whole
+	// string would read a properly closed key as an unfinished one.
+	searchFrom := 0
+	for {
+		loc := pemBeginMarker.FindStringIndex(s[searchFrom:])
+		if loc == nil {
+			break
+		}
+		begin := searchFrom + loc[0]
+		end := pemEndMarker.FindStringIndex(s[begin:])
+		if end == nil {
+			// Opened and never closed: everything from here on is key material.
+			return begin
+		}
+		searchFrom = begin + end[1]
+	}
+	if loc := pemBeginPartial.FindStringIndex(s[searchFrom:]); loc != nil {
+		return searchFrom + loc[0]
+	}
+	return -1
+}
+
+// PreviewPrefix returns the longest prefix of s that is safe to keep when the
+// rest of s is being discarded, together with the redacted form of that prefix.
+//
+// Truncating first and redacting afterwards is not safe, and the failure is not
+// hypothetical: cutting "postgres://user:<pw>@host" before the '@', or a JWT
+// before its second '.', leaves text that no pattern in this package matches,
+// so the visible head of the credential is stored and broadcast in plaintext.
+// Redacting the whole input first would be safe but costs ~0.6us/byte over an
+// unbounded tool output — several seconds of the user's CPU for a payload whose
+// tail is about to be thrown away.
+//
+// So: scan only the window, and before redacting it, cut away any trailing text
+// that could be the beginning of a secret whose completion lies outside. What
+// remains cannot contain a straddling secret, and the ordinary redaction pass
+// handles everything wholly inside.
+//
+// The returned prefix is a rune boundary. Callers still own the byte budget:
+// redaction can grow text (a 7-byte "TOKEN=x" becomes a 21-byte placeholder),
+// so redactedPrefix may be longer than prefix.
+func PreviewPrefix(s string) (prefix, redactedPrefix string) {
+	cut := len(s)
+	for _, p := range patterns {
+		if p.partialAtEOF == nil {
+			continue
+		}
+		if loc := p.partialAtEOF.FindStringIndex(s); loc != nil && loc[0] < cut {
+			cut = loc[0]
+		}
+	}
+	if i := pemPartialStart(s); i >= 0 && i < cut {
+		cut = i
+	}
+	prefix = s[:cut]
+	return prefix, Text(prefix)
 }

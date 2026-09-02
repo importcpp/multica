@@ -437,9 +437,10 @@ func (b *claudeBackend) handleUser(msg claudeSDKMessage, ch chan<- Message) bool
 				}
 			}
 			trySend(ch, Message{
-				Type:   MessageToolResult,
-				CallID: block.ToolUseID,
-				Output: resultStr,
+				Type:          MessageToolResult,
+				CallID:        block.ToolUseID,
+				Output:        resultStr,
+				OutputIsImage: containsImageContentBlock(block.Content),
 			})
 		}
 	}
