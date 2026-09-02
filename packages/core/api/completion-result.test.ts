@@ -46,7 +46,7 @@ describe("CompletionResultSchema", () => {
   });
 
   it("defaults missing artifact_ids to an empty array", () => {
-    expect(CompletionResultSchema.parse({ version: 1, summary: "s" }).artifact_ids).toEqual([]);
+    expect(CompletionResultSchema.parse({ version: 1, summary: "s" })?.artifact_ids).toEqual([]);
   });
 
   it("degrades a malformed artifact_ids without losing the summary", () => {
