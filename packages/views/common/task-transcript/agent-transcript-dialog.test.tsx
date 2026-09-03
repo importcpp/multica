@@ -972,4 +972,45 @@ describe("tool result truncation", () => {
     renderDialog([unknown, { ...unknown, seq: 2 }, { ...unknown, seq: 3 }]);
     expect(screen.getAllByText(/recorded before truncation was tracked/i)).toHaveLength(1);
   });
+
+  it("labels its own display clipping separately from source truncation", async () => {
+    // Two different facts. The stored preview is longer than this surface
+    // paints (display), versus the agent produced more than was stored
+    // (source). Conflating them told users a long-but-complete result had lost
+    // data. This also covers the {{count}} interpolation, which no assertion
+    // reached until now.
+    renderDialog([
+      {
+        seq: 1,
+        type: "tool_result",
+        tool: "terminal",
+        output: "x".repeat(9000),
+        output_truncated: false,
+        output_original_bytes: 9000,
+      },
+    ]);
+    await openInspector();
+    expect(
+      await screen.findByText(/Showing the first 8000 characters of the stored preview/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Source truncated/i)).toBeNull();
+  });
+
+  it("shows both labels when a long preview is also a truncated source", async () => {
+    // These are independent: a preview can be clipped for layout AND be all
+    // that was stored of a much larger output.
+    renderDialog([
+      {
+        seq: 1,
+        type: "tool_result",
+        tool: "terminal",
+        output: "y".repeat(9000),
+        output_truncated: true,
+        output_original_bytes: 2097152,
+      },
+    ]);
+    await openInspector();
+    expect(await screen.findByText(/Showing the first 8000 characters/)).toBeTruthy();
+    expect(screen.getByText(/Source truncated · 2\.0 MB total/)).toBeTruthy();
+  });
 });

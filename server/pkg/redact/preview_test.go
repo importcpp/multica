@@ -12,37 +12,44 @@ import (
 var canonicalSecrets = []struct {
 	name string
 	text string
+	// witness is a short, fixed, recognisable head of the secret. Assertions
+	// use it instead of "everything before the cut", because the latter cannot
+	// tell a real fix from a stub that drops one byte: shortening the expected
+	// string by a byte makes a substring check pass while the rest of the
+	// credential is still sitting in the preview. See the mutation guard in
+	// TestOracleRejectsTrivialTruncation.
+	witness string
 }{
-	{"aws secret space", "AWS_SECRET_ACCESS_KEY: " + strings.Repeat("A", 40)},
-	{"aws secret newline", "AWS_SECRET_ACCESS_KEY:\n" + strings.Repeat("A", 40)},
-	{"aws secret tab", "AWS_SECRET_ACCESS_KEY:\t" + strings.Repeat("A", 40)},
-	{"aws secret bare", "AWS_SECRET_ACCESS_KEY:" + strings.Repeat("A", 40)},
-	{"aws secret spaced equals", "AWS_SECRET_ACCESS_KEY = " + strings.Repeat("A", 40)},
-	{"aws access key id", "AKIA" + strings.Repeat("B", 16)},
-	{"github classic", "ghp_" + strings.Repeat("k", 36)},
-	{"github fine grained", "github_pat_" + strings.Repeat("z", 25)},
-	{"google api key", "AIza" + strings.Repeat("c", 35)},
-	{"jwt", "ey" + strings.Repeat("a", 12) + "." + strings.Repeat("b", 12) + "." + strings.Repeat("c", 12)},
-	{"bearer", "Bearer " + strings.Repeat("t", 30)},
+	{"aws secret space", "AWS_SECRET_ACCESS_KEY: " + strings.Repeat("A", 40), "AWS_SECRET_ACCESS_KEY: AAAAAAAA"},
+	{"aws secret newline", "AWS_SECRET_ACCESS_KEY:\n" + strings.Repeat("A", 40), "AWS_SECRET_ACCESS_KEY:\nAAAAAAAA"},
+	{"aws secret tab", "AWS_SECRET_ACCESS_KEY:\t" + strings.Repeat("A", 40), "AWS_SECRET_ACCESS_KEY:\tAAAAAAAA"},
+	{"aws secret bare", "AWS_SECRET_ACCESS_KEY:" + strings.Repeat("A", 40), "AWS_SECRET_ACCESS_KEY:AAAAAAAA"},
+	{"aws secret spaced equals", "AWS_SECRET_ACCESS_KEY = " + strings.Repeat("A", 40), "AWS_SECRET_ACCESS_KEY = AAAAAAAA"},
+	{"aws access key id", "AKIA" + strings.Repeat("B", 16), "AKIABBBBBBBB"},
+	{"github classic", "ghp_" + strings.Repeat("k", 36), "ghp_kkkkkkkk"},
+	{"github fine grained", "github_pat_" + strings.Repeat("z", 25), "github_pat_zzzzzzzz"},
+	{"google api key", "AIza" + strings.Repeat("c", 35), "AIzacccccccc"},
+	{"jwt", "ey" + strings.Repeat("a", 12) + "." + strings.Repeat("b", 12) + "." + strings.Repeat("c", 12), "eyaaaaaaaaaa"},
+	{"bearer", "Bearer " + strings.Repeat("t", 30), "Bearer tttttttt"},
 	// Ends on non-word characters, so the full rule's trailing \b does not
 	// hold at the cut. The partial matcher has to catch it anyway.
-	{"bearer punctuated", "Bearer " + strings.Repeat("/", 8) + strings.Repeat("A", 10)},
-	{"postgres url", "postgres://u:" + strings.Repeat("p", 30) + "@h"},
-	{"postgresql url", "postgresql://u:" + strings.Repeat("p", 30) + "@h"},
-	{"stripe live", "sk_live_" + strings.Repeat("9", 20)},
-	{"openai key", "sk-" + strings.Repeat("q", 24)},
-	{"slack bot", "xoxb-" + strings.Repeat("1", 20)},
-	{"slack app", "xapp-" + strings.Repeat("1", 20)},
-	{"gitlab pat", "glpat-" + strings.Repeat("g", 22)},
-	{"generic password", "PASSWORD=" + strings.Repeat("q", 30)},
-	{"generic token newline", "TOKEN:\n" + strings.Repeat("q", 30)},
-	{"pem rsa", "-----BEGIN RSA PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 30) + "-----END RSA PRIVATE KEY-----"},
-	{"pem ec", "-----BEGIN EC PRIVATE KEY-----\n" + strings.Repeat("MHcC\n", 20) + "-----END EC PRIVATE KEY-----"},
+	{"bearer punctuated", "Bearer " + strings.Repeat("/", 8) + strings.Repeat("A", 10), "Bearer ////////"},
+	{"postgres url", "postgres://u:" + strings.Repeat("p", 30) + "@h", "postgres://u:pppppppp"},
+	{"postgresql url", "postgresql://u:" + strings.Repeat("p", 30) + "@h", "postgresql://u:pppppppp"},
+	{"stripe live", "sk_live_" + strings.Repeat("9", 20), "sk_live_99999999"},
+	{"openai key", "sk-" + strings.Repeat("q", 24), "sk-qqqqqqqq"},
+	{"slack bot", "xoxb-" + strings.Repeat("1", 20), "xoxb-11111111"},
+	{"slack app", "xapp-" + strings.Repeat("1", 20), "xapp-11111111"},
+	{"gitlab pat", "glpat-" + strings.Repeat("g", 22), "glpat-gggggggg"},
+	{"generic password", "PASSWORD=" + strings.Repeat("q", 30), "PASSWORD=qqqqqqqq"},
+	{"generic token newline", "TOKEN:\n" + strings.Repeat("q", 30), "TOKEN:\nqqqqqqqq"},
+	{"pem rsa", "-----BEGIN RSA PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 30) + "-----END RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----"},
+	{"pem ec", "-----BEGIN EC PRIVATE KEY-----\n" + strings.Repeat("MHcC\n", 20) + "-----END EC PRIVATE KEY-----", "-----BEGIN EC PRIVATE KEY-----"},
 	// The full rule accepts any [A-Z\s]* algorithm name, so the partial scanner
 	// has to as well. A canonical-marker allowlist passed every other case here
 	// while leaving this one exposed.
-	{"pem non-canonical algorithm", "-----BEGIN CUSTOM PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 20) + "-----END CUSTOM PRIVATE KEY-----"},
-	{"pem multiword algorithm", "-----BEGIN SOME LONG NAME PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 10) + "-----END SOME LONG NAME PRIVATE KEY-----"},
+	{"pem non-canonical algorithm", "-----BEGIN CUSTOM PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 20) + "-----END CUSTOM PRIVATE KEY-----", "-----BEGIN CUSTOM PRIVATE KEY-----"},
+	{"pem multiword algorithm", "-----BEGIN SOME LONG NAME PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 10) + "-----END SOME LONG NAME PRIVATE KEY-----", "-----BEGIN SOME LONG NAME PRIVATE KEY-----"},
 }
 
 // TestPreviewPrefixNeverLeaksAcrossCut slides a cut point through every
@@ -79,8 +86,14 @@ func TestPreviewPrefixNeverLeaksAcrossCut(t *testing.T) {
 
 	checked := 0
 	for _, sec := range canonicalSecrets {
+		if !strings.HasPrefix(sec.text, sec.witness) {
+			t.Fatalf("%s: witness %q is not a prefix of the secret", sec.name, sec.witness)
+		}
 		for _, lead := range leadings {
-			for cut := 3; cut <= len(sec.text); cut++ {
+			// Start once the whole witness is inside the window. Before that
+			// there is nothing recognisable to leak, and asserting anyway would
+			// only measure how much of a partial keyword survives.
+			for cut := len(sec.witness); cut <= len(sec.text); cut++ {
 				visible := sec.text[:cut]
 
 				full := lead.prefix + sec.text + " trailing text"
@@ -88,9 +101,9 @@ func TestPreviewPrefixNeverLeaksAcrossCut(t *testing.T) {
 				baseline := Text(full)
 
 				checked++
-				if strings.Contains(got, visible) && !strings.Contains(baseline, visible) {
-					t.Errorf("%s (%s): cut at %d leaks %q, which full redaction removes",
-						sec.name, lead.name, cut, visible[:min(40, len(visible))])
+				if leaksWitness(got, baseline, sec.witness) {
+					t.Errorf("%s (%s): cut at %d leaves %q in the preview, which full redaction removes",
+						sec.name, lead.name, cut, sec.witness)
 				}
 			}
 		}
@@ -101,52 +114,115 @@ func TestPreviewPrefixNeverLeaksAcrossCut(t *testing.T) {
 	t.Logf("checked %d cut points", checked)
 }
 
+// leaksWitness reports a preview that exposes more than full redaction does.
+//
+// The witness is a FIXED head of the secret rather than "everything before the
+// cut". With a sliding expectation, dropping a single trailing byte makes the
+// substring test fail and the case pass, so an implementation that truncates by
+// one byte and does nothing else scores a clean sweep while leaving the
+// credential in plain sight. A fixed witness cannot be evaded that way: either
+// the recognisable head is gone, or it is not.
+func leaksWitness(preview, baseline, witness string) bool {
+	if strings.Contains(baseline, witness) {
+		// Full redaction does not protect this either, so truncation is not
+		// what exposed it. Out of scope for this contract.
+		return false
+	}
+	return strings.Contains(preview, witness)
+}
+
+// TestOracleRejectsTrivialTruncation proves the sweep above can fail.
+//
+// A passing test suite is evidence only if some wrong implementation would
+// have broken it. Two earlier versions of this oracle were vacuous — one
+// asserted the complete secret was absent, which any truncation satisfies; the
+// next asserted a sliding prefix, which a one-byte cut satisfies. Both reported
+// thousands of green cut points over code that leaked.
+//
+// So: run the same corpus against a stub that only removes the final byte and
+// require it to be caught. If this test ever passes with zero detections, the
+// oracle has gone blind again and the sweep's green run means nothing.
+func TestOracleRejectsTrivialTruncation(t *testing.T) {
+	dropLastByte := func(s string) string {
+		if s == "" {
+			return s
+		}
+		return s[:len(s)-1]
+	}
+
+	detected := 0
+	for _, sec := range canonicalSecrets {
+		for cut := len(sec.witness); cut <= len(sec.text); cut++ {
+			window := "prelude text " + sec.text[:cut]
+			baseline := Text("prelude text " + sec.text + " trailing text")
+
+			stub := Text(dropLastByte(window))
+			if leaksWitness(stub, baseline, sec.witness) {
+				detected++
+			}
+		}
+	}
+	if detected == 0 {
+		t.Fatal("the drop-one-byte stub passed every cut point; the oracle cannot " +
+			"distinguish a real fix from a trivial truncation and proves nothing")
+	}
+	t.Logf("oracle caught the stub at %d cut points", detected)
+}
+
 // Named regressions for shapes a whitespace-only corpus cannot reach. These are
 // the counterexamples that exposed the partial/full mismatch; kept as their own
 // test so a failure names the rule directly instead of surfacing as one row of
 // a multi-thousand-case sweep.
 func TestPreviewPrefixHandlesRulesWithoutLeftBoundary(t *testing.T) {
 	tests := []struct {
-		name   string
-		text   string
-		cutLen int
+		name    string
+		text    string
+		cutLen  int
+		witness string
 	}{
 		{
 			// The full AWS rule has no \b, so it matches the keyword embedded in
 			// a longer identifier. The partial matcher has to match there too.
-			name:   "aws secret embedded in a longer identifier",
-			text:   "MY_AWS_SECRET_ACCESS_KEY=" + strings.Repeat("A", 40),
-			cutLen: len("MY_AWS_SECRET_ACCESS_KEY=") + 20,
+			name:    "aws secret embedded in a longer identifier",
+			text:    "MY_AWS_SECRET_ACCESS_KEY=" + strings.Repeat("A", 40),
+			cutLen:  len("MY_AWS_SECRET_ACCESS_KEY=") + 20,
+			witness: "AWS_SECRET_ACCESS_KEY=AAAAAAAA",
 		},
 		{
-			name:   "generic credential embedded in a longer identifier",
-			text:   "APP_PASSWORD=" + strings.Repeat("z", 60),
-			cutLen: len("APP_PASSWORD=") + 30,
+			name:    "generic credential embedded in a longer identifier",
+			text:    "APP_PASSWORD=" + strings.Repeat("z", 60),
+			cutLen:  len("APP_PASSWORD=") + 30,
+			witness: "APP_PASSWORD=zzzzzzzz",
 		},
 		{
 			// The scheme group is (?:...)(?:ql)?:// so these spellings are
 			// matched by the full rule and need partial coverage.
-			name:   "mysqlql scheme",
-			text:   "mysqlql://user:" + strings.Repeat("p", 60) + "@host",
-			cutLen: len("mysqlql://user:") + 30,
+			name:    "mysqlql scheme",
+			text:    "mysqlql://user:" + strings.Repeat("p", 60) + "@host",
+			cutLen:  len("mysqlql://user:") + 30,
+			witness: "mysqlql://user:pppppppp",
 		},
 		{
-			name:   "redisql scheme",
-			text:   "redisql://user:" + strings.Repeat("p", 60) + "@host",
-			cutLen: len("redisql://user:") + 30,
+			name:    "redisql scheme",
+			text:    "redisql://user:" + strings.Repeat("p", 60) + "@host",
+			cutLen:  len("redisql://user:") + 30,
+			witness: "redisql://user:pppppppp",
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			visible := tc.text[:tc.cutLen]
-			baseline := Text("prelude " + tc.text + " trailing")
-			_, got := PreviewPrefix("prelude " + visible)
-
-			if strings.Contains(baseline, visible) {
-				t.Fatalf("test is vacuous: full redaction also leaks %q", visible[:min(40, len(visible))])
+			// Fixed witness, not the sliding visible prefix: see leaksWitness.
+			if !strings.Contains(tc.text[:tc.cutLen], tc.witness) {
+				t.Fatalf("witness %q is not inside the visible window", tc.witness)
 			}
-			if strings.Contains(got, visible) {
-				t.Errorf("preview leaks %q, which full redaction removes", visible[:min(40, len(visible))])
+			baseline := Text("prelude " + tc.text + " trailing")
+			if strings.Contains(baseline, tc.witness) {
+				t.Fatalf("test is vacuous: full redaction also leaves %q", tc.witness)
+			}
+
+			_, got := PreviewPrefix("prelude " + tc.text[:tc.cutLen])
+			if leaksWitness(got, baseline, tc.witness) {
+				t.Errorf("preview leaves %q, which full redaction removes", tc.witness)
 			}
 		})
 	}

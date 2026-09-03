@@ -29,6 +29,13 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
+import {
+  TRUNCATION_UNKNOWN_NOTICE,
+  clipForDisplay,
+  displayClippedLabel,
+  hasUnknownTruncation,
+  sourceTruncatedLabel,
+} from "@/lib/tool-output-truncation";
 
 interface Props {
   items: TaskMessagePayload[];
@@ -45,10 +52,7 @@ export function ChatTimeline({ items, isStreaming = false }: Props) {
   // them visually identical to results confirmed complete. Said once for the
   // turn rather than per row: it is a property of when the run happened, and
   // repeating it would bury the rows that really were cut.
-  // === undefined, not a falsy check — false is a positive assertion.
-  const hasUnknownTruncation = processSteps.some(
-    (i) => i.type === "tool_result" && i.output_truncated === undefined,
-  );
+  const showUnknownNotice = hasUnknownTruncation(processSteps);
 
   return (
     <Collapsible defaultOpen={isStreaming}>
@@ -67,10 +71,9 @@ export function ChatTimeline({ items, isStreaming = false }: Props) {
           </Text>
         </View>
       </CollapsibleTrigger>
-      {hasUnknownTruncation ? (
+      {showUnknownNotice ? (
         <Text className="mt-0.5 text-[10px] text-muted-foreground/70">
-          Some results here were recorded before truncation was tracked, so
-          whether they are complete is unknown.
+          {TRUNCATION_UNKNOWN_NOTICE}
         </Text>
       ) : null}
       <CollapsibleContent>
@@ -189,38 +192,15 @@ function ToolCallRow({ item }: { item: TaskMessagePayload }) {
   );
 }
 
-// Rendering limit for a collapsed tool result. Unrelated to the server's
-// persistence budget, which output_truncated reports separately — a collapsed
-// body is not lost data, and the two must not read as the same thing.
-const DISPLAY_CLIP_CHARS = 4000;
-
-/**
- * Badge text for a tool result whose stored output is only a preview.
- *
- * Says "source truncated" rather than just "truncated" so it cannot be read as
- * the row being collapsed for layout — that is a different thing and is
- * labelled separately.
- */
-function formatSourceTruncated(originalBytes?: number): string {
-  if (typeof originalBytes !== "number" || !Number.isFinite(originalBytes) || originalBytes < 0) {
-    return "source truncated";
-  }
-  if (originalBytes < 1024) return `source truncated · ${originalBytes} B total`;
-  if (originalBytes < 1024 * 1024) {
-    return `source truncated · ${Math.round(originalBytes / 1024)} KB total`;
-  }
-  return `source truncated · ${(originalBytes / (1024 * 1024)).toFixed(1)} MB total`;
-}
-
 function ToolResultRow({ item }: { item: TaskMessagePayload }) {
   const output = item.output ?? "";
   if (!output) return null;
   const preview = output.length > 80 ? `${output.slice(0, 80)}…` : output;
   const prefix = item.tool ? `${item.tool} result: ` : "result: ";
-  const isClipped = output.length > DISPLAY_CLIP_CHARS;
-  // === true, not a truthy check: undefined means an older daemon could not
-  // report, which is not the same as confirming the output is complete.
-  const sourceTruncated = item.output_truncated === true;
+  // Both labels come from lib/tool-output-truncation so the rules can be
+  // tested without a React Native renderer; this component only places them.
+  const clippedNotice = displayClippedLabel(output);
+  const truncatedLabel = sourceTruncatedLabel(item);
   return (
     <Collapsible>
       <CollapsibleTrigger asChild>
@@ -238,23 +218,21 @@ function ToolResultRow({ item }: { item: TaskMessagePayload }) {
             <Text className="text-xs text-muted-foreground">{prefix}</Text>
             {preview}
           </Text>
-          {sourceTruncated && (
+          {truncatedLabel ? (
             <Text className="shrink-0 text-[10px] text-amber-600 dark:text-amber-500">
-              {formatSourceTruncated(item.output_original_bytes)}
+              {truncatedLabel}
             </Text>
-          )}
+          ) : null}
         </View>
       </CollapsibleTrigger>
       <CollapsibleContent>
         <View className="ml-4 mt-1 rounded bg-muted/40 px-2 py-1.5">
           <Text className="text-xs text-muted-foreground">
-            {isClipped ? output.slice(0, DISPLAY_CLIP_CHARS) : output}
+            {clipForDisplay(output)}
           </Text>
-          {isClipped && (
-            <Text className="mt-1 text-[10px] text-muted-foreground/70">
-              {`Showing the first ${DISPLAY_CLIP_CHARS} characters of the stored preview.`}
-            </Text>
-          )}
+          {clippedNotice ? (
+            <Text className="mt-1 text-[10px] text-muted-foreground/70">{clippedNotice}</Text>
+          ) : null}
         </View>
       </CollapsibleContent>
     </Collapsible>
