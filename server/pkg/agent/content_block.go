@@ -25,12 +25,31 @@ func ToolResultOutput(raw json.RawMessage) (output string, isImage bool) {
 	}
 	// A tool result delivered as a JSON string is transport encoding, not
 	// content. Decode exactly one layer; anything else is passed through.
-	var unwrapped string
-	if json.Unmarshal(raw, &unwrapped) == nil {
-		// A decoded string cannot be a structured content block.
-		return unwrapped, false
+	//
+	// The type is checked before decoding rather than inferred from the decode
+	// succeeding. Unmarshalling JSON `null` into a string returns no error and
+	// leaves the zero value, so an error-only check reads `null` as an empty
+	// string — and an empty Output is dropped by omitempty and rendered as
+	// nothing, so a legal tool result disappears from the transcript entirely.
+	if isJSONString(raw) {
+		var unwrapped string
+		if json.Unmarshal(raw, &unwrapped) == nil {
+			// A decoded string cannot be a structured content block.
+			return unwrapped, false
+		}
 	}
 	return string(raw), containsImageContentBlock(raw)
+}
+
+// isJSONString reports whether raw's top-level value is a JSON string.
+//
+// JSON permits leading whitespace, so the first non-space byte is what decides
+// the type. Only `"` opens a string; every other value — including `null`,
+// which decodes into a string variable without complaint — is passed through
+// verbatim.
+func isJSONString(raw json.RawMessage) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '"'
 }
 
 // containsImageContentBlock reports whether raw is an Anthropic-style content

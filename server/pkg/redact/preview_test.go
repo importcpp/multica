@@ -38,6 +38,11 @@ var canonicalSecrets = []struct {
 	{"generic token newline", "TOKEN:\n" + strings.Repeat("q", 30)},
 	{"pem rsa", "-----BEGIN RSA PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 30) + "-----END RSA PRIVATE KEY-----"},
 	{"pem ec", "-----BEGIN EC PRIVATE KEY-----\n" + strings.Repeat("MHcC\n", 20) + "-----END EC PRIVATE KEY-----"},
+	// The full rule accepts any [A-Z\s]* algorithm name, so the partial scanner
+	// has to as well. A canonical-marker allowlist passed every other case here
+	// while leaving this one exposed.
+	{"pem non-canonical algorithm", "-----BEGIN CUSTOM PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 20) + "-----END CUSTOM PRIVATE KEY-----"},
+	{"pem multiword algorithm", "-----BEGIN SOME LONG NAME PRIVATE KEY-----\n" + strings.Repeat("MIIE\n", 10) + "-----END SOME LONG NAME PRIVATE KEY-----"},
 }
 
 // TestPreviewPrefixNeverLeaksAcrossCut slides a cut point through every
@@ -184,6 +189,15 @@ func TestPemPartialStart(t *testing.T) {
 		{"end marker cut in half", "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIV", true},
 		{"no pem at all", "ordinary log output with dashes -- here", false},
 		{"begin word in prose", "we -----BEGIN and later -----END fine", false},
+		// The scanner is derived from the full rule's grammar rather than a
+		// list of known markers: the full rule accepts any [A-Z\s]* algorithm
+		// name, so an allowlist would miss these while still redacting the
+		// complete key.
+		{"non-canonical algorithm unterminated", "-----BEGIN CUSTOM PRIVATE KEY-----\nMIIE", true},
+		{"non-canonical algorithm complete", "-----BEGIN CUSTOM PRIVATE KEY-----\nabc\n-----END CUSTOM PRIVATE KEY-----", false},
+		{"multiword algorithm cut mid-name", "text -----BEGIN SOME LONG", true},
+		{"cut just after BEGIN", "text -----BEGIN", true},
+		{"cut mid-BEGIN", "text -----BEG", true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

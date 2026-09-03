@@ -901,3 +901,75 @@ describe("AgentTranscriptDialog — reason vs raw diagnostics", () => {
     expect(screen.queryByText("Reason")).not.toBeInTheDocument();
   });
 });
+
+// Wiring regressions for truncation metadata. The state matrix for the pure
+// helpers lives in output-truncation.test.ts; these assert the dialog actually
+// consults it. Every defect in this area so far has been a correct helper that
+// some surface never called, so "the helper is tested" is not sufficient.
+describe("tool result truncation", () => {
+  const truncated: TimelineItem = {
+    seq: 1,
+    type: "tool_result",
+    tool: "terminal",
+    output: "partial output",
+    output_truncated: true,
+    output_original_bytes: 36000,
+  };
+  const complete: TimelineItem = {
+    seq: 1,
+    type: "tool_result",
+    tool: "terminal",
+    output: "whole output",
+    output_truncated: false,
+    output_original_bytes: 12,
+  };
+  const unknown: TimelineItem = {
+    seq: 1,
+    type: "tool_result",
+    tool: "terminal",
+    output: "legacy output",
+  };
+
+  async function openInspector() {
+    const row = screen.getAllByRole("button").find((b) => b.textContent?.includes("terminal"));
+    if (!row) throw new Error("no tool row rendered");
+    await userEvent.click(row);
+  }
+
+  it("marks a truncated result with its original size", async () => {
+    renderDialog([truncated]);
+    await openInspector();
+    // The size is what tells a reader how much is missing; a bare "truncated"
+    // does not distinguish losing 100 bytes from losing 36 KB.
+    expect(await screen.findByText(/35 KB/)).toBeTruthy();
+  });
+
+  it("does not mark a result the daemon reported as complete", async () => {
+    renderDialog([complete]);
+    await openInspector();
+    expect(screen.queryByText(/Source truncated/i)).toBeNull();
+  });
+
+  it("does not mark a result whose state is unknown", async () => {
+    // undefined is not evidence of loss, so no per-row badge — but it is also
+    // not evidence of completeness, which the transcript-level notice covers.
+    renderDialog([unknown]);
+    await openInspector();
+    expect(screen.queryByText(/Source truncated/i)).toBeNull();
+  });
+
+  it("explains once that some results predate truncation tracking", () => {
+    renderDialog([unknown]);
+    expect(screen.getAllByText(/recorded before truncation was tracked/i)).toHaveLength(1);
+  });
+
+  it("stays silent when every result carries a definite state", () => {
+    renderDialog([complete, { ...truncated, seq: 2 }]);
+    expect(screen.queryByText(/recorded before truncation was tracked/i)).toBeNull();
+  });
+
+  it("shows the notice once even with several unknown results", () => {
+    renderDialog([unknown, { ...unknown, seq: 2 }, { ...unknown, seq: 3 }]);
+    expect(screen.getAllByText(/recorded before truncation was tracked/i)).toHaveLength(1);
+  });
+});

@@ -337,19 +337,35 @@ var (
 	pemBeginMarker = regexp.MustCompile(`-----BEGIN[A-Z\s]*PRIVATE KEY-----`)
 	pemEndMarker   = regexp.MustCompile(`-----END[A-Z\s]*PRIVATE KEY-----`)
 
-	// pemBeginPartial matches a strict prefix of a BEGIN marker at end of
-	// string, generated from the canonical marker spellings rather than
-	// hand-nested, which is both unreadable and easy to get wrong.
-	pemBeginPartial = regexp.MustCompile(strictPrefixAlternation([]string{
-		"-----BEGIN RSA PRIVATE KEY-----",
-		"-----BEGIN EC PRIVATE KEY-----",
-		"-----BEGIN DSA PRIVATE KEY-----",
-		"-----BEGIN OPENSSH PRIVATE KEY-----",
-		"-----BEGIN PGP PRIVATE KEY BLOCK-----",
-		"-----BEGIN ENCRYPTED PRIVATE KEY-----",
-		"-----BEGIN PRIVATE KEY-----",
-	}) + `\z`)
+	// pemBeginPartial matches an incomplete BEGIN marker at end of string.
+	//
+	// Derived from the same grammar as pemBeginMarker rather than from a list
+	// of known marker spellings. An allowlist drifts in both directions: the
+	// full rule accepts any [A-Z\s]* algorithm name, so "-----BEGIN CUSTOM
+	// PRIVATE KEY-----" is redacted in full but was invisible to a canonical
+	// allowlist; meanwhile the allowlist carried "PGP PRIVATE KEY BLOCK", which
+	// the full rule does not accept at all. Both directions are maintenance
+	// hazards, and the first is a leak.
+	//
+	// The alternation walks the fixed literal "-----BEGIN" one byte at a time,
+	// then allows a complete "-----BEGIN" followed by any prefix of
+	// "[A-Z\s]*PRIVATE KEY-----" — the same tail the full rule matches.
+	pemBeginPartial = regexp.MustCompile(
+		`(?:` + literalPrefixAlternation("-----BEGIN") + `|` +
+			`-----BEGIN[A-Z\s]*` + literalPrefixAlternation("PRIVATE KEY-----") + `|` +
+			`-----BEGIN[A-Z\s]*` +
+			`)\z`)
 )
+
+// literalPrefixAlternation returns a group matching any non-empty prefix of
+// lit, longest first so the regex engine prefers the longest match.
+func literalPrefixAlternation(lit string) string {
+	alts := make([]string, 0, len(lit))
+	for n := len(lit); n >= 1; n-- {
+		alts = append(alts, regexp.QuoteMeta(lit[:n]))
+	}
+	return "(?:" + strings.Join(alts, "|") + ")"
+}
 
 // strictPrefixAlternation returns a group matching any strict prefix of any
 // literal, longest first so the regex engine prefers the longest cut.

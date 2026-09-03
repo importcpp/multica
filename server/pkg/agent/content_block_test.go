@@ -67,6 +67,21 @@ func TestToolResultOutput(t *testing.T) {
 		},
 		// A decoded string is text by construction, however image-ish it reads.
 		{"quoted text mentioning image", `"failed to load image data"`, "failed to load image data", false},
+		// json.Unmarshal puts `null` into a string variable without error,
+		// leaving the zero value. Inferring "this was a JSON string" from the
+		// decode succeeding therefore turns a legal tool result into empty
+		// output, which omitempty drops and the UI renders as nothing — the
+		// whole result vanishes from the transcript.
+		{"null is not a string", `null`, `null`, false},
+		{"padded null is not a string", " null", " null", false},
+		// The other literals already failed to decode, but they belong in the
+		// table so the type check is exercised rather than assumed.
+		{"true passes through", `true`, `true`, false},
+		{"number passes through", `123`, `123`, false},
+		{"empty array passes through", `[]`, `[]`, false},
+		{"empty object passes through", `{}`, `{}`, false},
+		{"empty json string decodes to empty", `""`, ``, false},
+		{"whitespace-padded json string", "  \"padded\"  ", "padded", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
