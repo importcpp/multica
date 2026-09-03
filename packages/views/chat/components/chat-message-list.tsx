@@ -49,7 +49,11 @@ import { OnboardingStarterCards } from "./onboarding-starter-cards";
 import { TaskStatusPill } from "./task-status-pill";
 import { CHAT_COLUMN, CHAT_GUTTER } from "./chat-column";
 import { FOLLOW_EDGE_THRESHOLD } from "../../common/task-transcript/transcript-follow";
-import { OutputTruncatedBadge } from "../../common/task-transcript/output-truncation";
+import {
+  OutputTruncatedBadge,
+  TruncationUnknownNotice,
+  hasUnknownTruncation,
+} from "../../common/task-transcript/output-truncation";
 import { LIVE_END_ROW_ATTR, useStickToBottom } from "./stick-to-bottom";
 import { formatElapsedMs } from "../lib/format";
 import { splitTimeline, extractCopyText } from "../lib/copy-text";
@@ -1071,6 +1075,10 @@ function TimelineView({
 
   return (
     <>
+      {/* Stated once for the turn rather than per row: rows recorded before
+          truncation was tracked carry no badge, and without this they would be
+          visually indistinguishable from confirmed-complete results. */}
+      <TruncationUnknownNotice show={hasUnknownTruncation(items)} />
       {preface.length > 0 && (
         <RichContent
           content={preface.map((t) => t.content ?? "").join("")}

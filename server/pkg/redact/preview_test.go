@@ -55,30 +55,96 @@ var canonicalSecrets = []struct {
 //     without truncation; the contract here is that truncation adds no new
 //     exposure, so the full-redaction result is the only correct yardstick.
 //
-// The filler before each secret ends in a space. Without it the padding fuses
-// with the secret, \b never matches, and the baseline leaks too — which makes
-// every comparison vacuously pass.
+// Each secret is exercised under several leading contexts. Whitespace before
+// the secret is the obvious case, but several full rules — AWS secret,
+// connection string, generic credential — carry no left \b and therefore also
+// match a keyword glued to preceding text ("MY_AWS_SECRET_ACCESS_KEY=").
+// An earlier version of this test used only the whitespace prefix, so it never
+// exercised those occurrences: the partial matchers were stricter than their
+// full rules and leaked, while every assertion here passed.
 func TestPreviewPrefixNeverLeaksAcrossCut(t *testing.T) {
+	leadings := []struct {
+		name   string
+		prefix string
+	}{
+		{"space separated", "prelude text "},
+		{"glued to a word char", "prelude_text_MY_"},
+		{"glued to a digit", "prelude 42"},
+	}
+
 	checked := 0
 	for _, sec := range canonicalSecrets {
-		for cut := 3; cut <= len(sec.text); cut++ {
-			visible := sec.text[:cut]
+		for _, lead := range leadings {
+			for cut := 3; cut <= len(sec.text); cut++ {
+				visible := sec.text[:cut]
 
-			full := "prelude text " + sec.text + " trailing text"
-			_, got := PreviewPrefix("prelude text " + visible)
-			baseline := Text(full)
+				full := lead.prefix + sec.text + " trailing text"
+				_, got := PreviewPrefix(lead.prefix + visible)
+				baseline := Text(full)
 
-			checked++
-			if strings.Contains(got, visible) && !strings.Contains(baseline, visible) {
-				t.Errorf("%s: cut at %d leaks %q, which full redaction removes",
-					sec.name, cut, visible[:min(40, len(visible))])
+				checked++
+				if strings.Contains(got, visible) && !strings.Contains(baseline, visible) {
+					t.Errorf("%s (%s): cut at %d leaks %q, which full redaction removes",
+						sec.name, lead.name, cut, visible[:min(40, len(visible))])
+				}
 			}
 		}
 	}
-	if checked < 500 {
+	if checked < 1500 {
 		t.Fatalf("only %d cut points exercised; the corpus shrank unexpectedly", checked)
 	}
 	t.Logf("checked %d cut points", checked)
+}
+
+// Named regressions for shapes a whitespace-only corpus cannot reach. These are
+// the counterexamples that exposed the partial/full mismatch; kept as their own
+// test so a failure names the rule directly instead of surfacing as one row of
+// a multi-thousand-case sweep.
+func TestPreviewPrefixHandlesRulesWithoutLeftBoundary(t *testing.T) {
+	tests := []struct {
+		name   string
+		text   string
+		cutLen int
+	}{
+		{
+			// The full AWS rule has no \b, so it matches the keyword embedded in
+			// a longer identifier. The partial matcher has to match there too.
+			name:   "aws secret embedded in a longer identifier",
+			text:   "MY_AWS_SECRET_ACCESS_KEY=" + strings.Repeat("A", 40),
+			cutLen: len("MY_AWS_SECRET_ACCESS_KEY=") + 20,
+		},
+		{
+			name:   "generic credential embedded in a longer identifier",
+			text:   "APP_PASSWORD=" + strings.Repeat("z", 60),
+			cutLen: len("APP_PASSWORD=") + 30,
+		},
+		{
+			// The scheme group is (?:...)(?:ql)?:// so these spellings are
+			// matched by the full rule and need partial coverage.
+			name:   "mysqlql scheme",
+			text:   "mysqlql://user:" + strings.Repeat("p", 60) + "@host",
+			cutLen: len("mysqlql://user:") + 30,
+		},
+		{
+			name:   "redisql scheme",
+			text:   "redisql://user:" + strings.Repeat("p", 60) + "@host",
+			cutLen: len("redisql://user:") + 30,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			visible := tc.text[:tc.cutLen]
+			baseline := Text("prelude " + tc.text + " trailing")
+			_, got := PreviewPrefix("prelude " + visible)
+
+			if strings.Contains(baseline, visible) {
+				t.Fatalf("test is vacuous: full redaction also leaks %q", visible[:min(40, len(visible))])
+			}
+			if strings.Contains(got, visible) {
+				t.Errorf("preview leaks %q, which full redaction removes", visible[:min(40, len(visible))])
+			}
+		})
+	}
 }
 
 // TestEverySecretPatternHasPartial is the contract that keeps this scheme

@@ -41,3 +41,61 @@ func TestContainsImageContentBlockLargePayload(t *testing.T) {
 		t.Error("a real screenshot payload was not recognised as an image")
 	}
 }
+
+func TestToolResultOutput(t *testing.T) {
+	tests := []struct {
+		name      string
+		raw       string
+		wantOut   string
+		wantImage bool
+	}{
+		{"empty", "", "", false},
+		// Transport encoding, not content: the reader should see the terminal
+		// text, and the byte count should measure that rather than its escaped
+		// form. Left wrapped, "\n" is two characters and the preview fills with
+		// literal backslash-n once cut.
+		{"json string is unwrapped", `"line one\nline two"`, "line one\nline two", false},
+		{"escaped quotes survive", `"he said \"hi\""`, `he said "hi"`, false},
+		{"bare document passes through", `{"ok":true}`, `{"ok":true}`, false},
+		{"plain text passes through", `not json at all`, `not json at all`, false},
+		{"text content block", `[{"type":"text","text":"hello"}]`, `[{"type":"text","text":"hello"}]`, false},
+		{
+			"image content block is marked",
+			`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]`,
+			`[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}]`,
+			true,
+		},
+		// A decoded string is text by construction, however image-ish it reads.
+		{"quoted text mentioning image", `"failed to load image data"`, "failed to load image data", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			out, isImage := ToolResultOutput(json.RawMessage(tc.raw))
+			if out != tc.wantOut {
+				t.Errorf("output = %q, want %q", out, tc.wantOut)
+			}
+			if isImage != tc.wantImage {
+				t.Errorf("isImage = %v, want %v", isImage, tc.wantImage)
+			}
+		})
+	}
+}
+
+// The byte count reported with a truncated preview is meant to describe the
+// output the reader saw. Measuring the wire form instead makes the same content
+// report different sizes depending on how much escaping its provider applied.
+func TestToolResultOutputSizeIsLogical(t *testing.T) {
+	logical := strings.Repeat("line with \"quotes\" and \n newlines\n", 100)
+	encoded, err := json.Marshal(logical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) <= len(logical) {
+		t.Fatal("fixture does not exercise escaping growth")
+	}
+
+	out, _ := ToolResultOutput(json.RawMessage(encoded))
+	if len(out) != len(logical) {
+		t.Errorf("logical size = %d, want %d (wire form is %d)", len(out), len(logical), len(encoded))
+	}
+}

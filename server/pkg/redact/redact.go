@@ -40,7 +40,15 @@ type secretPattern struct {
 // rather than merely conservative: "a" is a prefix of "amqp://", so
 // `a[^\s]*\z` matches the tail of any single-line output and would cut the
 // whole preview away.
-func partialFor(lits []string, valueTail string) *regexp.Regexp {
+//
+// leftBoundary MUST mirror the full rule's own left anchor. A partial matcher
+// that is stricter than its full rule is not conservative — it is a hole. The
+// AWS, connection-string and generic-credential rules have no \b, so they match
+// a keyword glued to preceding text ("MY_AWS_SECRET_ACCESS_KEY="); a partial
+// matcher that demanded \b there would skip exactly those occurrences and leave
+// the credential's visible head in the preview, which is the leak this whole
+// mechanism exists to prevent.
+func partialFor(lits []string, valueTail string, leftBoundary boundaryKind) *regexp.Regexp {
 	strict := make([]string, 0, 16)
 	full := make([]string, 0, len(lits))
 	for _, lit := range lits {
@@ -49,12 +57,28 @@ func partialFor(lits []string, valueTail string) *regexp.Regexp {
 		}
 		full = append(full, regexp.QuoteMeta(lit))
 	}
-	return regexp.MustCompile(`(?i)\b(?:` +
+	anchor := ""
+	if leftBoundary == wordBoundaryLeft {
+		anchor = `\b`
+	}
+	return regexp.MustCompile(`(?i)` + anchor + `(?:` +
 		`(?:` + strings.Join(strict, "|") + `)` +
 		`|` +
 		`(?:` + strings.Join(full, "|") + `)(?:` + valueTail + `)?` +
 		`)\z`)
 }
+
+// boundaryKind records whether a full rule anchors its opener on a word
+// boundary. It exists so the choice is stated per rule rather than assumed.
+type boundaryKind int
+
+const (
+	// wordBoundaryLeft mirrors a full rule written with a leading \b.
+	wordBoundaryLeft boundaryKind = iota
+	// noBoundaryLeft mirrors a full rule with no left anchor, which therefore
+	// matches its keyword mid-identifier.
+	noBoundaryLeft
+)
 
 // Literal openers, kept next to the rules that consume them so the two cannot
 // drift apart.
@@ -63,26 +87,43 @@ var (
 	githubTokenPrefix = []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_"}
 	slackTokenPrefix  = []string{"xoxb-", "xoxp-", "xoxo-", "xoxr-", "xoxa-", "xoxs-", "xoxe-"}
 	stripeKeyPrefix   = []string{"sk_live_", "rk_live_"}
-	connectionSchemes = []string{"postgresql://", "postgres://", "mysql://", "mongodb://", "redis://", "amqp://"}
+	// Every spelling the full rule accepts. Its scheme group is
+	// (?:postgres|mysql|mongodb|redis|amqp)(?:ql)?://, so the optional "ql"
+	// applies to each base — "mysqlql://" and "redisql://" are matched by the
+	// full rule and therefore need partial coverage too. Listing only the
+	// realistic spellings would leave the others matchable but uncuttable.
+	connectionSchemes = buildConnectionSchemes()
 	genericSecretKeys = []string{
 		"API_KEY", "API_SECRET", "SECRET_KEY", "SECRET", "ACCESS_TOKEN", "AUTH_TOKEN",
 		"PRIVATE_KEY", "DATABASE_URL", "DB_PASSWORD", "DB_URL", "REDIS_URL", "PASSWORD", "TOKEN",
 	}
 )
 
+// buildConnectionSchemes expands the full rule's scheme grammar into concrete
+// openers. Derived rather than hand-listed so the two cannot drift: if a base
+// is added to the regex, it is added here in the same edit.
+func buildConnectionSchemes() []string {
+	bases := []string{"postgres", "mysql", "mongodb", "redis", "amqp"}
+	out := make([]string, 0, len(bases)*2)
+	for _, base := range bases {
+		out = append(out, base+"ql://", base+"://")
+	}
+	return out
+}
+
 // Patterns are checked in order; first match wins per position.
 var patterns = []secretPattern{
 	// AWS access key IDs (always start with AKIA)
 	{
 		re:           regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
-		partialAtEOF: partialFor([]string{"AKIA"}, `[0-9A-Z]{0,16}`),
+		partialAtEOF: partialFor([]string{"AKIA"}, `[0-9A-Z]{0,16}`, wordBoundaryLeft),
 		replacement:  "[REDACTED AWS KEY]",
 	},
 
 	// AWS secret access keys (40 char base64-ish, preceded by a common separator)
 	{
 		re:           regexp.MustCompile(`(?i)(?:aws_secret_access_key|secret_?access_?key)\s*[=:]\s*[A-Za-z0-9/+=]{40}`),
-		partialAtEOF: partialFor(awsSecretKeyNames, `\s*(?:[=:]\s*[A-Za-z0-9/+=]{0,40})?`),
+		partialAtEOF: partialFor(awsSecretKeyNames, `\s*(?:[=:]\s*[A-Za-z0-9/+=]{0,40})?`, noBoundaryLeft),
 		replacement:  "[REDACTED AWS SECRET]",
 	},
 
@@ -98,7 +139,7 @@ var patterns = []secretPattern{
 	// GitHub tokens (classic PAT, OAuth, user-to-server, server-to-server, refresh)
 	{
 		re:           regexp.MustCompile(`\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,255}\b`),
-		partialAtEOF: partialFor(githubTokenPrefix, `[A-Za-z0-9_]{0,255}`),
+		partialAtEOF: partialFor(githubTokenPrefix, `[A-Za-z0-9_]{0,255}`, wordBoundaryLeft),
 		replacement:  "[REDACTED GITHUB TOKEN]",
 	},
 
@@ -108,14 +149,14 @@ var patterns = []secretPattern{
 	// to the database and WebSocket broadcast.
 	{
 		re:           regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,255}\b`),
-		partialAtEOF: partialFor([]string{"github_pat_"}, `[A-Za-z0-9_]{0,255}`),
+		partialAtEOF: partialFor([]string{"github_pat_"}, `[A-Za-z0-9_]{0,255}`, wordBoundaryLeft),
 		replacement:  "[REDACTED GITHUB TOKEN]",
 	},
 
 	// OpenAI / Anthropic API keys
 	{
 		re:           regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}\b`),
-		partialAtEOF: partialFor([]string{"sk-"}, `[A-Za-z0-9_-]*`),
+		partialAtEOF: partialFor([]string{"sk-"}, `[A-Za-z0-9_-]*`, wordBoundaryLeft),
 		replacement:  "[REDACTED API KEY]",
 	},
 
@@ -123,7 +164,7 @@ var patterns = []secretPattern{
 	// newer xoxe- config/refresh tokens are covered alongside xoxb/p/o/r/a/s.
 	{
 		re:           regexp.MustCompile(`\bxox[bporase]-[A-Za-z0-9\-]{10,}\b`),
-		partialAtEOF: partialFor(slackTokenPrefix, `[A-Za-z0-9\-]*`),
+		partialAtEOF: partialFor(slackTokenPrefix, `[A-Za-z0-9\-]*`, wordBoundaryLeft),
 		replacement:  "[REDACTED SLACK TOKEN]",
 	},
 
@@ -132,14 +173,14 @@ var patterns = []secretPattern{
 	// leaks unredacted to the DB / WebSocket broadcast.
 	{
 		re:           regexp.MustCompile(`\bxapp-[A-Za-z0-9-]{10,}\b`),
-		partialAtEOF: partialFor([]string{"xapp-"}, `[A-Za-z0-9-]*`),
+		partialAtEOF: partialFor([]string{"xapp-"}, `[A-Za-z0-9-]*`, wordBoundaryLeft),
 		replacement:  "[REDACTED SLACK TOKEN]",
 	},
 
 	// GitLab personal access tokens
 	{
 		re:           regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}\b`),
-		partialAtEOF: partialFor([]string{"glpat-"}, `[A-Za-z0-9_-]*`),
+		partialAtEOF: partialFor([]string{"glpat-"}, `[A-Za-z0-9_-]*`, wordBoundaryLeft),
 		replacement:  "[REDACTED GITLAB TOKEN]",
 	},
 
@@ -148,7 +189,7 @@ var patterns = []secretPattern{
 	// a non-word character such as '-' are still redacted.
 	{
 		re:           regexp.MustCompile(`\bAIza[0-9A-Za-z_-]{35}([^0-9A-Za-z_-]|$)`),
-		partialAtEOF: partialFor([]string{"AIza"}, `[0-9A-Za-z_-]{0,35}`),
+		partialAtEOF: partialFor([]string{"AIza"}, `[0-9A-Za-z_-]{0,35}`, wordBoundaryLeft),
 		replacement:  "[REDACTED GOOGLE API KEY]$1",
 	},
 
@@ -158,35 +199,35 @@ var patterns = []secretPattern{
 	// keys (pk_live_) are intentionally excluded — they are not secret.
 	{
 		re:           regexp.MustCompile(`\b(?:sk|rk)_live_[0-9A-Za-z]{16,}\b`),
-		partialAtEOF: partialFor(stripeKeyPrefix, `[0-9A-Za-z]*`),
+		partialAtEOF: partialFor(stripeKeyPrefix, `[0-9A-Za-z]*`, wordBoundaryLeft),
 		replacement:  "[REDACTED STRIPE KEY]",
 	},
 
 	// JWT tokens (three base64url segments)
 	{
 		re:           regexp.MustCompile(`\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`),
-		partialAtEOF: partialFor([]string{"ey"}, `[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}`),
+		partialAtEOF: partialFor([]string{"ey"}, `[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}`, wordBoundaryLeft),
 		replacement:  "[REDACTED JWT]",
 	},
 
 	// Generic "Bearer <token>" in output
 	{
 		re:           regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9\-._~+/]+=*\b`),
-		partialAtEOF: partialFor([]string{"Bearer"}, `\s+[A-Za-z0-9\-._~+/]*=*`),
+		partialAtEOF: partialFor([]string{"Bearer"}, `\s+[A-Za-z0-9\-._~+/]*=*`, wordBoundaryLeft),
 		replacement:  "Bearer [REDACTED]",
 	},
 
 	// Connection strings with embedded passwords
 	{
 		re:           regexp.MustCompile(`(?i)(?:postgres|mysql|mongodb|redis|amqp)(?:ql)?://[^:\s]+:[^@\s]+@`),
-		partialAtEOF: partialFor(connectionSchemes, `[^\s]*`),
+		partialAtEOF: partialFor(connectionSchemes, `[^\s]*`, noBoundaryLeft),
 		replacement:  "[REDACTED CONNECTION STRING]@",
 	},
 
 	// Generic key=value patterns for common secret env var names
 	{
 		re:           regexp.MustCompile(`(?i)(?:API_KEY|API_SECRET|SECRET_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|PRIVATE_KEY|DATABASE_URL|DB_PASSWORD|DB_URL|REDIS_URL|PASSWORD|TOKEN)\s*[=:]\s*\S+`),
-		partialAtEOF: partialFor(genericSecretKeys, `\s*(?:[=:]\s*\S*)?`),
+		partialAtEOF: partialFor(genericSecretKeys, `\s*(?:[=:]\s*\S*)?`, noBoundaryLeft),
 		replacement:  "[REDACTED CREDENTIAL]",
 	},
 }

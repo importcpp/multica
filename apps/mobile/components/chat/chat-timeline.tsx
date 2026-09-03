@@ -41,6 +41,15 @@ export function ChatTimeline({ items, isStreaming = false }: Props) {
   const processSteps = items.filter((i) => i.type !== "text");
   if (processSteps.length === 0) return null;
 
+  // Rows recorded before truncation was tracked carry no badge, which makes
+  // them visually identical to results confirmed complete. Said once for the
+  // turn rather than per row: it is a property of when the run happened, and
+  // repeating it would bury the rows that really were cut.
+  // === undefined, not a falsy check — false is a positive assertion.
+  const hasUnknownTruncation = processSteps.some(
+    (i) => i.type === "tool_result" && i.output_truncated === undefined,
+  );
+
   return (
     <Collapsible defaultOpen={isStreaming}>
       <CollapsibleTrigger asChild>
@@ -58,6 +67,12 @@ export function ChatTimeline({ items, isStreaming = false }: Props) {
           </Text>
         </View>
       </CollapsibleTrigger>
+      {hasUnknownTruncation ? (
+        <Text className="mt-0.5 text-[10px] text-muted-foreground/70">
+          Some results here were recorded before truncation was tracked, so
+          whether they are complete is unknown.
+        </Text>
+      ) : null}
       <CollapsibleContent>
         <View className="mt-1 rounded-lg border border-border bg-muted/20 px-2 py-1.5 gap-0.5">
           {processSteps.map((item) => (
