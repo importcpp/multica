@@ -84,11 +84,8 @@ import { RevisionConflictCompare } from "./revision-conflict-compare";
 import { CommentInput } from "./comment-input";
 import { CurrentIssueRenderContextProvider } from "../current-issue-render-context";
 import { ResolvedThreadBar } from "./resolved-thread-bar";
-import { getShortcut, shortcutMatchesEvent } from "@multica/core/shortcuts";
-import { isImeComposing } from "@multica/core/utils";
-import { ThreadMinimap } from "./thread-minimap";
-import { ThreadNavPanel, mentionsUser, type ThreadNavThread } from "./thread-nav-panel";
-import { collectThreadReplies, deriveThreadResolution } from "./thread-utils";
+import { ThreadMinimap, type ThreadMinimapThread } from "./thread-minimap";
+import { collectThreadParticipants, collectThreadReplies, deriveThreadResolution } from "./thread-utils";
 import { IssueAgentHeaderChip } from "./issue-agent-header-chip";
 import { ExecutionLogSection } from "./execution-log-section";
 import { QuickActionsSection } from "./quick-actions-section";
@@ -627,7 +624,16 @@ function ActivityBlock({
         } else if (isDueDateChange) {
           leadIcon = <Calendar className="h-4 w-4 shrink-0 text-muted-foreground" />;
         } else {
-          leadIcon = <ActorAvatar actorType={entry.actor_type} actorId={entry.actor_id} size="sm" />;
+          leadIcon = (
+            <ActorAvatar
+              actorType={entry.actor_type}
+              actorId={entry.actor_id}
+              name={entry.actor_name}
+              avatarUrl={entry.actor_avatar_url}
+              profileRequiresDirectoryEntry
+              size="sm"
+            />
+          );
         }
 
         return (
@@ -636,7 +642,9 @@ function ActivityBlock({
               {leadIcon}
             </div>
             <div className="flex min-w-0 flex-1 items-center gap-1">
-              <span className="shrink-0 font-medium">{getActorName(entry.actor_type, entry.actor_id)}</span>
+              <span className="shrink-0 font-medium">
+                {entry.actor_name || getActorName(entry.actor_type, entry.actor_id)}
+              </span>
               <span className="truncate">{formatActivity(entry, t, locale, getActorName, resolveStatusLabel)}</span>
               {(entry.coalesced_count ?? 1) > 1 &&
                 entry.action !== "task_completed" &&
@@ -1584,42 +1592,27 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
   // One entry per comment thread (folded resolved bars included), activity
   // groups skipped. Derived from the same flat `items` array Virtuoso renders
-  // so the order always matches the page. Feeds both thread navigators — the
-  // right-edge rail and the header panel — from one derivation, so they can
-  // never disagree about what the threads are or what order they are in.
+  // so the right-edge outline always matches the page order.
   //
   // The resolved flag comes from `deriveThreadResolution`, not from the
   // `resolved-bar` kind: that kind only covers root resolutions that are
   // currently folded, so it would miss reply resolutions and would flip off
   // as soon as the user expanded a resolved thread.
-  const minimapThreads = useMemo<ThreadNavThread[]>(
+  const minimapThreads = useMemo<ThreadMinimapThread[]>(
     () =>
       items.flatMap((it) => {
         if (it.kind !== "comment" && it.kind !== "resolved-bar") return [];
         const replies = timelineView.threadReplies.get(it.id) ?? EMPTY_REPLIES;
-        const currentUserId = user?.id ?? "";
-        // "@me" means the thread concerns this reader: they started it,
-        // answered in it, or were @mentioned anywhere in it. Authorship counts
-        // because a thread you spoke in is one you are expected to follow —
-        // narrowing to literal mentions would drop most of them.
-        const involvesMe =
-          currentUserId !== "" &&
-          ([it.entry, ...replies].some(
-            (entry) =>
-              (entry.actor_type === "member" && entry.actor_id === currentUserId) ||
-              mentionsUser(entry.content, currentUserId),
-          ));
         return [
           {
             id: it.id,
             entry: it.entry,
             resolved: deriveThreadResolution(it.entry, replies).kind !== "none",
-            replyCount: replies.length,
-            involvesMe,
+            participants: collectThreadParticipants(it.entry, replies),
           },
         ];
       }),
-    [items, timelineView.threadReplies, user?.id],
+    [items, timelineView.threadReplies],
   );
 
   // When the timeline renders flat (deep-link or in-page find), there is no
@@ -1728,49 +1721,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     },
     [isFlatTimeline, items, scrollContainerEl],
   );
-
-  // Header thread navigator. `open` and `pinned` live here rather than inside
-  // the panel because the global shortcut has to be able to open it already
-  // pinned, and because the rail needs `threadNavHoverId` to light the tick
-  // the panel's pointer is resting on — the two navigators share one
-  // coordinate system (MUL-5755).
-  const [threadNavOpen, setThreadNavOpen] = useState(false);
-  const [threadNavPinned, setThreadNavPinned] = useState(false);
-  const [threadNavHoverId, setThreadNavHoverId] = useState<string | null>(null);
-  const handleThreadNavOpenChange = useCallback((open: boolean, pinned: boolean) => {
-    setThreadNavOpen(open);
-    setThreadNavPinned(pinned);
-    if (!open) setThreadNavHoverId(null);
-  }, []);
-
-  // Global Mod+Shift+O. Scoped to the mounted issue detail and gated on
-  // visibility the same way Cmd+F is, so on desktop only the visible tab
-  // intercepts the key.
-  useEffect(() => {
-    if (minimapThreads.length === 0) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.repeat || isImeComposing(e)) return;
-      if (!shortcutMatchesEvent(getShortcut("openThreadNav"), e)) return;
-      if (!scrollContainerEl || scrollContainerEl.getClientRects().length === 0) return;
-      e.preventDefault();
-      // The shortcut is a deliberate act, so it opens the pinned state
-      // directly. Pressing it again over a hover preview pins that preview
-      // rather than closing it, matching what pressing the button does.
-      if (threadNavOpen && threadNavPinned) {
-        handleThreadNavOpenChange(false, false);
-      } else {
-        handleThreadNavOpenChange(true, true);
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  }, [
-    handleThreadNavOpenChange,
-    minimapThreads.length,
-    scrollContainerEl,
-    threadNavOpen,
-    threadNavPinned,
-  ]);
 
   const {
     reactions: issueReactions,
@@ -1992,8 +1942,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
   const descEditorRef = useRef<ContentEditorRef>(null);
   const descriptionEditingRef = useRef(false);
-  const [descriptionConflictDraft, setDescriptionConflictDraft] = useState<string | null>(null);
-  const descriptionAttachmentIdsRef = useRef<string[]>([]);
   const descriptionSaveInFlightRef = useRef(false);
   const descriptionSaveIssueIdRef = useRef(id);
   const pendingDescriptionSaveRef = useRef<{
@@ -2015,9 +1963,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   const [titleResetToken, setTitleResetToken] = useState(0);
   useEffect(() => {
     setTitleConflictDraft(null);
-    setDescriptionConflictDraft(null);
     titleBaseRef.current = undefined;
-    descriptionAttachmentIdsRef.current = [];
     descriptionSaveInFlightRef.current = false;
     descriptionSaveIssueIdRef.current = id;
     pendingDescriptionSaveRef.current = null;
@@ -2270,7 +2216,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
       {
         onSuccess: (serverIssue) => {
           if (descriptionSaveIssueIdRef.current !== id) return;
-          setDescriptionConflictDraft(null);
           descriptionSaveInFlightRef.current = false;
           const pending = pendingDescriptionSaveRef.current;
           pendingDescriptionSaveRef.current = null;
@@ -2285,16 +2230,10 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             persistDescriptionSave({ ...pending, baseMarkdown: nextBase });
           }
         },
-        onError: (error) => {
+        onError: () => {
           if (descriptionSaveIssueIdRef.current !== id) return;
           descriptionSaveInFlightRef.current = false;
-          const pending = pendingDescriptionSaveRef.current;
           pendingDescriptionSaveRef.current = null;
-          if (errorCode(error) === "revision_conflict") {
-            const latest = pending ?? draft;
-            descriptionAttachmentIdsRef.current = latest.attachmentIds;
-            setDescriptionConflictDraft(latest.markdown);
-          }
         },
       },
     );
@@ -2303,7 +2242,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   const queueDescriptionSave = (
     draft: { markdown: string; baseMarkdown: string; attachmentIds: string[] },
   ) => {
-    descriptionAttachmentIdsRef.current = draft.attachmentIds;
     if (descriptionSaveInFlightRef.current) {
       pendingDescriptionSaveRef.current = draft;
       return;
@@ -2776,21 +2714,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                 it never overlaps the title (which truncates to make room).
                 It self-hides when no agent is active. */}
             <IssueAgentHeaderChip issueId={id} />
-            {/* Thread navigator. Leftmost of the action buttons because it
-                navigates the document, while everything to its right acts on
-                the issue. Hidden on mobile with the rail: the panel would work
-                there, but it needs a sheet rather than a popover to be usable
-                one-handed, which is its own change. */}
-            {!isMobile && (
-              <ThreadNavPanel
-                threads={minimapThreads}
-                onJump={jumpToThread}
-                onHoverThread={setThreadNavHoverId}
-                open={threadNavOpen}
-                pinned={threadNavPinned}
-                onOpenChange={handleThreadNavOpenChange}
-              />
-            )}
             {onDone && !issueBehavesAsAny(issue, ["done", "cancelled"]) && (
               <Tooltip>
                 <TooltipTrigger
@@ -3057,7 +2980,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             <ContentEditor
               ref={descEditorRef}
               key={id}
-              value={descriptionConflictDraft ?? issue.description ?? ""}
+              value={issue.description ?? ""}
               placeholder={t(($) => $.detail.desc_placeholder)}
               onUpdate={(md, baseMarkdown) => {
                 // Bind any pending uploads still referenced in the markdown
@@ -3095,64 +3018,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
               currentIssueId={id}
               attachments={descEditorAttachments}
             />
-
-            {descriptionConflictDraft !== null ? (
-              <RevisionConflictCompare
-                className="mt-3"
-                title={t(($) => $.revision.compare_description)}
-                serverLabel={t(($) => $.revision.server_version)}
-                localLabel={t(($) => $.revision.local_version)}
-                serverValue={issue.description || ""}
-                localValue={descriptionConflictDraft}
-                serverAction={(
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      // The editor is dirty — that is why this conflict
-                      // exists — so the `value` prop cannot land: ContentEditor
-                      // deliberately refuses to clobber unsaved bytes.
-                      // adoptContent is the explicit "take this content"
-                      // channel and applies without emitting an update, so
-                      // discarding never writes.
-                      descEditorRef.current?.adoptContent(issue.description || "");
-                      descriptionAttachmentIdsRef.current = [];
-                      pendingDescriptionSaveRef.current = null;
-                      setDescriptionConflictDraft(null);
-                    }}
-                  >
-                    {t(($) => $.revision.use_server)}
-                  </Button>
-                )}
-                localAction={(
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      handleUpdateField(
-                        {
-                          description: descriptionConflictDraft,
-                          description_base: issue.description || "",
-                          attachment_ids:
-                            descriptionAttachmentIdsRef.current.length > 0
-                              ? descriptionAttachmentIdsRef.current
-                              : undefined,
-                        },
-                        {
-                          onSuccess: () => {
-                            setDescriptionConflictDraft(null);
-                          },
-                        },
-                      );
-                    }}
-                  >
-                    {t(($) => $.revision.keep_local)}
-                  </Button>
-                )}
-              />
-            ) : null}
 
             <div className="flex items-center gap-1 mt-3">
               <ReactionBar
@@ -3540,7 +3405,6 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
             threads={minimapThreads}
             scrollContainerEl={scrollContainerEl}
             onJump={jumpToThread}
-            highlightedThreadId={threadNavHoverId}
             className="absolute bottom-0 right-3 top-12"
           />
         )}
