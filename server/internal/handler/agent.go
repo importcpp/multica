@@ -1001,6 +1001,10 @@ func (h *Handler) loadAgentRuntimeAvailability(ctx context.Context, agents []db.
 		return result, nil
 	}
 
+	// Read directly rather than through RuntimeLookup: this resolves rows for a
+	// list of agents instead of resolving a runtime a caller asked for, so it
+	// has no honest source label on multica_agent_runtime_lookup_total yet. See
+	// the exception noted on service.RuntimeLookup (MUL-6884).
 	runtimes, err := h.Queries.GetAgentRuntimes(ctx, runtimeIDs)
 	if err != nil {
 		return nil, err

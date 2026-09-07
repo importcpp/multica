@@ -12,8 +12,19 @@ import (
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-// RuntimeLookup is the only way production code reads agent_runtime rows by id
-// (MUL-6884) — one row via Get, or many in one query via GetMany.
+// RuntimeLookup is how production code reads agent_runtime rows by id
+// (MUL-6884) — one row via Get, or many in one query via GetMany. Every read
+// that resolves a runtime for a product behaviour goes through it, so
+// multica_agent_runtime_lookup_total can attribute that behaviour.
+//
+// One reader is deliberately outside it: the agent-list presence projection
+// (handler.loadAgentRuntimeAvailability) batch-reads runtime rows to derive a
+// coarse liveness bucket for agents whose runtime the viewer may not see. It
+// resolves rows for agents rather than resolving a runtime a caller asked for,
+// and it is unclassified rather than counted as some existing source, because
+// folding it into one would make that source's rate stop meaning what its name
+// says. Classifying it is worth doing; it needs its own source constant and is
+// not part of MUL-6788.
 //
 // Point-read callers share one SQL fingerprint, while GetMany uses a separate
 // batch-query fingerprint. pg_stat_statements can show that either query is
