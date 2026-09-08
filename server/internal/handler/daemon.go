@@ -3435,6 +3435,16 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Match batch claim's machine boundary for daemon tokens. PAT/JWT
+	// callers retain workspace-member access, and NULL daemon_id runtimes
+	// remain unpinned, as in batch claim and daemon WebSocket authorization.
+	if middleware.DaemonAuthPathFromContext(r.Context()) == middleware.DaemonAuthPathDaemonToken {
+		daemonID := middleware.DaemonIDFromContext(r.Context())
+		if daemonID == "" || (runtime.DaemonID.Valid && runtime.DaemonID.String != daemonID) {
+			writeError(w, http.StatusNotFound, "runtime not found")
+			return
+		}
+	}
 	runtimeWorkspaceID := uuidToString(runtime.WorkspaceID)
 	authMs = time.Since(start).Milliseconds()
 

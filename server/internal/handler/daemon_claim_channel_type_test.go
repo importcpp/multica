@@ -99,11 +99,11 @@ type claimedChatChannel struct {
 
 // claimChatChannelFields claims the queued task for runtimeID and returns the
 // channel-awareness fields the daemon reads off the claim response.
-func claimChatChannelFields(t *testing.T, runtimeID string) claimedChatChannel {
+func claimChatChannelFields(t *testing.T, runtimeID, daemonID string) claimedChatChannel {
 	t.Helper()
 	w := httptest.NewRecorder()
 	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil,
-		testWorkspaceID, "claim-channel-type")
+		testWorkspaceID, daemonID)
 	req = withURLParam(req, "runtimeId", runtimeID)
 
 	testHandler.ClaimTaskByRuntime(w, req)
@@ -127,7 +127,7 @@ func TestClaim_FeishuBoundSessionReportsChannelType(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "feishu-backed chat")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "feishu-backed chat")
 	// last_thread_id != last_message_id: the shape that would set ChatInThread on
 	// Slack. Feishu must still report false — there is no reader to thread into.
 	seedChannelBinding(t, ctx, agentID, sessionID, "feishu", "msg-1", "thread-9")
@@ -135,7 +135,7 @@ func TestClaim_FeishuBoundSessionReportsChannelType(t *testing.T) {
 	seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
 
-	claimed := claimChatChannelFields(t, runtimeID)
+	claimed := claimChatChannelFields(t, runtimeID, daemonID)
 	if claimed.ChannelType != "feishu" {
 		t.Errorf("chat_channel_type = %q, want %q — a Feishu session must not look like a web chat", claimed.ChannelType, "feishu")
 	}
@@ -149,13 +149,13 @@ func TestClaim_SlackBoundSessionStillReportsThreadState(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "slack-backed chat")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "slack-backed chat")
 	seedChannelBinding(t, ctx, agentID, sessionID, "slack", "msg-1", "thread-9")
 	taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 	seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
 
-	claimed := claimChatChannelFields(t, runtimeID)
+	claimed := claimChatChannelFields(t, runtimeID, daemonID)
 	if claimed.ChannelType != "slack" {
 		t.Errorf("chat_channel_type = %q, want %q", claimed.ChannelType, "slack")
 	}
@@ -178,13 +178,13 @@ func TestClaim_UnlistedChannelBoundSessionReportsChannelType(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "wecom-backed chat")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "wecom-backed chat")
 	seedChannelBinding(t, ctx, agentID, sessionID, "wecom", "msg-1", "thread-9")
 	taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 	seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
 
-	claimed := claimChatChannelFields(t, runtimeID)
+	claimed := claimChatChannelFields(t, runtimeID, daemonID)
 	if claimed.ChannelType != "wecom" {
 		t.Errorf("chat_channel_type = %q, want %q — a channel the handler does not name must not look like a web chat", claimed.ChannelType, "wecom")
 	}
@@ -198,11 +198,11 @@ func TestClaim_UnboundSessionReportsNoChannelType(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "web chat")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "web chat")
 	insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
 
-	claimed := claimChatChannelFields(t, runtimeID)
+	claimed := claimChatChannelFields(t, runtimeID, daemonID)
 	if claimed.ChannelType != "" {
 		t.Errorf("chat_channel_type = %q, want empty for a web-only session", claimed.ChannelType)
 	}
@@ -216,13 +216,13 @@ func TestClaim_ChannelOriginChatWithoutTaskDeliveryIsPrivateMulticaTurn(t *testi
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "old channel chat continued in web")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "old channel chat continued in web")
 	seedChannelBinding(t, ctx, agentID, sessionID, "slack", "msg-1", "thread-9")
 	// Deliberately no channel_task_delivery: this is the shape produced by a
 	// Web/Desktop/Mobile send after /new moves the external route elsewhere.
 	insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
-	claimed := claimChatChannelFields(t, runtimeID)
+	claimed := claimChatChannelFields(t, runtimeID, daemonID)
 	if claimed.ChannelType != "" || claimed.InThread || claimed.DeliversFiles {
 		t.Fatalf("private continuation leaked channel audience: %+v", claimed)
 	}
@@ -253,13 +253,13 @@ func TestClaim_BoundSessionReportsRoomShape(t *testing.T) {
 	} {
 		name := tc.channelType + "/" + tc.chatType
 		t.Run(name, func(t *testing.T) {
-			agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, name+" chat")
+			agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, name+" chat")
 			seedChannelBindingOfChatType(t, ctx, agentID, sessionID, tc.channelType, tc.chatType, "msg-1", "msg-1")
 			taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 			seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 			requeueTaskForClaim(t, ctx, sessionID)
 
-			claimed := claimChatChannelFields(t, runtimeID)
+			claimed := claimChatChannelFields(t, runtimeID, daemonID)
 			if claimed.ChannelType != tc.channelType {
 				t.Errorf("chat_channel_type = %q, want %q", claimed.ChannelType, tc.channelType)
 			}
@@ -279,11 +279,11 @@ func TestClaim_UnboundSessionReportsNoRoomShape(t *testing.T) {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
-	agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "web chat shape")
+	agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "web chat shape")
 	insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 	requeueTaskForClaim(t, ctx, sessionID)
 
-	if claimed := claimChatChannelFields(t, runtimeID); claimed.ChatType != "" {
+	if claimed := claimChatChannelFields(t, runtimeID, daemonID); claimed.ChatType != "" {
 		t.Errorf("chat_type = %q, want empty for a web-only session", claimed.ChatType)
 	}
 }
@@ -336,13 +336,13 @@ func TestClaim_FileDeliveryIsTheDeploymentsAnswerNotTheChannelTypes(t *testing.T
 
 	t.Run("declared: the deployment wired the hop", func(t *testing.T) {
 		declareFileDeliveryForTest(t, "wecom")
-		agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "wecom chat with storage")
+		agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "wecom chat with storage")
 		seedChannelBinding(t, ctx, agentID, sessionID, "wecom", "msg-1", "msg-1")
 		taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 		seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 		requeueTaskForClaim(t, ctx, sessionID)
 
-		claimed := claimChatChannelFields(t, runtimeID)
+		claimed := claimChatChannelFields(t, runtimeID, daemonID)
 		if claimed.ChannelType != "wecom" {
 			t.Fatalf("chat_channel_type = %q, want wecom", claimed.ChannelType)
 		}
@@ -353,13 +353,13 @@ func TestClaim_FileDeliveryIsTheDeploymentsAnswerNotTheChannelTypes(t *testing.T
 
 	t.Run("not declared: the same channel with no object storage", func(t *testing.T) {
 		declareFileDeliveryForTest(t) // nothing declared, as a storage-less deployment
-		agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "wecom chat without storage")
+		agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "wecom chat without storage")
 		seedChannelBinding(t, ctx, agentID, sessionID, "wecom", "msg-1", "msg-1")
 		taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 		seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 		requeueTaskForClaim(t, ctx, sessionID)
 
-		claimed := claimChatChannelFields(t, runtimeID)
+		claimed := claimChatChannelFields(t, runtimeID, daemonID)
 		if claimed.ChannelType != "wecom" {
 			t.Fatalf("chat_channel_type = %q, want wecom", claimed.ChannelType)
 		}
@@ -370,24 +370,24 @@ func TestClaim_FileDeliveryIsTheDeploymentsAnswerNotTheChannelTypes(t *testing.T
 
 	t.Run("declared for one channel does not answer for another", func(t *testing.T) {
 		declareFileDeliveryForTest(t, "wecom")
-		agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "slack chat alongside wecom")
+		agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "slack chat alongside wecom")
 		seedChannelBinding(t, ctx, agentID, sessionID, "slack", "msg-1", "msg-1")
 		taskID := insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 		seedChannelTaskDelivery(t, ctx, taskID, sessionID)
 		requeueTaskForClaim(t, ctx, sessionID)
 
-		if claimed := claimChatChannelFields(t, runtimeID); claimed.DeliversFiles {
+		if claimed := claimChatChannelFields(t, runtimeID, daemonID); claimed.DeliversFiles {
 			t.Error("a Slack session inherited WeCom's delivery capability; the flag is per channel, not per deployment")
 		}
 	})
 
 	t.Run("a web chat is answered by its own branch, not this flag", func(t *testing.T) {
 		declareFileDeliveryForTest(t, "wecom")
-		agentID, sessionID, runtimeID, _ := setupDirectChatSession(t, ctx, "web chat alongside wecom")
+		agentID, sessionID, runtimeID, daemonID := setupDirectChatSession(t, ctx, "web chat alongside wecom")
 		insertChannelChatTask(t, ctx, agentID, runtimeID, sessionID)
 		requeueTaskForClaim(t, ctx, sessionID)
 
-		claimed := claimChatChannelFields(t, runtimeID)
+		claimed := claimChatChannelFields(t, runtimeID, daemonID)
 		if claimed.ChannelType != "" {
 			t.Fatalf("chat_channel_type = %q, want empty for a web chat", claimed.ChannelType)
 		}
