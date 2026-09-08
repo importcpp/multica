@@ -76,6 +76,68 @@ func TestBuildQwenArgsYoloAlwaysPresent(t *testing.T) {
 	}
 }
 
+func TestQwenToolResultOutput(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"missing", "", ""},
+		{"string", `"hello"`, "hello"},
+		{"empty string", `""`, ""},
+		{"quoted null", `"null"`, "null"},
+		{"null", "null", "null"},
+		{"null with whitespace", " \t\r\nnull \t\r\n", " \t\r\nnull \t\r\n"},
+		{"string with whitespace", " \t\r\n\"hello\" \t\r\n", "hello"},
+		{"escaped string", `"line\n\u4e2d\""`, "line\n中\""},
+		{"decode once", `"\"hello\""`, `"hello"`},
+		{"object", `{"ok":true}`, `{"ok":true}`},
+		{"array", `["hello",null]`, `["hello",null]`},
+		{"number", "42", "42"},
+		{"boolean", "false", "false"},
+		{"object with whitespace", " \t{\"ok\":true}\n", " \t{\"ok\":true}\n"},
+		{"malformed string", `"unfinished`, `"unfinished`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := qwenToolResultOutput(json.RawMessage(tc.raw)); got != tc.want {
+				t.Fatalf("qwenToolResultOutput(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestHandleQwenEventPreservesNullToolResult(t *testing.T) {
+	t.Parallel()
+	var event qwenStreamEvent
+	if err := json.Unmarshal([]byte(`{"type":"user","message":{"role":"user","content":[
+		{"type":"tool_result","tool_use_id":"null-result","content":null},
+		{"type":"tool_result","tool_use_id":"empty-result","content":""},
+		{"type":"tool_result","tool_use_id":"missing-result"}
+	]}}`), &event); err != nil {
+		t.Fatal(err)
+	}
+	messages := make(chan Message, 3)
+	handleQwenEvent(event, messages, &qwenStreamState{})
+	if len(messages) != 3 {
+		t.Fatalf("got %d messages, want 3 tool results", len(messages))
+	}
+	for _, want := range []struct {
+		callID string
+		output string
+	}{
+		{"null-result", "null"},
+		{"empty-result", ""},
+		{"missing-result", ""},
+	} {
+		got := <-messages
+		if got.Type != MessageToolResult || got.CallID != want.callID || got.Output != want.output {
+			t.Fatalf("got type=%q callID=%q output=%q, want type=%q callID=%q output=%q",
+				got.Type, got.CallID, got.Output, MessageToolResult, want.callID, want.output)
+		}
+	}
+}
+
 func fakeQwenScript() string {
 	return `#!/bin/sh
 if [ -n "$QWEN_ARGS_FILE" ]; then printf '%s\n' "$@" > "$QWEN_ARGS_FILE"; fi

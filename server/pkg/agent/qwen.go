@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -389,9 +390,14 @@ func qwenResultUsage(usage *qwenUsage, model string) map[string]TokenUsage {
 }
 
 func qwenToolResultOutput(raw json.RawMessage) string {
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
+	// Unmarshal accepts null into a string without error, leaving it empty.
+	// Only unwrap JSON strings; preserve every other result verbatim.
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '"' {
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			return text
+		}
 	}
 	return string(raw)
 }
