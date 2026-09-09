@@ -323,6 +323,12 @@ status (`done`/`cancelled`). A completion that does not close a stage is silent
 so the parent is woken once when the *last* sub-issue finishes — not on every
 child.
 
+Completion notifications are best-effort. If the status catalog cannot be read,
+or a custom status needed for the checks cannot be resolved (including a status
+created after the notification pass's catalog snapshot), the server skips that
+parent's notification and wake. The child's committed status change remains
+saved; there is no automatic replay of the skipped notification.
+
 Advancement is agent-driven: the server only detects the closed barrier and
 wakes the parent assignee, who then decides whether to promote the next stage's
 `backlog` sub-issues to `todo`.

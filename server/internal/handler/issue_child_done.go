@@ -396,6 +396,9 @@ func isTerminalChildStatus(status string) bool {
 //
 // Resolve without rewriting the issue rows, which also supply the original
 // user-selected status to downstream rendering. Built-in keys need no I/O.
+// Unlike display-oriented Resolver callers, this side-effecting path must
+// reject unresolved custom keys: parent or sibling rows can be newer than the
+// catalog snapshot. A miss must not bypass a parked/terminal parent's guard.
 func (h *Handler) childStatusResolver(ctx context.Context) func(db.Issue) (string, error) {
 	resolvers := make(map[pgtype.UUID]*issuestatus.Resolver)
 	return func(c db.Issue) (string, error) {
@@ -408,7 +411,13 @@ func (h *Handler) childStatusResolver(ctx context.Context) func(db.Issue) (strin
 			resolvers[c.WorkspaceID] = resolver
 		}
 		status := resolver.Effective(ctx, h.issueStatusCatalog(), c.Status)
-		return status, resolver.Err()
+		if err := resolver.Err(); err != nil {
+			return "", err
+		}
+		if !issuestatus.IsCategory(status) {
+			return "", fmt.Errorf("unresolved status %q in workspace %s", c.Status, uuidToString(c.WorkspaceID))
+		}
+		return status, nil
 	}
 }
 

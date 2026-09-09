@@ -462,7 +462,8 @@ func NewResolver(workspaceID pgtype.UUID) *Resolver {
 // load fetches the catalog once, on the first call that needs it. A failed read
 // leaves the maps nil, which makes every lookup below fall back to its
 // key-unchanged branch. Callers making side-effect decisions must check Err
-// rather than treating a failed read as an unknown status.
+// and require a valid resolved category: a successful read can still miss a
+// custom key that was created after the snapshot.
 func (r *Resolver) load(ctx context.Context, q Querier) {
 	if r.loaded {
 		return

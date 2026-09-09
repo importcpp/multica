@@ -19,6 +19,7 @@ type childDoneCatalog struct {
 	pointReads int
 	fail       bool
 	failNext   map[pgtype.UUID]bool
+	afterRead  func()
 }
 
 func (c *childDoneCatalog) ListIssueStatusEntries(ctx context.Context, arg db.ListIssueStatusEntriesParams) ([]db.IssueStatus, error) {
@@ -30,7 +31,13 @@ func (c *childDoneCatalog) ListIssueStatusEntries(ctx context.Context, arg db.Li
 	if c.fail {
 		return nil, errors.New("test catalog unavailable")
 	}
-	return c.Querier.ListIssueStatusEntries(ctx, arg)
+	entries, err := c.Querier.ListIssueStatusEntries(ctx, arg)
+	if err == nil && c.afterRead != nil {
+		afterRead := c.afterRead
+		c.afterRead = nil
+		afterRead()
+	}
+	return entries, err
 }
 
 func (c *childDoneCatalog) GetIssueStatusEntryByKey(ctx context.Context, arg db.GetIssueStatusEntryByKeyParams) (db.IssueStatus, error) {
@@ -155,12 +162,12 @@ func TestChildStatusResolverRefreshesForNextPass(t *testing.T) {
 	h.IssueStatusCatalog = catalog
 	issue := db.Issue{WorkspaceID: parseUUID(ws), Status: "approved"}
 	first := h.childStatusResolver(ctx)
-	if got, err := first(issue); got != "approved" || err != nil {
-		t.Fatalf("unknown key resolved to %q, err=%v", got, err)
+	if _, err := first(issue); err == nil {
+		t.Fatal("unknown key must prevent side effects")
 	}
 	dbfx.Insert(t, "issue_status", testutil.Cols{"workspace_id": ws, "key": "approved", "name": "Approved", "category": "done", "color": "#123456"})
-	if got, err := first(issue); got != "approved" || err != nil {
-		t.Fatalf("one pass changed its snapshot to %q, err=%v", got, err)
+	if _, err := first(issue); err == nil {
+		t.Fatal("one pass must not refresh a missing key")
 	}
 	if got, err := h.childStatusResolver(ctx)(issue); got != "done" || err != nil {
 		t.Fatalf("next pass did not refresh: %q, err=%v", got, err)
@@ -170,6 +177,204 @@ func TestChildStatusResolverRefreshesForNextPass(t *testing.T) {
 	}
 	if catalog.reads[issue.WorkspaceID] != 2 || catalog.pointReads != 0 {
 		t.Fatalf("catalog counts: %+v, point=%d", catalog.reads, catalog.pointReads)
+	}
+}
+
+func TestChildDoneCatalogSnapshotPredatesParent(t *testing.T) {
+	ctx := context.Background()
+	for _, batch := range []bool{false, true} {
+		for _, category := range []string{"backlog", "done", "cancelled"} {
+			t.Run(fmt.Sprintf("batch=%t/%s", batch, category), func(t *testing.T) {
+				ws := dbfx.Workspace(t, "New parent status", "child-status-snapshot")
+				fx := testutil.New(testPool, ws, testUserID)
+				for key, category := range map[string]string{"working": "in_progress", "parked": "backlog"} {
+					fx.Insert(t, "issue_status", testutil.Cols{"workspace_id": ws, "key": key, "name": key, "category": category, "color": "#123456"})
+				}
+				agentID := fx.Agent(t, "Parent assignee", fx.Runtime(t, "Parent runtime"))
+				parentID := fx.Issue(t, "Parent", testutil.Cols{"status": "in_progress", "assignee_type": "agent", "assignee_id": agentID})
+				fx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", parentID)
+				fx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id = $1", parentID)
+				childID := fx.Issue(t, "Completed child", testutil.Cols{"parent_issue_id": parentID, "status": "done", "stage": 1})
+				fx.Issue(t, "Later stage", testutil.Cols{"parent_issue_id": parentID, "status": "backlog", "stage": 2})
+				child, err := testHandler.Queries.GetIssue(ctx, parseUUID(childID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				previous := child
+				previous.Status = "working"
+				var completed []db.Issue
+				if batch {
+					// An earlier parent group loads the shared catalog before the
+					// affected parent row is read. This parked group stays silent.
+					firstParent := fx.Issue(t, "Earlier parked parent", testutil.Cols{"status": "parked"})
+					fx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", firstParent)
+					firstID := fx.Issue(t, "Earlier completed child", testutil.Cols{"parent_issue_id": firstParent, "status": "done"})
+					first, err := testHandler.Queries.GetIssue(ctx, parseUUID(firstID))
+					if err != nil {
+						t.Fatal(err)
+					}
+					completed = append(completed, first)
+				}
+				completed = append(completed, child)
+				newKey := "new_" + category
+				catalog := &childDoneCatalog{
+					Querier: testHandler.Queries, reads: map[pgtype.UUID]int{},
+					afterRead: func() {
+						// Commit both changes after materializing the catalog rows,
+						// but before GetIssue reads the affected parent. No sleeps or
+						// read errors: only the snapshot is older than the parent row.
+						fx.Insert(t, "issue_status", testutil.Cols{"workspace_id": ws, "key": newKey, "name": newKey, "category": category, "color": "#123456"})
+						fx.Exec(t, "UPDATE issue SET status = $1 WHERE id = $2", newKey, parentID)
+					},
+				}
+				h := *testHandler
+				h.IssueStatusCatalog = catalog
+				if batch {
+					h.notifyParentsOfBatchChildDone(ctx, completed)
+				} else {
+					h.notifyParentOfChildDone(ctx, previous, child)
+				}
+				if catalog.afterRead != nil {
+					t.Fatal("test did not mutate the parent after the catalog read")
+				}
+				if got := countSystemCommentsOn(t, parentID); got != 0 {
+					t.Errorf("parent in newly created %s status received %d comments, want none", category, got)
+				}
+				if got := countPendingTasksForAgent(t, parentID, agentID); got != 0 {
+					t.Errorf("parent in newly created %s status received %d queued runs, want none", category, got)
+				}
+				if catalog.reads[parseUUID(ws)] != 1 || catalog.pointReads != 0 {
+					t.Errorf("snapshot miss must not re-read: catalog=%+v, point=%d", catalog.reads, catalog.pointReads)
+				}
+				parent, err := h.Queries.GetIssue(ctx, parseUUID(parentID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if parent.Status != newKey {
+					t.Errorf("stored parent status = %q, want %q", parent.Status, newKey)
+				}
+			})
+		}
+	}
+}
+
+func TestChildDoneUnknownStatusSkipsNotification(t *testing.T) {
+	ctx := context.Background()
+	for _, batch := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, previous, current, parent string
+			siblingStage                    int
+		}{
+			{name: "previous_child", previous: "missing", current: "done", parent: "in_progress"},
+			{name: "current_child", previous: "in_progress", current: "missing", parent: "in_progress"},
+			{name: "parent", previous: "in_progress", current: "done", parent: "missing"},
+			{name: "deleted_parent_status", previous: "in_progress", current: "done", parent: "missing"},
+			{name: "stage_barrier", previous: "in_progress", current: "done", parent: "in_progress", siblingStage: 1},
+			{name: "progress_summary", previous: "in_progress", current: "done", parent: "in_progress", siblingStage: 2},
+		} {
+			if batch && (tc.previous == "missing" || tc.current == "missing") {
+				continue // Transition filtering belongs to BatchUpdateIssues, not its notifier.
+			}
+			t.Run(fmt.Sprintf("batch=%t/%s", batch, tc.name), func(t *testing.T) {
+				ws := dbfx.Workspace(t, "Unknown notification status", "child-status-unknown")
+				fx := testutil.New(testPool, ws, testUserID)
+				if tc.name == "deleted_parent_status" {
+					id := fx.Insert(t, "issue_status", testutil.Cols{"workspace_id": ws, "key": "missing", "name": "Deleted", "category": "backlog", "color": "#123456"})
+					fx.Exec(t, "DELETE FROM issue_status WHERE id = $1", id)
+				}
+				agentID := fx.Agent(t, "Parent assignee", fx.Runtime(t, "Parent runtime"))
+				parentID := fx.Issue(t, "Parent", testutil.Cols{"status": tc.parent, "assignee_type": "agent", "assignee_id": agentID})
+				fx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", parentID)
+				fx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id = $1", parentID)
+				cols := testutil.Cols{"parent_issue_id": parentID, "status": tc.current}
+				if tc.siblingStage != 0 {
+					cols["stage"] = 1
+					fx.Issue(t, "Unknown-status sibling", testutil.Cols{"parent_issue_id": parentID, "status": "missing", "stage": tc.siblingStage})
+				}
+				childID := fx.Issue(t, "Completed child", cols)
+				child, err := testHandler.Queries.GetIssue(ctx, parseUUID(childID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				previous := child
+				previous.Status = tc.previous
+				catalog := &childDoneCatalog{Querier: testHandler.Queries, reads: map[pgtype.UUID]int{}}
+				h := *testHandler
+				h.IssueStatusCatalog = catalog
+				if batch {
+					h.notifyParentsOfBatchChildDone(ctx, []db.Issue{child})
+				} else {
+					h.notifyParentOfChildDone(ctx, previous, child)
+				}
+				if got := countSystemCommentsOn(t, parentID); got != 0 {
+					t.Errorf("unknown status produced %d comments, want none", got)
+				}
+				if got := countPendingTasksForAgent(t, parentID, agentID); got != 0 {
+					t.Errorf("unknown status queued %d parent runs, want none", got)
+				}
+				if catalog.reads[parseUUID(ws)] != 1 || catalog.pointReads != 0 {
+					t.Errorf("unknown status triggered extra reads: catalog=%+v, point=%d", catalog.reads, catalog.pointReads)
+				}
+				stored, err := h.Queries.GetIssue(ctx, child.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stored.Status != tc.current {
+					t.Errorf("notification changed committed child status to %q, want %q", stored.Status, tc.current)
+				}
+			})
+		}
+	}
+}
+
+func TestBatchChildDoneUnknownStatusIsolation(t *testing.T) {
+	ctx := context.Background()
+	ws := dbfx.Workspace(t, "Missing key", "child-missing-key")
+	otherWS := dbfx.Workspace(t, "Known key", "child-known-key")
+	for _, workspace := range []string{ws, otherWS} {
+		dbfx.Insert(t, "issue_status", testutil.Cols{"workspace_id": workspace, "key": "working", "name": "Working", "category": "in_progress", "color": "#123456"})
+	}
+	dbfx.Insert(t, "issue_status", testutil.Cols{"workspace_id": otherWS, "key": "missing", "name": "Known elsewhere", "category": "in_progress", "color": "#123456"})
+	cases := []struct {
+		workspace, status string
+		want              int
+	}{
+		{ws, "missing", 0},
+		{ws, "working", 1}, // A missing key must not poison this workspace's valid catalog.
+		{ws, "in_progress", 1},
+		{otherWS, "missing", 1}, // The same key resolves independently in another workspace.
+	}
+	var completed []db.Issue
+	var parents, agents []string
+	for i, tc := range cases {
+		fx := testutil.New(testPool, tc.workspace, testUserID)
+		agentID := fx.Agent(t, fmt.Sprintf("Parent assignee %d", i), fx.Runtime(t, fmt.Sprintf("Parent runtime %d", i)))
+		parentID := fx.Issue(t, "Batch parent", testutil.Cols{"status": tc.status, "assignee_type": "agent", "assignee_id": agentID})
+		parents = append(parents, parentID)
+		agents = append(agents, agentID)
+		fx.Cleanup(t, "DELETE FROM comment WHERE issue_id = $1", parentID)
+		fx.Cleanup(t, "DELETE FROM agent_task_queue WHERE issue_id = $1", parentID)
+		childID := fx.Issue(t, "Batch child", testutil.Cols{"parent_issue_id": parentID, "status": "done"})
+		child, err := testHandler.Queries.GetIssue(ctx, parseUUID(childID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		completed = append(completed, child)
+	}
+	catalog := &childDoneCatalog{Querier: testHandler.Queries, reads: map[pgtype.UUID]int{}}
+	h := *testHandler
+	h.IssueStatusCatalog = catalog
+	h.notifyParentsOfBatchChildDone(ctx, completed)
+	for i, tc := range cases {
+		if got := countSystemCommentsOn(t, parents[i]); got != tc.want {
+			t.Errorf("group %d (%s): %d comments, want %d", i, tc.status, got, tc.want)
+		}
+		if got := countPendingTasksForAgent(t, parents[i], agents[i]); got != tc.want {
+			t.Errorf("group %d (%s): %d queued runs, want %d", i, tc.status, got, tc.want)
+		}
+	}
+	if catalog.reads[parseUUID(ws)] != 1 || catalog.reads[parseUUID(otherWS)] != 1 || catalog.pointReads != 0 {
+		t.Errorf("catalog counts: %+v, point=%d", catalog.reads, catalog.pointReads)
 	}
 }
 
