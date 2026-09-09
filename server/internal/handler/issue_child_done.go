@@ -82,8 +82,18 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	// inherit, so a move into a custom done/cancelled status fires the barrier
 	// exactly like a move into Done or Cancelled. (MUL-6243)
 	effective := h.childStatusResolver(ctx)
-	prevTerminal := isTerminalChildStatus(effective(prev))
-	nowTerminal := isTerminalChildStatus(effective(issue))
+	prevStatus, err := effective(prev)
+	if err != nil {
+		slog.Warn("child done: failed to resolve previous child status", "error", err, "child_id", uuidToString(issue.ID))
+		return
+	}
+	nowStatus, err := effective(issue)
+	if err != nil {
+		slog.Warn("child done: failed to resolve child status", "error", err, "child_id", uuidToString(issue.ID))
+		return
+	}
+	prevTerminal := isTerminalChildStatus(prevStatus)
+	nowTerminal := isTerminalChildStatus(nowStatus)
 	if prevTerminal || !nowTerminal {
 		return
 	}
@@ -98,7 +108,11 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 	// Custom statuses inherit the canonical status they name, so a custom
 	// terminal status closes this out and a custom backlog status parks it,
 	// exactly like Done/Cancelled and Backlog do. (MUL-6243)
-	parentStatus := effective(parent)
+	parentStatus, err := effective(parent)
+	if err != nil {
+		slog.Warn("child done: failed to resolve parent status", "error", err, "parent_id", uuidToString(parent.ID))
+		return
+	}
 	if parentStatus == "done" || parentStatus == "cancelled" {
 		return
 	}
@@ -133,7 +147,11 @@ func (h *Handler) notifyParentOfChildDone(ctx context.Context, prev, issue db.Is
 			"parent_id", uuidToString(parent.ID))
 		return
 	}
-	isTerminal := func(c db.Issue) bool { return isTerminalChildStatus(effective(c)) }
+	isTerminal, err := resolveTerminalChildren(children, effective)
+	if err != nil {
+		slog.Warn("child done: failed to resolve sibling statuses", "error", err, "parent_id", uuidToString(parent.ID))
+		return
+	}
 	if !stageBarrierClosed(children, issue, isTerminal) {
 		return
 	}
@@ -191,7 +209,6 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 	}
 
 	effective := h.childStatusResolver(ctx)
-	isTerminal := func(c db.Issue) bool { return isTerminalChildStatus(effective(c)) }
 	for _, g := range groups {
 		parent, err := h.Queries.GetIssue(ctx, g.parentID)
 		if err != nil {
@@ -200,7 +217,11 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			continue
 		}
 		// Same parent guards as the single path (see notifyParentOfChildDone).
-		parentStatus := effective(parent)
+		parentStatus, err := effective(parent)
+		if err != nil {
+			slog.Warn("batch child done: failed to resolve parent status", "error", err, "parent_id", uuidToString(parent.ID))
+			continue
+		}
 		if parentStatus == "done" || parentStatus == "cancelled" {
 			continue
 		}
@@ -218,6 +239,11 @@ func (h *Handler) notifyParentsOfBatchChildDone(ctx context.Context, completed [
 			continue
 		}
 
+		isTerminal, err := resolveTerminalChildren(children, effective)
+		if err != nil {
+			slog.Warn("batch child done: failed to resolve sibling statuses", "error", err, "parent_id", uuidToString(parent.ID))
+			continue
+		}
 		batch := len(g.children) > 1
 		if !siblingsAreStaged(children) {
 			// Unstaged: one implicit stage. Fire once iff every child is terminal
@@ -370,19 +396,40 @@ func isTerminalChildStatus(status string) bool {
 //
 // Resolve without rewriting the issue rows, which also supply the original
 // user-selected status to downstream rendering. Built-in keys need no I/O.
-func (h *Handler) childStatusResolver(ctx context.Context) func(db.Issue) string {
+func (h *Handler) childStatusResolver(ctx context.Context) func(db.Issue) (string, error) {
 	resolvers := make(map[pgtype.UUID]*issuestatus.Resolver)
-	return func(c db.Issue) string {
+	return func(c db.Issue) (string, error) {
 		if issuestatus.IsBuiltIn(c.Status) {
-			return c.Status
+			return c.Status, nil
 		}
 		resolver := resolvers[c.WorkspaceID]
 		if resolver == nil {
 			resolver = issuestatus.NewResolver(c.WorkspaceID)
 			resolvers[c.WorkspaceID] = resolver
 		}
-		return resolver.Effective(ctx, h.issueStatusCatalog(), c.Status)
+		status := resolver.Effective(ctx, h.issueStatusCatalog(), c.Status)
+		return status, resolver.Err()
 	}
+}
+
+// resolveTerminalChildren checks every status needed by the stage barrier and
+// progress summary before either can produce a notification. The returned
+// predicate only reads this snapshot, so a late catalog failure cannot be
+// hidden by the bool-only stage helpers. Stored status keys stay untouched.
+func resolveTerminalChildren(children []db.Issue, effective func(db.Issue) (string, error)) (func(db.Issue) bool, error) {
+	terminal := make(map[pgtype.UUID]bool, len(children))
+	staged := siblingsAreStaged(children)
+	for _, child := range children {
+		if staged && !child.Stage.Valid {
+			continue // Neither stage helper considers unstaged siblings.
+		}
+		status, err := effective(child)
+		if err != nil {
+			return nil, fmt.Errorf("resolve child %s status %q: %w", uuidToString(child.ID), child.Status, err)
+		}
+		terminal[child.ID] = isTerminalChildStatus(status)
+	}
+	return func(child db.Issue) bool { return terminal[child.ID] }, nil
 }
 
 // siblingsAreStaged reports whether any child in the set carries an explicit
