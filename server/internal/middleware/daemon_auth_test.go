@@ -167,7 +167,7 @@ func TestDaemonAuth_StripsForgedAgentIdentityHeaders(t *testing.T) {
 	}, auth.AuthCacheTTL)
 
 	var gotAgentID, gotTaskID string
-	mw := DaemonAuth(nil, nil, cache, nil)
+	mw := DaemonAuth(nil, nil, cache, nil, auth.NoopPATLastUsedRecorder{})
 	handler := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAgentID = r.Header.Get("X-Agent-ID")
 		gotTaskID = r.Header.Get("X-Task-ID")
