@@ -347,6 +347,14 @@ created after the notification pass's catalog snapshot), the server skips that
 parent's notification and wake. The child's committed status change remains
 saved; there is no automatic replay of the skipped notification.
 
+The same rule applies when a batch resolves each child's previous and current
+status to collect completion transitions. If any transition cannot be resolved,
+the server skips notifications and wakes for that child's resulting parent
+throughout the batch, including candidates collected before the failure. Other
+parent groups with fully resolved transitions can still notify. Successful
+writes remain saved and included in the response's `updated` count; re-saving
+an unchanged terminal status does not replay a skipped notification.
+
 Advancement is agent-driven: the server only detects the closed barrier and
 wakes the parent assignee, who then decides whether to promote the next stage's
 `backlog` sub-issues to `todo`.
