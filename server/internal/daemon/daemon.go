@@ -5399,6 +5399,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// a millisecond timestamp that only advances every ~65s, so concurrent
 	// tasks routinely share one (#7326).
 	taskLog := d.logger.With("task", task.ID)
+	phaseRecorder := newTaskPhaseRecorder(taskLog.With("task_id", task.ID, "runtime_id", task.RuntimeID), time.Now)
+	ctx = withTaskPhaseRecorder(ctx, phaseRecorder)
+	phaseRecorder.Mark(taskPhaseClaimed)
+	defer phaseRecorder.Mark(taskPhaseFinished)
 	agentName := "agent"
 	if task.Agent != nil {
 		agentName = task.Agent.Name
@@ -7243,6 +7247,8 @@ func qualifyTaskModel(
 }
 
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
+	phaseRecorder := taskPhaseRecorderFromContext(ctx)
+	phaseRecorder.Mark(taskPhasePrepareStarted)
 	// A claim carries the task-row agent id both at the top level and inside
 	// the expanded agent configuration. The top-level id is authoritative
 	// because it is also bound into the task-scoped token. Never prepare or
@@ -7337,6 +7343,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err := d.ensureTaskSkillBundles(prepareCtx, &task); err != nil {
 		return TaskResult{}, err
 	}
+	phaseRecorder.Mark(taskPhaseSkillsReady)
 
 	agentName := "agent"
 	var skills []SkillData
@@ -7814,6 +7821,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			}
 		}
 	}
+	phaseRecorder.Mark(taskPhaseEnvironmentReady)
 	// Belt-and-suspenders: also mark whatever root we ended up with, in case
 	// future changes diverge from ResolveRootDir.
 	if env.RootDir != resolvedRoot && env.RootDir != "" {
@@ -8409,6 +8417,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// than being relabeled resumable by a benign-looking second error.
 		result, tools = reconcileFreshRetryResult(firstResult, firstUsage, firstTools, retryResult, retryTools, retryErr)
 	}
+	phaseRecorder.Mark(taskPhaseTurnCompleted)
 
 	elapsed := time.Since(taskStart).Round(time.Second)
 	taskLog.Info("agent finished",
@@ -8847,6 +8856,7 @@ func freshSessionMayHelp(errText string) bool {
 // sequence instead of restarting at 1 — the server orders the transcript by
 // seq alone, and duplicate seqs would interleave the two attempts' rows.
 func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, prompt string, opts agent.ExecOptions, taskLog *slog.Logger, taskID, codexHome string, msgSeq *atomic.Int32) (agent.Result, int32, error) {
+	phaseRecorder := taskPhaseRecorderFromContext(ctx)
 	// Wrap the caller's ctx so the idle watchdog (below) can interrupt both
 	// the agent subprocess (via the ctx passed to backend.Execute) AND the
 	// drain loop with a single cancel. Without this layer the backend would
@@ -8869,6 +8879,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	// boundary, not at the earlier server-side StartTask transition.
 	d.runningTasks.Add(1)
 	defer d.runningTasks.Add(-1)
+	phaseRecorder.Mark(taskPhaseRuntimeStarted)
 	taskLog.Debug("backend started, draining messages")
 
 	// Bound the drain loop only when there is a wall-clock cap. With a positive
@@ -9019,6 +9030,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 				if !ok {
 					goto drainDone
 				}
+				if isTaskOutputReceived(msg) {
+					phaseRecorder.Mark(taskPhaseFirstOutputReceived)
+				}
+				if isTaskToolUse(msg) {
+					phaseRecorder.Mark(taskPhaseFirstToolUse)
+				}
 				// Stamp activity as soon as a message lands. The idle
 				// watchdog reads this to decide whether the backend has
 				// gone silent — stamping before processing makes sure a
@@ -9102,10 +9119,7 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						}
 					}
 					s := msgSeq.Add(1)
-					output := msg.Output
-					if len(output) > 8192 {
-						output = output[:8192]
-					}
+					output, outputTruncated := toolOutputPreview(msg.Output)
 					toolName := msg.Tool
 					if toolName == "" && msg.CallID != "" {
 						mu.Lock()
@@ -9119,6 +9133,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						Type:   "tool_result",
 						Tool:   toolName,
 						Output: output,
+						// Always sent, including false: the reader has to be
+						// able to tell "this record is complete" from "this
+						// record predates the flag", and only a daemon that
+						// measured the output can say the former.
+						OutputTruncated: &outputTruncated,
 					})
 					mu.Unlock()
 				case agent.MessageThinking:

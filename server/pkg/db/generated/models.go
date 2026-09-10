@@ -337,6 +337,9 @@ type ChannelChatContextGeneration struct {
 	PendingFresh           bool               `json:"pending_fresh"`
 	InitiatorUserID        pgtype.UUID        `json:"initiator_user_id"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	LastMessageID          pgtype.Text        `json:"last_message_id"`
+	LastThreadID           pgtype.Text        `json:"last_thread_id"`
+	LastSenderID           pgtype.Text        `json:"last_sender_id"`
 }
 
 type ChannelChatSessionBinding struct {
@@ -445,6 +448,7 @@ type ChannelTaskDelivery struct {
 	RouteRevision    int64              `json:"route_revision"`
 	Config           []byte             `json:"config"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ChannelSenderID  pgtype.Text        `json:"channel_sender_id"`
 }
 
 type ChannelUserBinding struct {
@@ -1311,15 +1315,16 @@ type SysCronExecution struct {
 }
 
 type TaskMessage struct {
-	ID        pgtype.UUID        `json:"id"`
-	TaskID    pgtype.UUID        `json:"task_id"`
-	Seq       int32              `json:"seq"`
-	Type      string             `json:"type"`
-	Tool      pgtype.Text        `json:"tool"`
-	Content   pgtype.Text        `json:"content"`
-	Input     []byte             `json:"input"`
-	Output    pgtype.Text        `json:"output"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID              pgtype.UUID        `json:"id"`
+	TaskID          pgtype.UUID        `json:"task_id"`
+	Seq             int32              `json:"seq"`
+	Type            string             `json:"type"`
+	Tool            pgtype.Text        `json:"tool"`
+	Content         pgtype.Text        `json:"content"`
+	Input           []byte             `json:"input"`
+	Output          pgtype.Text        `json:"output"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	OutputTruncated pgtype.Bool        `json:"output_truncated"`
 }
 
 type TaskToken struct {
