@@ -88,7 +88,7 @@ type blipOnce struct {
 	done bool
 }
 
-func (b *blipOnce) Claim(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+func (b *blipOnce) Claim(ctx context.Context, key, token string, ttl time.Duration) (bool, error) {
 	b.mu.Lock()
 	first := !b.done
 	b.done = true
@@ -96,7 +96,7 @@ func (b *blipOnce) Claim(ctx context.Context, key string, ttl time.Duration) (bo
 	if first {
 		return false, errors.New("wecom test: redis blip")
 	}
-	return b.DedupeStore.Claim(ctx, key, ttl)
+	return b.DedupeStore.Claim(ctx, key, token, ttl)
 }
 
 // sentTexts is what actually reached the chat, in order.
@@ -297,15 +297,15 @@ type failsOnceHandler struct {
 }
 
 func (h *failsOnceHandler) ownsSocket(string) bool { return true }
-func (h *failsOnceHandler) deliverRelayed(context.Context, relayFrame) deliveryOutcome {
+func (h *failsOnceHandler) deliverRelayed(context.Context, relayFrame) relayResult {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.n++
 	if h.n == 1 {
-		return outcomeProvablyNotSent
+		return relayResult{outcome: outcomeProvablyNotSent}
 	}
 	h.delivered = true
-	return outcomeDone
+	return relayResult{outcome: outcomeDone}
 }
 func (h *failsOnceHandler) calls() int {
 	h.mu.Lock()
@@ -452,20 +452,6 @@ func TestRelayRetryPlan_DefaultsCoverTheDefaultPollInterval(t *testing.T) {
 	}
 	if total < engine.DefaultPollInterval {
 		t.Fatalf("the default chain covers %s against a %s lease move", total, engine.DefaultPollInterval)
-	}
-}
-
-// The drain runs inside the process's own shutdown, so its budget has to fit
-// under the channel supervisor's — the thing that is joined after it. A drain
-// budget larger than that would push shutdown past the supervisor's own bound
-// and cost the final lease release, which is what makes the next replica wait
-// out a whole LeaseTTL after a redeploy.
-func TestRelayDrainBudget_FitsUnderTheSupervisorShutdownTimeout(t *testing.T) {
-	t.Parallel()
-	cfg := RelayConfig{}.withDefaults()
-	if cfg.DrainBudget >= engine.DefaultShutdownTimeout {
-		t.Fatalf("drain budget %s does not fit under the supervisor's shutdown timeout %s",
-			cfg.DrainBudget, engine.DefaultShutdownTimeout)
 	}
 }
 

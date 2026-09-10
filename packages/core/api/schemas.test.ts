@@ -478,14 +478,14 @@ describe("IssueTriggerPreviewSchema", () => {
   it("parses a well-formed response", () => {
     const parsed = IssueTriggerPreviewSchema.parse({
       triggers: [
-        { issue_id: "i1", agent_id: "a1", source: "assign", handoff_supported: true },
-        { issue_id: "i2", agent_id: "a2", source: "status", handoff_supported: false },
+        { issue_id: "i1", agent_id: "a1", source: "assign" },
+        { issue_id: "i2", agent_id: "a2", source: "status" },
       ],
       total_count: 2,
     });
     expect(parsed.total_count).toBe(2);
     expect(parsed.triggers).toHaveLength(2);
-    expect(parsed.triggers[0]).toMatchObject({ issue_id: "i1", agent_id: "a1", source: "assign", handoff_supported: true });
+    expect(parsed.triggers[0]).toMatchObject({ issue_id: "i1", agent_id: "a1", source: "assign" });
   });
 
   it("defaults missing top-level fields (empty / older backend)", () => {
@@ -500,7 +500,6 @@ describe("IssueTriggerPreviewSchema", () => {
       issue_id: "i1",
       agent_id: "",
       source: "",
-      handoff_supported: false,
     });
   });
 
@@ -580,6 +579,11 @@ describe("TimelineEntriesSchema", () => {
 });
 
 describe("AgentTaskListSchema", () => {
+  it.each([true, false, undefined, null, "true", 1])("safely parses comment cancellation metadata: %s", (value) => {
+    const parsed = AgentTaskListSchema.parse([{ id: "run", cancelled_by_comment_change: value }]);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]?.cancelled_by_comment_change).toBe(typeof value === "boolean" ? value : undefined);
+  });
   const task = {
     id: "task-1",
     agent_id: "agent-1",

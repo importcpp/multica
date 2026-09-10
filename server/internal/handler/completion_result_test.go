@@ -5,8 +5,54 @@ import (
 	"strings"
 	"testing"
 
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
+
+// Completion normalization and comment-change cancellation provenance share the
+// response mapper. Neither may be lost when changes to that mapper are merged.
+func TestTaskToResponseCompletionPreservesCancellation(t *testing.T) {
+	const taskID = "11111111-1111-1111-1111-111111111111"
+	for _, tc := range []struct {
+		name       string
+		result     string
+		wantResult bool
+	}{
+		{"legacy", `{"output":"answer","session_id":"private-session","work_dir":"/private/work"}`, true},
+		{"v1", `{"version":1,"summary":"answer","artifact_ids":[]}`, true},
+		{"malformed v1", `{"version":1,"summary":null}`, false},
+		{"absent", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := taskToResponse(db.AgentTaskQueue{
+				ID:      parseUUID(taskID),
+				Status:  "cancelled",
+				Context: []byte(`{"comment_change_cancelled_task_id":"` + taskID + `"}`),
+				Result:  []byte(tc.result),
+			}, "")
+			if !got.CancelledByCommentChange {
+				t.Fatal("completion parsing lost comment-change cancellation provenance")
+			}
+			if !tc.wantResult {
+				if got.Result != nil {
+					t.Fatalf("Result = %#v, want nil", got.Result)
+				}
+				return
+			}
+			result, ok := got.Result.(protocol.CompletionResultV1)
+			if !ok || result.Version != 1 || result.Summary != "answer" || result.ArtifactIDs == nil {
+				t.Fatalf("Result = %#v, want normalized completion envelope", got.Result)
+			}
+			wire, err := json.Marshal(got)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(wire), "private-session") || strings.Contains(string(wire), "/private/work") {
+				t.Fatalf("response exposed transport-only fields: %s", wire)
+			}
+		})
+	}
+}
 
 // normalizeCompletionResult owns the /complete selection rules: legacy vs v1,
 // strict rejection, and dual-write conflict. It is a pure function, so this is
