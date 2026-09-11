@@ -1504,9 +1504,11 @@ type commentAgentTrigger struct {
 	Source         commentAgentTriggerSource
 	Squad          *db.Squad
 	AlreadyPending bool
-	// WorkerReply is the non-self agent reply routed to the assigned squad's
-	// leader. Completion may replay it only if creation recorded a planned input.
-	WorkerReply bool
+	// NonLeaderAgentReply marks an agent comment, not authored by the leader,
+	// that the assigned-squad-leader fallback routes to that leader. The author
+	// need not be a squad member. Completion may replay it only if creation
+	// recorded it as a planned input.
+	NonLeaderAgentReply bool
 }
 
 type commentTriggerComputeOptions struct {
@@ -2097,7 +2099,7 @@ func (h *Handler) resolveCommentTriggerEnqueue(ctx context.Context, issue db.Iss
 			}
 			// No same-head QUEUED row to fold into (merge missed). The two paths
 			// resolve differently.
-			if !lostRace && !trigger.WorkerReply {
+			if !lostRace && !trigger.NonLeaderAgentReply {
 				// (b) AlreadyPending path: this comment arrived AFTER its task, so
 				// it is newer than the task and completion reconcile covers it by
 				// timestamp; MUL-4195 leaves the claimed task untouched. Defer to
@@ -2627,7 +2629,7 @@ func (h *Handler) computeCommentAgentTriggers(ctx context.Context, issue db.Issu
 		// target alongside the assigned leader.
 		if issue.AssigneeType.Valid && issue.AssigneeType.String == "squad" {
 			if trigger, ok := h.routeAssignedSquadLeaderFallback(ctx, issue, actorType, actorID, opts); ok {
-				trigger.WorkerReply = actorType == "agent" && actorID != uuidToString(trigger.Agent.ID)
+				trigger.NonLeaderAgentReply = actorType == "agent" && actorID != uuidToString(trigger.Agent.ID)
 				return []commentAgentTrigger{trigger}, nil
 			}
 		}

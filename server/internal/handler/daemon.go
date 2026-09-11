@@ -4239,7 +4239,7 @@ func keepReplayableAgentTriggers(triggers []commentAgentTrigger, planned bool) [
 		case commentTriggerSourceMentionAgent, commentTriggerSourceMentionSquadLeader:
 			filtered = append(filtered, trigger)
 		case commentTriggerSourceIssueAssignee:
-			if planned && trigger.WorkerReply {
+			if planned && trigger.NonLeaderAgentReply {
 				filtered = append(filtered, trigger)
 			}
 		}
