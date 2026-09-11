@@ -195,6 +195,13 @@ it.
 If an issue is assigned to a squad, a new comment can wake the squad leader. This
 is leader routing, not member fan-out.
 
+An accepted worker reply can also wake the assigned leader without an explicit
+mention. If the leader already has a queued run in that thread, the reply joins
+its inputs. If that run has been claimed but has not started, the reply is
+recorded for a follow-up when the run completes; an input already delivered at claim is not replayed.
+Completion does not turn unplanned ordinary agent replies or leader self-replies
+into new work, and replay still checks current invocation permissions.
+
 Squad mention format:
 
 ```md
