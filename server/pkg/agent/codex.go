@@ -3561,10 +3561,11 @@ func (c *codexClient) updateThreadTokenUsage(params map[string]any) {
 	}
 	c.usageTotal = total
 	c.usageTotalSet = true
-	c.usage.InputTokens += codexPlainInputTokens(delta.InputTokens, delta.CachedInputTokens, delta.CacheWriteInputTokens)
-	c.usage.OutputTokens += delta.OutputTokens + delta.ReasoningOutputTokens
-	c.usage.CacheReadTokens += delta.CachedInputTokens
-	c.usage.CacheWriteTokens += delta.CacheWriteInputTokens
+	u := codexTokenUsage(delta)
+	c.usage.InputTokens += u.InputTokens
+	c.usage.OutputTokens += u.OutputTokens
+	c.usage.CacheReadTokens += u.CacheReadTokens
+	c.usage.CacheWriteTokens += u.CacheWriteTokens
 	c.usageMu.Unlock()
 }
 
@@ -3835,6 +3836,19 @@ type codexRawTokenUsage struct {
 	ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
 }
 
+// codexTokenUsage converts either event or rollout counters to the shared
+// TokenUsage contract. Codex input includes cache reads/writes; its output
+// already includes reasoning_output_tokens, which is only a breakdown.
+func codexTokenUsage(raw codexRawTokenUsage) TokenUsage {
+	u := normalizeCodexRawTokenUsage(raw)
+	return TokenUsage{
+		InputTokens:      codexPlainInputTokens(u.InputTokens, u.CachedInputTokens, u.CacheWriteInputTokens),
+		OutputTokens:     u.OutputTokens,
+		CacheReadTokens:  u.CachedInputTokens,
+		CacheWriteTokens: u.CacheWriteInputTokens,
+	}
+}
+
 // codexSessionTokenCount represents a token_count event in Codex JSONL.
 type codexSessionTokenCount struct {
 	Timestamp time.Time `json:"timestamp"`
@@ -3932,14 +3946,7 @@ func parseCodexSessionFileSince(path string, startTime time.Time, resumed bool) 
 	if !finalUsageFound {
 		return nil
 	}
-	cacheReadTokens := finalUsage.CachedInputTokens
-	cacheWriteTokens := finalUsage.CacheWriteInputTokens
-	result.usage = TokenUsage{
-		InputTokens:      codexPlainInputTokens(finalUsage.InputTokens, cacheReadTokens, cacheWriteTokens),
-		OutputTokens:     finalUsage.OutputTokens + finalUsage.ReasoningOutputTokens,
-		CacheReadTokens:  cacheReadTokens,
-		CacheWriteTokens: cacheWriteTokens,
-	}
+	result.usage = codexTokenUsage(finalUsage)
 	return &result
 }
 
