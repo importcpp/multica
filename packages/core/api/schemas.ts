@@ -1798,6 +1798,7 @@ export const AgentTaskSchema = z.object({
   // `.catch(undefined)` collapses a bad array to "no usage recorded", which
   // the UI already renders as an em dash.
   usage: z.array(TaskUsageSchema).optional().catch(undefined),
+  usage_sources: OptionalStringArraySchema,
 }).loose();
 
 export const AgentTaskListSchema = z.array(AgentTaskSchema);

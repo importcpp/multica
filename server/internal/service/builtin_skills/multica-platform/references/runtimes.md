@@ -48,6 +48,23 @@ best-effort per-event input/cache accounting. These fallback figures can be
 incomplete; use the provider's billing records for actual charges. This
 correction applies to new runs, not historical usage rows.
 
+Claude runs also expose `usage_sources` on execution records. This is a run-level
+set across attempts: `final_model_usage` includes main/subagent totals reported
+by the CLI; `final_usage` covers the main loop only; `assistant_fallback` recovers
+main-loop input/cache counts; `none` means no usable counters were obtained.
+An absent/empty set, `unknown`, or an unrecognized source leaves coverage unknown.
+Zero-only final statistics do not replace recovered counters or prove zero spend.
+Final statistics replace fallback within an attempt, while a fresh-session retry
+preserves both attempts' sources. A successful status does not prove complete
+usage. The execution log, transcript, and per-run issue usage table disclose
+these limits; runtime/dashboard rollups do not yet carry this coverage.
+
+`POST /api/daemon/tasks/{id}/usage` accepts optional `usage_sources`. A non-null
+array identifies a whole-run snapshot: model rows and sources replace the prior
+snapshot atomically, including empty usage. Reports without this field keep
+per-model upserts and clear the run's source evidence to unknown. Historical
+records and other providers are not backfilled with inferred completeness.
+
 `runtime update` and `runtime delete` are writes. Starting a runtime update is
 limited to its owner or a workspace owner/admin; the original initiator may keep
 polling that specific in-flight request if their admin role changes.
