@@ -3,7 +3,6 @@
 Product contracts the runtime brief does not fully encode.
 
 - [PR linking and close intent are two distinct contracts](#pr-linking-and-close-intent-are-two-distinct-contracts)
-- [Final comment receipts](#final-comment-receipts)
 - [Reading a linked PR's real state](#reading-a-linked-prs-real-state)
 - [Custom properties: typed workflow state](#custom-properties-typed-workflow-state)
 - [Status changes have server side effects](#status-changes-have-server-side-effects)
@@ -91,19 +90,6 @@ Part of MUL-123                    # body mention only → no link at all
 In the final issue comment, include the PR URL when a PR exists. If the task did
 not produce a PR because no code changed or the user asked not to create one, say
 that explicitly.
-
-## Final comment receipts
-
-For a final result that only needs a success confirmation, post with
-`multica issue comment add <issue-id> --content-file ./reply.md --output table`
-(add the current `--parent <comment-id>` when replying). The complete comment
-is still saved; on success the CLI prints a confirmation to stderr without
-echoing the body to stdout. Check the posting command's exit status before
-cleanup: empty stdout is not proof of success, and errors still require handling.
-
-Use `--output json` when you need the returned comment ID, attachment details,
-or other response fields. JSON remains the CLI default. This choice changes
-only the local receipt, not the posted body, attachments, or thread routing.
 
 ## Reading a linked PR's real state
 
