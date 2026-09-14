@@ -29,7 +29,7 @@ func TestBuildCommentReplyInstructionsCodexLinux(t *testing.T) {
 	got := BuildCommentReplyInstructions("codex", issueID, triggerID, false)
 
 	for _, want := range []string{
-		"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file ./reply.md",
+		"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file ./reply.md --output table",
 		"Write the body file first",
 		"--content-file ./reply.md",
 		"#4182",
@@ -85,7 +85,7 @@ func TestBuildCommentReplyInstructionsNonCodexLinux(t *testing.T) {
 				got := BuildCommentReplyInstructions(provider, issueID, triggerID, false)
 
 				for _, want := range []string{
-					"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file ./reply.md",
+					"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file ./reply.md --output table",
 					// MUL-5442 cross-channel dedup: shell-hazard mechanics live in
 					// the brief's Comment Formatting; the cookbook keeps the
 					// file-first order, the command, and the pointer.
@@ -140,7 +140,7 @@ func TestBuildCommentReplyInstructionsWindowsUsesContentFile(t *testing.T) {
 		t.Run(provider+"/windows", func(t *testing.T) {
 			got := BuildCommentReplyInstructions(provider, issueID, triggerID, false)
 			for _, want := range []string{
-				"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file",
+				"multica issue comment add " + issueID + " --parent " + triggerID + " --content-file ./reply.md --output table",
 				// MUL-5442 cross-channel dedup: the $OutputEncoding trap's
 				// full mechanics live once, in the brief's Windows Comment
 				// Formatting variant; the per-turn cookbook keeps the ban,
@@ -302,6 +302,9 @@ func TestInjectRuntimeConfigWindowsAssignmentBriefStaysFileOnly(t *testing.T) {
 				"## Comment Formatting",
 				"On Windows, **always write the comment body to a UTF-8 file",
 				"do NOT pipe via `--content-stdin`",
+				"use `--output table` to confirm success without echoing the body",
+				"Use `--output json` instead when you need the returned comment ID, attachment details, or other response fields",
+				"empty stdout alone does not prove success",
 			} {
 				if !strings.Contains(s, want) {
 					t.Errorf("%s missing Windows file-only guidance %q\n---\n%s", fileName, want, s)

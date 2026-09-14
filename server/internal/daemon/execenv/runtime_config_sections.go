@@ -387,6 +387,7 @@ func writeIssueBodyFormatting(b *strings.Builder) {
 // because agents cannot rely on which shell services the pipe.
 func writeCommentFormatting(b *strings.Builder) {
 	b.WriteString("## Comment Formatting\n\n")
+	b.WriteString("For final-result comments, use `--output table` to confirm success without echoing the body. Use `--output json` instead when you need the returned comment ID, attachment details, or other response fields. Check the posting command's exit status before cleanup; empty stdout alone does not prove success.\n\n")
 	if runtimeGOOS == "windows" {
 		b.WriteString("On Windows, **always write the comment body to a UTF-8 file with your file-write tool first, then post it with `--content-file <path>`** — do NOT pipe via `--content-stdin` (Windows PowerShell 5.1's `$OutputEncoding` may replace non-ASCII characters with `?`). Never use inline `--content` for agent-authored comments. Write the file inside your working directory, never `/tmp` or shared paths (MUL-4252). Keep the same `--parent` value from the trigger comment when replying. Delete the temp file (`Remove-Item ./reply.md`) after posting; do not rely on `\\n` escapes.\n\n")
 		return
