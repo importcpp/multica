@@ -22,13 +22,18 @@ import { redactSecrets } from "../../common/task-transcript/redact";
 import { ReadonlyContent } from "../../editor";
 import { useT } from "../../i18n";
 import { formatDuration } from "../../agents/components/agent-activity-hover-content";
-import { cancelReasonLabel, failureReasonLabel } from "../../agents/components/tabs/task-failure";
+import { cancellationActorLabel, cancelReasonLabel, failureReasonLabel } from "../../agents/components/tabs/task-failure";
 import { TerminateTaskConfirmDialog } from "./terminate-task-confirm-dialog";
 import { TaskStatusIcon } from "./task-status-icon";
 import { useStatusLabel } from "./task-run-labels";
 import { commentRunOutput, isActiveCommentRun, showCommentRunInHeader, type CommentRun } from "./comment-runs";
 
 import { useRunAnimationVisibility, useRunDisclosureMotion } from "./use-run-comment-motion";
+
+function thinkingPreview(content: string | undefined, formatText: (text: string) => string): string {
+  // Redact the complete content before clipping so a split credential cannot leak.
+  return traceEventSummary({ type: "thinking", content: redactSecrets(formatText(content ?? "")) });
+}
 
 export function useInlineCommentRunState() {
   const [expanded, setExpanded] = useState(false);
@@ -60,6 +65,7 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
   const { getActorName } = useActorName();
   const name = getActorName("agent", task.agent_id);
   const status = useStatusLabel(task.status);
+  const statusText = cancellationActorLabel(task, tAgents) ?? status;
   const active = isActiveCommentRun(task);
   const localViewState = useInlineCommentRunState();
   const state = viewState ?? localViewState;
@@ -99,7 +105,7 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
   const activitySummary = current && isCallStep(current)
     ? redactSecrets(traceToolArgSummary(current.call?.input, { formatText }) || current.tool)
     : current?.kind === "text" ? redactSecrets(formatText(current.item.content ?? ""))
-    : current?.kind === "thinking" ? t(($) => $.inline_run.thinking)
+    : current?.kind === "thinking" ? thinkingPreview(current.item.content, formatText) || t(($) => $.inline_run.thinking)
     : current?.kind === "error" ? t(($) => $.inline_run.error)
     : t(($) => $.inline_run.waiting_response);
   const summary = task.status === "queued" ? t(($) => $.inline_run.queued)
@@ -146,12 +152,12 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
           <ActorAvatar actorType="agent" actorId={task.agent_id} size="md" enableHoverCard />
           <span className="max-w-[30%] shrink-0 truncate text-body font-medium" title={name}>{name}</span>
         </>}
-        <span className={cn("flex shrink-0 items-center gap-1.5 whitespace-nowrap text-caption text-muted-foreground", showProgress && "sr-only")}
+        <span className={cn("flex min-w-0 max-w-[50%] shrink-0 items-center gap-1.5 whitespace-nowrap text-caption text-muted-foreground", showProgress && "sr-only")}
           role="status" data-run-status>
-          <TaskStatusIcon status={task.status} />{status}
+          <TaskStatusIcon status={task.status} /><span className="truncate" title={statusText}>{statusText}</span>
         </span>
         <button type="button"
-          className={cn("flex min-w-0 items-center gap-1.5 rounded py-1 text-left text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          className={cn("flex min-w-0 items-center gap-1.5 rounded-xs py-1 text-left text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
             showProgress ? "flex-1 text-body" : "order-last ml-auto shrink-0",
             showIdentity && !showProgress && "@max-[32rem]/run:min-w-7 @max-[32rem]/run:justify-center")}
           aria-label={stepLabel ? `${activityLabel} · ${stepLabel}` : activityLabel}
@@ -185,7 +191,7 @@ export function InlineCommentRun({ run, className, viewState, showIdentity = fal
           {rows.length > visibleCount && <button type="button" className="py-1 text-caption text-muted-foreground hover:text-foreground"
             onClick={() => setVisibleCount((count) => count + 12)}>{t(($) => $.inline_run.show_earlier, { count: rows.length - visibleCount })}</button>}
           {rows.slice(-visibleCount).map((row) => <InlineStep key={row.seq} row={row} live={active} formatText={formatText} />)}
-          <button type="button" className="flex items-center gap-1.5 rounded py-2 text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          <button type="button" className="flex items-center gap-1.5 rounded-xs py-2 text-caption text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
             onClick={openFullLog}>{t(($) => $.inline_run.full_log)}<ExternalLink className="size-3" /></button>
         </div>}
       </div>
@@ -210,10 +216,10 @@ function InlineStep({ row, live, formatText }: { row: TraceRow; live: boolean; f
     ? redactSecrets(traceToolArgSummary(row.call?.input, { formatText }) || (row.result ? traceEventSummary(row.result, { formatText }) : "")) || row.tool
     : grouped ? row.tool
     : row.kind === "text" ? t(($) => $.inline_run.message)
-    : row.kind === "thinking" ? t(($) => $.inline_run.thinking)
+    : row.kind === "thinking" ? thinkingPreview(row.item.content, formatText) || t(($) => $.inline_run.thinking)
     : t(($) => $.inline_run.error);
   return <details className="min-w-0 text-caption" onToggle={onToggle}>
-    <summary onClick={disclosure.onTrigger} className="flex cursor-pointer list-none items-center gap-2 rounded py-1.5 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
+    <summary onClick={disclosure.onTrigger} className="flex cursor-pointer list-none items-center gap-2 rounded-xs py-1.5 hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring [&::-webkit-details-marker]:hidden">
       {pending ? <Loader2 aria-hidden className="size-3.5 shrink-0 animate-spin text-info motion-reduce:animate-none" />
         : <Icon aria-hidden className={cn("size-3.5 shrink-0", error ? "text-destructive" : "text-muted-foreground")} />}
       <span className={cn("min-w-0 flex-1 truncate", error && "text-destructive")} title={summary}>{summary}</span>
