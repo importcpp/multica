@@ -438,7 +438,8 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 				"A name is not an id",
 				"`--output json` writes to stdout",
 				"`--no-start` when you are only recording",
-				"Status is a category, not a literal",
+				"categories describe lifecycle only",
+				"Custom statuses do not inherit built-in automation behavior",
 				"Comment reads stay bounded",
 				"--roots-only --summary --compact",
 				"--thread <thread-id> --tail 30",
@@ -456,7 +457,17 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 				"Default for code-changing issue work",
 				"open or update a PR before posting the final Multica issue comment",
 				"This is a default, not",
-				"Use a routable issue key in the PR title, body, or branch",
+				"put a routable issue key in the PR **title**",
+				"body links nothing",
+				// The empty-PR-list guidance drives GitHub write actions, so
+				// both halves of it are pinned: a syntax problem is repairable
+				// by editing the PR, and an integration problem is not — an
+				// agent that keeps editing burns deliveries on a no-op.
+				"editing the title or adding a closing keyword re-runs the scan",
+				"stop editing the PR blind",
+				"whether the installation is bound to this workspace",
+				"redelivered once the receiving side is fixed",
+				"unless the issue should auto-advance",
 				"include the PR URL when a PR exists",
 				"Closes MUL-123",
 				"--status backlog",
@@ -677,13 +688,14 @@ func TestPlatformSkillCoversPlatformContracts(t *testing.T) {
 			if !ok {
 				t.Fatalf("platform skill does not ship %q", tc.file)
 			}
+			unwrapped := collapseSpace(content)
 			for _, want := range tc.want {
-				if !containsUnwrapped(content, want) {
+				if !containsUnwrapped(unwrapped, want) {
 					t.Errorf("%s missing %q", tc.file, want)
 				}
 			}
 			for _, forbidden := range tc.notWant {
-				if containsUnwrapped(content, forbidden) {
+				if containsUnwrapped(unwrapped, forbidden) {
 					t.Errorf("%s carries banned content %q", tc.file, forbidden)
 				}
 			}
@@ -798,8 +810,12 @@ func TestOnboardingSkillIsScopedToMika(t *testing.T) {
 // wrapped. These anchors pin a claim, not a line layout — matching raw bytes
 // made every reflow of a paragraph look like a deleted contract, which trains
 // authors to fix the test instead of the text.
-func containsUnwrapped(content, want string) bool {
-	return strings.Contains(collapseSpace(content), collapseSpace(want))
+//
+// unwrapped is content already passed through collapseSpace: callers collapse
+// each file once, because re-collapsing a whole reference per anchor made this
+// the slowest test in the package.
+func containsUnwrapped(unwrapped, want string) bool {
+	return strings.Contains(unwrapped, collapseSpace(want))
 }
 
 var whitespaceRun = regexp.MustCompile(`\s+`)

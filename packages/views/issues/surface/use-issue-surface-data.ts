@@ -3,14 +3,13 @@
 import { useCallback, useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { Issue, Project } from "@multica/core/types";
-import { ALL_STATUSES } from "@multica/core/issues/config";
 import { projectListOptions } from "@multica/core/projects/queries";
 import { childIssueProgressOptions } from "@multica/core/issues/queries";
 import { issueSurfaceGanttOptions } from "@multica/core/issues/surface/repository";
 import type { IssueSurfaceQueryPlan } from "@multica/core/issues/surface/query-plan";
-import type { IssueStatus, IssueStatusCategory, PropertyFilterValue } from "@multica/core/types";
+import type { IssueStatus, PropertyFilterValue } from "@multica/core/types";
 import { useIssueStatuses } from "@multica/core/issue-statuses/hooks";
-import { issueBehavesAsAny, statusFilterColumns } from "@multica/core/issues";
+import { issueBehavesAsAny, statusColumnKeys, visibleStatusKeys } from "@multica/core/issues";
 import {
   applyIssueFilters,
   type IssueFilterState,
@@ -48,7 +47,7 @@ function ganttCanvasRows(issues: Issue[], showCompleted: boolean): Issue[] {
   if (showCompleted) return dated;
   // By CATEGORY: a custom status in done/cancelled is completed work, and
   // "show completed" has to hide it too. (MUL-6243)
-  return dated.filter((i) => !issueBehavesAsAny(i, ["done", "cancelled"]));
+  return dated.filter((i) => !issueBehavesAsAny(i, ["done", "closed"]));
 }
 
 export interface IssueSurfaceData {
@@ -62,8 +61,8 @@ export interface IssueSurfaceData {
   ganttWorkingScopeIssues: Issue[] | undefined;
   filteredGanttIssues: Issue[];
   ganttIssues: Issue[];
-  visibleStatuses: IssueStatusCategory[];
-  hiddenStatuses: IssueStatusCategory[];
+  visibleStatuses: IssueStatus[];
+  hiddenStatuses: IssueStatus[];
   statusPagination: IssueStatusPagination;
   activeFilters: Omit<IssueFilters, "statusFilters">;
   childProgressMap: Map<string, ChildProgress>;
@@ -100,7 +99,7 @@ export function useIssueSurfaceData({
   serverGroupBranches,
   ganttShowCompleted,
   statusFilters,
-  hiddenStatusCategories,
+  hiddenStatusKeys,
   statusFilterPending,
   statusFilterError,
   priorityFilters,
@@ -127,7 +126,7 @@ export function useIssueSurfaceData({
    *  rows without it, so the working scope has to honour it too. */
   ganttShowCompleted: boolean;
   statusFilters: IssueStatus[];
-  hiddenStatusCategories: IssueStatusCategory[];
+  hiddenStatusKeys: IssueStatus[];
   /** A custom status filter is waiting on the catalog — hold loading. */
   statusFilterPending: boolean;
   /** The catalog failed, so a custom status filter cannot be honoured. */
@@ -160,11 +159,10 @@ export function useIssueSurfaceData({
       ? serverGroupBranches.issues
       : EMPTY_ISSUES;
 
-  // `cancelled` is a first-class default status (MUL-4290): it is fetched into
-  // the cache like every other status and flows straight through to list /
-  // board / swimlane columns, header facet counts, batch selection, and the
-  // isEmpty check. The status filter narrows this set like any other status —
-  // it no longer unlocks an otherwise-hidden bucket.
+  // Status branches already reflect the visible category set chosen by the
+  // controller. Cancelled is hidden for a new view, but remains a first-class
+  // branch once the user restores it or selects it explicitly in a status
+  // filter; no client-only exclusion happens here.
   const ganttIssues = ganttIssuesQuery.data ?? EMPTY_ISSUES;
   const surfaceIssues = usesGantt
     ? ganttIssues
@@ -336,32 +334,19 @@ export function useIssueSurfaceData({
 
   const catalog = useIssueStatuses(wsId);
 
-  const visibleStatuses = useMemo<IssueStatusCategory[]>(() => {
-    // Board columns are CATEGORIES, not status keys — adding a custom status
-    // must never add a column. Two independent things narrow them: hidden
-    // columns (display state) and the status filter, which is expressed in
-    // concrete KEYS and so has to be mapped back to the columns those keys land
-    // in. Default view shows every category, `cancelled` last (its canonical
-    // position in ALL_STATUSES). (MUL-6243)
-    const resolved =
-      statusFilters.length > 0 ? statusFilterColumns(statusFilters, catalog) : null;
-    // Pending/error contribute no narrowing here; the surface's loading and
-    // error states (statusFilterPending / statusFilterError) are what stop it
-    // rendering as though the empty result were the answer.
-    const selected = resolved?.state === "resolved" ? resolved.columns : null;
-    return ALL_STATUSES.filter(
-      (s) =>
-        !hiddenStatusCategories.includes(s) &&
-        (selected === null || selected.has(s)),
+  const visibleStatuses = useMemo<IssueStatus[]>(() => {
+    // An explicit exact-key filter wins over hidden column preferences.
+    return visibleStatusKeys(
+      statusFilters,
+      hiddenStatusKeys,
+      catalog,
     );
-  }, [statusFilters, hiddenStatusCategories, catalog]);
+  }, [statusFilters, hiddenStatusKeys, catalog]);
 
-  // Hidden columns are the lifecycle statuses not currently visible, so
-  // `cancelled` participates in the board show/hide controls exactly like the
-  // rest of the statuses.
-  const hiddenStatuses = useMemo<IssueStatusCategory[]>(
-    () => ALL_STATUSES.filter((s) => !visibleStatuses.includes(s)),
-    [visibleStatuses],
+  // Each catalog status can be hidden or restored independently.
+  const hiddenStatuses = useMemo<IssueStatus[]>(
+    () => statusColumnKeys(catalog).filter((s) => !visibleStatuses.includes(s)),
+    [catalog, visibleStatuses],
   );
 
   const activeFilters = useMemo(

@@ -156,7 +156,8 @@ allowlist の正確な判定順序は[ログインとサインアップ](/auth-s
 
 | 変数 | デフォルト | 説明 |
 |---|---|---|
-| `REDIS_URL` | 空 | 共有レート制限、リアルタイムイベント、token cache に使用。未設定の場合、リアルタイムイベントと招待制限はプロセス内メモリにフォールバックし、認証レート制限は無効になります |
+| `REDIS_URL` | 空 | 共有レート制限、リアルタイムイベント、チャンネル WebSocket リース、token cache など、すべての Redis 機能が使用する唯一の接続 URL |
+| `REDIS_CLUSTER_MODE` | `false` | `true` にすると、`REDIS_URL` が単一の設定エンドポイントでも Redis Cluster クライアントを使用します。クラスターモードではデータベース 0 と `REALTIME_RELAY_MODE=sharded` が必要です |
 | `REDIS_DISABLE_CLIENT_NAME` | `false` | マネージド Redis が `CLIENT SETNAME` を禁止している場合に `true` を設定 |
 | `RATE_LIMIT_AUTH` | `5` | 認証コード送信または Google ログイン開始の、IP あたり毎分の回数 |
 | `RATE_LIMIT_AUTH_VERIFY` | `20` | 認証コード検証の、IP あたり毎分の回数 |
@@ -234,11 +235,12 @@ API key と base URL の両方が空の場合、このレイヤーは無効に�
 | `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` | `20` | デーモン 1 つあたりの同時実行上限 |
 | `MULTICA_AGENT_TIMEOUT` | `0` | 1 回の実行の絶対時間上限。`0` は上限なし |
 | `MULTICA_AGENT_IDLE_WATCHDOG` | `2h` | 出力もツール実行もない状態の静穏上限。`0` で watchdog 全体を無効化 |
-| `MULTICA_AGENT_TOOL_WATCHDOG` | `MULTICA_AGENT_IDLE_WATCHDOG` と同じ | 単一のツール呼び出しが静穏なままでいられる上限。モデルより長い余裕をツールに与えたい場合のみ設定し、`0` はツール実行中に強制停止しません |
+| `MULTICA_AGENT_TOOL_WATCHDOG` | `MULTICA_AGENT_IDLE_WATCHDOG` と同じ | 単一のツール呼び出しが静穏なままでいられる上限。モデルより長い余裕をツールに与えたい場合のみ設定し、`0` はツール実行中に強制停止しません。Cursor のバックグラウンドシェルは、起動したプロセスが終了するまで実行中として扱われます。この上限に達すると、デーモンはそれらのプロセスを停止し、Cursor が最終結果を出すための新しい watchdog 予算を与えます。プロセスの所有権やクリーンアップを検証できない場合は、通常の実行キャンセル方針に従います |
 | `MULTICA_OPENCODE_IDLE_WATCHDOG` | `10m` | OpenCode 専用の静穏しきい値 |
 | `MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT` | `MULTICA_AGENT_IDLE_WATCHDOG` と同じ | Codex のセマンティック静穏しきい値。Codex 自身のタイマーはツール実行中かどうかを判別できないため、独自の短い上限を持たず idle / tool 予算の大きい方に追従します |
 | `MULTICA_CODEX_FIRST_TURN_TIMEOUT` | `0` | Codex 初回ターンの無進捗上限を明示的に上書き；`0` はデフォルトを維持。実効の初回ターン待機は依然として `MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT` と全体の実行タイムアウトに制限される——`MULTICA_CODEX_SEMANTIC_INACTIVITY_TIMEOUT` をこの値より厳密に大きく（余裕を持たせて）設定すること。さもないと待機はその値で打ち切られ、モデルカタログの起動リトライがスキップされる。同値では不十分：セマンティックタイマーが先に起動するため、同値の場合でもリトライが失われることがある |
 | `MULTICA_CODEX_HANDSHAKE_TIMEOUT` | `30s`、`thread/start`・`thread/resume`：`60s` | Codex app-server 起動ハンドシェイクの上限。明示的な値は両方の予算を一括で上書きします |
+| `MULTICA_CODEX_TURN_INTERRUPT_TIMEOUT` | `2s` | キャンセル後に Codex app-server が `turn/interrupt` を確認し `turn/completed` を送信するまでの猶予時間。プロセスを強制終了する前に最終トークン使用量を保持します。特に遅いホストでは daemon ログに記録された割り込み遅延を基に調整できます |
 | `MULTICA_DAEMON_AUTO_UPDATE` | Cloud は `true`、セルフホストは `false` | CLI の更新を自動でチェックして適用するか |
 | `MULTICA_DAEMON_AUTO_UPDATE_INTERVAL` | `6h` | 更新チェックの間隔 |
 | `MULTICA_DAEMON_AUTO_RELOAD` | `true` | 帯域外で置き換えられた `multica` バイナリ（`brew upgrade`、再ダウンロード、ローカルビルド）へ再起動して追従するかどうか。`MULTICA_DAEMON_AUTO_UPDATE` とは独立 |
@@ -248,12 +250,16 @@ API key と base URL の両方が空の場合、このレイヤーは無効に�
 
 デーモンがエージェント作業に注入する内部コンテキストについては、[作業ランタイム環境](/daemon-runtimes#作業ランタイム環境)を参照してください。
 
-各 AI コーディングツールは `MULTICA_<PROVIDER>_PATH` でコマンドパスを上書きでき、モデル上書き対応ツールでは `MULTICA_<PROVIDER>_MODEL` も利用できます。QwenPaw と MiniMax Code にはモデル変数がなく、MiniMax Code のパス変数は `MULTICA_MCODE_PATH` です。詳しくは [AI コーディングツール比較](/providers#モデルの取得元) を参照してください。DeepSeek Harness は `MULTICA_DSH_PATH` と `MULTICA_DSH_MODEL` に対応しています（値は dsh のモデルカタログにあるモデル ID、例: `deepseek-official/deepseek-chat`）。ZeroClaw は `MULTICA_ZEROCLAW_PATH` に対応しますが、モデル変数はありません。モデルは ZeroClaw のエージェント設定で管理します。マシン全体のデフォルト引数 `MULTICA_<PROVIDER>_ARGS` は、現在 Claude Code、Codex、CodeBuddy、Qwen Code、QwenPaw の 5 ツールに対応しています。対応する変数は `MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS`、`MULTICA_QWEN_ARGS`、`MULTICA_QWENPAW_ARGS` です。例:
+各 AI コーディングツールは `MULTICA_<PROVIDER>_PATH` でコマンドパスを上書きでき、モデル上書き対応ツールでは `MULTICA_<PROVIDER>_MODEL` も利用できます。QwenPaw と MiniMax Code にはモデル変数がなく、MiniMax Code のパス変数は `MULTICA_MCODE_PATH` です。詳しくは [AI コーディングツール比較](/providers#モデルの取得元) を参照してください。DeepSeek Harness は `MULTICA_DSH_PATH` と `MULTICA_DSH_MODEL` に対応しています（値は dsh のモデルカタログにあるモデル ID、例: `deepseek-official/deepseek-chat`）。 DeepSeek Harness はさらに `MULTICA_DSH_PROFILE_BUNDLE` に対応しています。`multica` プロファイルが存在しない場合にインストールするバンドルを指定するもので、カンマ区切りで複数の候補を順に試します。各項目は npm のパッケージ名、ディレクトリ、またはパック済み tarball です。既定では未設定です。Multica が利用する `--stdio` プロトコルはこのプロファイルが提供するため、未設定の場合は DSH のインストールには手を加えず、デーモンは使用できないランタイムを登録する代わりにプロファイルの欠落を報告します。Multica 自身のブリッジはまだ公開 npm レジストリにないため、値の選び方は[エージェントランタイムのインストール](/install-agent-runtime)を参照してください。ここに設定した値は追加の確認なしに各デーモンホストの DSH ホームへインストールされるので、サプライチェーンの判断として扱ってください。`MULTICA_DSH_PROFILE_BUNDLE` が有効にするインストールは範囲を意図的に限定しています。実行はデーモンのライフタイムにつき最大 1 回、プローブがプロファイルの不在を確認できた場合のみです。失敗時はパッケージマネージャー自身の出力をログに記録し、再試行はデーモンの再起動後のみ行います。プローブがタイムアウトした場合や、このデーモンが扱わないプロトコルバージョンを返した場合は報告のみで、上書きインストールは行いません。意図して用意されたプロファイルをデーモンが上書きすることはありません。調査はデーモンログで `DSH runtime profile` を検索してください。取り消す場合は `$DSH_HOME/profiles/multica`（既定は `~/.dsh/profiles/multica`）を削除します。`MULTICA_DSH_PLUGIN_PATH` はインストール時に pnpm を解決するディレクトリを上書きします。`dsh plugin` が転送する pnpm は macOS でも Windows でも DSH Desktop 独自の runtime-commands ディレクトリに置かれており、デーモンはそれを自動で見つけて PATH の先頭に追加します（新しい Desktop が使うバージョン付きの構成も含みます）。したがってこの変数が必要なのは、デーモンが見つけられない場所にインストールされている場合か、独自の pnpm を使わせたい場合だけです。設定すると自動探索は完全に置き換わり、指定したディレクトリが存在しなければ、インストールは同梱の pnpm ではなくデーモンの `PATH` 上の pnpm にフォールバックします。Linux には DSH Desktop がないため、常に `PATH` が使われます。ZeroClaw は `MULTICA_ZEROCLAW_PATH` に対応しますが、モデル変数はありません。モデルは ZeroClaw のエージェント設定で管理します。マシン全体のデフォルト引数 `MULTICA_<PROVIDER>_ARGS` は、現在 Claude Code、Codex、CodeBuddy、Qwen Code、QwenPaw の 5 ツールに対応しています。対応する変数は `MULTICA_CLAUDE_ARGS`、`MULTICA_CODEX_ARGS`、`MULTICA_CODEBUDDY_ARGS`、`MULTICA_QWEN_ARGS`、`MULTICA_QWENPAW_ARGS` です。例:
 
 ```dotenv
 MULTICA_CLAUDE_PATH=/opt/bin/claude
 MULTICA_CLAUDE_ARGS=--max-turns 40
 ```
+
+Cursor の検証済みバックグラウンドクリーンアップには、Linux 6.9 以降（プロセスグループ pidfd）、macOS カーネルによるプロセス識別子の照会と audit token を用いたシグナル送信のサポート、または Windows で正常に割り当てられた入れ子の Job Object が必要です。macOS では各プロセスへのシグナル送信にカーネルが検証する PID version を用いるため、同一セッションのグループに参加する必要はありません。これらの macOS API は非公開であり、プロセス捕捉時に確認されます。所有権を確保できなかったバックグラウンドプロセスは元のツール結果を返し、ツール watchdog が `0` の場合も含めて通常の idle watchdog に従います。すでに所有している作業は、クリーンアップを確認できない場合も実行中のままです。ツール watchdog を `0` にした場合はこの境界自体が存在せず、所有済みのバックグラウンド作業が生きている限り実行は継続します。その場合の実行は `MULTICA_AGENT_TIMEOUT` だけに制限され、これも既定値は `0` です。
+
+所有している Cursor のバックグラウンドプロセスは、実行が正常に完了したときにも停止されます。したがって、その実行が起動したバックグラウンドサーバーが意図的に終了処理後まで生き残ることはありません。macOS は保持された元の親プロセスの識別子によって後から生まれた子プロセスを認識できますが、観測前に中間プロセスが消えた連鎖は証明できません。そのようなプロセス、追跡対象のグループから外れた作業、および継続的な所有権や送信のエラーは、バックグラウンド作業を残す可能性があります。確認できなかったクリーンアップはログに記録され、「クリーンアップ成功」による回復ウィンドウを与えることはありません。数値の PID やプロセスグループだけを根拠に未知のプロセスを終了させることはありません。
 
 優先順位はコマンドラインフラグ → 環境変数 → `~/.multica/config.json` → 組み込みデフォルトです。watchdog の動作は[デーモンとランタイム](/daemon-runtimes)を参照してください。
 
