@@ -209,10 +209,8 @@ type Message struct {
 }
 
 // TokenUsage tracks token consumption for a single model.
-// The normalization target is four mutually exclusive counts: InputTokens
-// excludes cache reads/writes, and OutputTokens includes reasoning/thinking.
-// Codex and Claude follow this output convention. OpenCode and CodeArts currently
-// preserve provider output without folding in the separate reasoning counter.
+// Its four token counts are mutually exclusive: InputTokens excludes cache
+// reads and writes, and OutputTokens includes reasoning/thinking.
 // Breakdowns already included in a total must not be added to that total again.
 // Zero counters alone do not establish that the provider reported complete usage.
 type TokenUsage struct {
