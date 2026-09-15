@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// Provider fields do not share an input-token convention, but their normalized
-// usage must share the TokenUsage contract. Reasoning is already in output.
+// Codex and Claude use different input-token conventions but normalize to the
+// same TokenUsage buckets. Both include reasoning/thinking in output.
 // https://developers.openai.com/api/docs/guides/reasoning#managing-the-context-window
 // https://platform.claude.com/docs/en/build-with-claude/prompt-caching#tracking-cache-performance
 func TestProviderTokenUsageContract(t *testing.T) {

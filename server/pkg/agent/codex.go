@@ -3827,6 +3827,8 @@ func codexSessionRoot(codexHome string) string {
 	return ""
 }
 
+// codexRawTokenUsage keeps the provider's reasoning breakdown in raw snapshots
+// and deltas. Normalized usage consumes OutputTokens, which already includes it.
 type codexRawTokenUsage struct {
 	InputTokens           int64 `json:"input_tokens"`
 	OutputTokens          int64 `json:"output_tokens"`
