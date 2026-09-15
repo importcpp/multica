@@ -275,7 +275,8 @@ type qwenStreamState struct {
 	sawResult, resultIsError                                            bool
 	usage                                                               map[string]TokenUsage
 	fallbackUsage                                                       map[string]TokenUsage
-	messageUsage                                                        map[qwenUsageKey]qwenUsage
+	seenUsageMessageIDs                                                 map[string]struct{}
+	anonymousUsage                                                      map[string]TokenUsage
 	hasResultUsage                                                      bool
 	eventCount, invalidEventCount, assistantEventCount, toolUseCount    int
 	unreadableAssistantCount                                            int
@@ -370,31 +371,34 @@ func handleQwenAssistant(raw json.RawMessage, ch chan<- Message, state *qwenStre
 	return turn, message.Model
 }
 
-type qwenUsageKey struct{ model, messageID string }
-
 func (s *qwenStreamState) accumulateAssistantUsage(message qwenMessage) {
-	if s.messageUsage == nil {
-		s.messageUsage = make(map[qwenUsageKey]qwenUsage)
+	if s.fallbackUsage == nil {
 		s.fallbackUsage = make(map[string]TokenUsage)
+		s.seenUsageMessageIDs = make(map[string]struct{})
+		s.anonymousUsage = make(map[string]TokenUsage)
 	}
-	key := qwenUsageKey{message.Model, message.ID}
-	previous := s.messageUsage[key]
-	current := *message.Usage
-	// Qwen can emit the same message as blocks close and again at completion.
-	// Retain the richest raw snapshot before normalizing its cache buckets.
-	// Without an ID, preserve the existing latest-per-model best effort.
+	current := qwenTokenUsage(message.Usage)
+	var previous TokenUsage
 	if message.ID != "" {
-		current.InputTokens = max(previous.InputTokens, current.InputTokens)
-		current.OutputTokens = max(previous.OutputTokens, current.OutputTokens)
-		current.CacheReadInputTokens = max(previous.CacheReadInputTokens, current.CacheReadInputTokens)
+		// Qwen emits full assistant messages at finalization. Count the first
+		// non-empty snapshot once by ID, keeping its counters and model together.
+		if current.InputTokens == 0 && current.OutputTokens == 0 && current.CacheReadTokens == 0 {
+			return
+		}
+		if _, seen := s.seenUsageMessageIDs[message.ID]; seen {
+			return
+		}
+		s.seenUsageMessageIDs[message.ID] = struct{}{}
+	} else {
+		// Without an ID, preserve the existing latest-per-model best effort.
+		previous = s.anonymousUsage[message.Model]
+		s.anonymousUsage[message.Model] = current
 	}
-	before, after := qwenTokenUsage(&previous), qwenTokenUsage(&current)
 	total := s.fallbackUsage[message.Model]
-	total.InputTokens += after.InputTokens - before.InputTokens
-	total.OutputTokens += after.OutputTokens - before.OutputTokens
-	total.CacheReadTokens += after.CacheReadTokens - before.CacheReadTokens
+	total.InputTokens += current.InputTokens - previous.InputTokens
+	total.OutputTokens += current.OutputTokens - previous.OutputTokens
+	total.CacheReadTokens += current.CacheReadTokens - previous.CacheReadTokens
 	s.fallbackUsage[message.Model] = total
-	s.messageUsage[key] = current
 	if !s.hasResultUsage {
 		s.usage = s.fallbackUsage
 	}

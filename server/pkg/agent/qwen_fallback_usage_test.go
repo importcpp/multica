@@ -30,9 +30,19 @@ func TestQwenFallbackUsageAccumulatesMessageSnapshots(t *testing.T) {
 		{"duplicate", []qwenStreamEvent{first, first}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
 		{"interleaved_duplicate", []qwenStreamEvent{first, second, first}, map[string]TokenUsage{"test": {InputTokens: 300, OutputTokens: 70}}},
 		{"placeholder_then_usage", []qwenStreamEvent{qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{}), first}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
-		{"updated_then_stale_snapshot", []qwenStreamEvent{first, qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{InputTokens: 120, OutputTokens: 60}), first}, map[string]TokenUsage{"test": {InputTokens: 120, OutputTokens: 60}}},
+		{"changed_duplicate_keeps_first_snapshot", []qwenStreamEvent{first, qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{InputTokens: 120, OutputTokens: 60}), first}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
+		{"decreasing_counter_keeps_whole_snapshot", []qwenStreamEvent{
+			qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{InputTokens: 100, OutputTokens: 60, CacheReadInputTokens: 20}),
+			qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{InputTokens: 100, OutputTokens: 50, CacheReadInputTokens: 40}),
+		}, map[string]TokenUsage{"test": {InputTokens: 80, OutputTokens: 60, CacheReadTokens: 20}}},
+		{"corrected_model_does_not_count_message_twice", []qwenStreamEvent{first, qwenFallbackAssistant(t, "message-1", "other", &qwenUsage{InputTokens: 100, OutputTokens: 50})}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
+		{"empty_snapshot_does_not_claim_model", []qwenStreamEvent{qwenFallbackAssistant(t, "message-1", "other", &qwenUsage{}), first}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
+		{"missing_usage_does_not_claim_id", []qwenStreamEvent{qwenFallbackAssistant(t, "message-1", "test", nil), first}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
+		{"cache_only_snapshot_claims_id", []qwenStreamEvent{qwenFallbackAssistant(t, "message-1", "test", &qwenUsage{InputTokens: 20, CacheReadInputTokens: 20}), first}, map[string]TokenUsage{"test": {CacheReadTokens: 20}}},
 		{"separate_models", []qwenStreamEvent{first, qwenFallbackAssistant(t, "message-2", "other", &qwenUsage{InputTokens: 20, OutputTokens: 10})}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}, "other": {InputTokens: 20, OutputTokens: 10}}},
 		{"no_id_keeps_latest_snapshot", []qwenStreamEvent{qwenFallbackAssistant(t, "", "test", &qwenUsage{InputTokens: 100, OutputTokens: 50}), qwenFallbackAssistant(t, "", "test", &qwenUsage{InputTokens: 200, OutputTokens: 20})}, map[string]TokenUsage{"test": {InputTokens: 200, OutputTokens: 20}}},
+		{"no_id_decrease_preserves_identified_usage", []qwenStreamEvent{first, qwenFallbackAssistant(t, "", "test", &qwenUsage{InputTokens: 200, OutputTokens: 20}), qwenFallbackAssistant(t, "", "test", &qwenUsage{InputTokens: 50, OutputTokens: 10})}, map[string]TokenUsage{"test": {InputTokens: 150, OutputTokens: 60}}},
+		{"no_id_empty_snapshot_clears_only_anonymous_usage", []qwenStreamEvent{first, qwenFallbackAssistant(t, "", "test", &qwenUsage{InputTokens: 200, OutputTokens: 20}), qwenFallbackAssistant(t, "", "test", &qwenUsage{})}, map[string]TokenUsage{"test": {InputTokens: 100, OutputTokens: 50}}},
 		{"empty_result_keeps_fallback", []qwenStreamEvent{first, second, {Type: "result", Usage: &qwenUsage{}}}, map[string]TokenUsage{"test": {InputTokens: 300, OutputTokens: 70}}},
 		{"final_total_wins", []qwenStreamEvent{first, second, final}, map[string]TokenUsage{"test": {InputTokens: 500, OutputTokens: 80}}},
 		{"late_assistant_cannot_replace_final_total", []qwenStreamEvent{first, final, second}, map[string]TokenUsage{"test": {InputTokens: 500, OutputTokens: 80}}},
@@ -57,7 +67,7 @@ func TestQwenFallbackUsageAccumulatesMessageSnapshots(t *testing.T) {
 	}
 }
 
-func TestQwenFallbackUsagePreservesCacheSnapshots(t *testing.T) {
+func TestQwenFallbackUsagePreservesFirstCacheSnapshot(t *testing.T) {
 	t.Parallel()
 	state := qwenStreamState{usage: make(map[string]TokenUsage)}
 	for _, event := range []qwenStreamEvent{
@@ -67,8 +77,8 @@ func TestQwenFallbackUsagePreservesCacheSnapshots(t *testing.T) {
 	} {
 		handleQwenEvent(event, make(chan Message, 1), &state)
 	}
-	if got := state.usage["test"].CacheReadTokens; got != 70 {
-		t.Fatalf("cache reads = %d, want 70", got)
+	if got, want := state.usage["test"], (TokenUsage{InputTokens: 150, CacheReadTokens: 50}); got != want {
+		t.Fatalf("usage = %+v, want %+v", got, want)
 	}
 }
 
