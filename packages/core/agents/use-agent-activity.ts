@@ -13,8 +13,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export interface ActivityBucket {
   total: number;
   failed: number;
-  completed: number | null;
-  cancelled: number | null;
+  completed: number;
+  cancelled: number;
 }
 
 export interface AgentActivity {
@@ -48,9 +48,15 @@ export interface ActivityWindowSummary {
   totalRuns: number;
   /** Sum of `bucket.failed` across the window. */
   totalFailed: number;
-  totalCompleted: number | null;
-  totalCancelled: number | null;
-  /** Completed / (completed + failed), or null without known outcomes. */
+  /** Sum of `bucket.completed` across the window. */
+  totalCompleted: number;
+  /** Sum of `bucket.cancelled` across the window. */
+  totalCancelled: number;
+  /**
+   * Completed / (completed + failed). Null when the window has no
+   * completed or failed run to divide by — a window of nothing but
+   * cancellations has no success rate, and must not claim 100%.
+   */
   successRate: number | null;
   /** Echo of the input window — the renderer uses it for copy. */
   windowDays: number;
@@ -162,14 +168,8 @@ export function deriveAgentActivity(
     const target = series[slot]!;
     target.total += b.task_count;
     target.failed += b.failed_count;
-    target.completed =
-      target.completed === null || b.completed_count === undefined
-        ? null
-        : target.completed + b.completed_count;
-    target.cancelled =
-      target.cancelled === null || b.cancelled_count === undefined
-        ? null
-        : target.cancelled + b.cancelled_count;
+    target.completed += b.completed_count;
+    target.cancelled += b.cancelled_count;
   }
 
   const createdAt = new Date(agentCreatedAt).getTime();
@@ -209,25 +209,17 @@ export function summarizeActivityWindow(
     safeWindow === 0 ? [] : activity.buckets.slice(-safeWindow);
   let totalRuns = 0;
   let totalFailed = 0;
-  let totalCompleted: number | null = 0;
-  let totalCancelled: number | null = 0;
+  let totalCompleted = 0;
+  let totalCancelled = 0;
   for (const b of slice) {
     totalRuns += b.total;
     totalFailed += b.failed;
-    totalCompleted =
-      totalCompleted === null || b.completed === null
-        ? null
-        : totalCompleted + b.completed;
-    totalCancelled =
-      totalCancelled === null || b.cancelled === null
-        ? null
-        : totalCancelled + b.cancelled;
+    totalCompleted += b.completed;
+    totalCancelled += b.cancelled;
   }
-  const outcomes = (totalCompleted ?? 0) + totalFailed;
+  const outcomes = totalCompleted + totalFailed;
   const successRate =
-    totalCompleted !== null && outcomes > 0
-      ? Math.round((totalCompleted / outcomes) * 100)
-      : null;
+    outcomes > 0 ? Math.round((totalCompleted / outcomes) * 100) : null;
   return {
     buckets: slice,
     totalRuns,

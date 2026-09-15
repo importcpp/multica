@@ -18,6 +18,7 @@ function bucket(
   daysAgo: number,
   taskCount: number,
   failedCount = 0,
+  cancelledCount = 0,
 ): AgentActivityBucket {
   const t = new Date(NOW);
   t.setHours(0, 0, 0, 0);
@@ -26,6 +27,8 @@ function bucket(
     bucket_at: new Date(t.getTime() - daysAgo * DAY).toISOString(),
     task_count: taskCount,
     failed_count: failedCount,
+    completed_count: taskCount - failedCount - cancelledCount,
+    cancelled_count: cancelledCount,
   };
 }
 
@@ -136,23 +139,31 @@ describe("summarizeActivityWindow", () => {
     });
   });
 
-  it("keeps missing outcomes unknown only within the requested window", () => {
-    const known = { ...bucket("a1", 0, 10, 1), completed_count: 1, cancelled_count: 8 };
-    const result = deriveAgentActivity([bucket("a1", 20, 5), known], fullHistoryAgent.created_at, NOW);
+  it("rolls outcome counts up over the requested window only", () => {
+    // 5 clean runs 20 days back, then 1/1/8 today. The 7-day window sees
+    // only the recent day, so the older successes must not lift its rate.
+    const result = deriveAgentActivity(
+      [bucket("a1", 20, 5), bucket("a1", 0, 10, 1, 8)],
+      fullHistoryAgent.created_at,
+      NOW,
+    );
     expect(summarizeActivityWindow(result, 30)).toMatchObject({
-      totalRuns: 15, totalCompleted: null, totalCancelled: null, successRate: null,
+      totalRuns: 15, totalCompleted: 6, totalCancelled: 8, successRate: 86,
     });
     expect(summarizeActivityWindow(result, 7)).toMatchObject({
       totalRuns: 10, totalCompleted: 1, totalCancelled: 8, successRate: 50,
     });
   });
 
-  it("does not turn a partly unknown day into complete statistics", () => {
-    const result = deriveAgentActivity([
-      bucket("a1", 0, 5),
-      { ...bucket("a1", 0, 2, 1), completed_count: 1, cancelled_count: 0 },
-    ], fullHistoryAgent.created_at, NOW);
-    expect(summarizeActivityWindow(result, 30)).toMatchObject({ totalRuns: 7, totalCompleted: null, successRate: null });
+  it("sums outcomes from several buckets landing on the same day", () => {
+    const result = deriveAgentActivity(
+      [bucket("a1", 0, 5), bucket("a1", 0, 2, 1)],
+      fullHistoryAgent.created_at,
+      NOW,
+    );
+    expect(summarizeActivityWindow(result, 30)).toMatchObject({
+      totalRuns: 7, totalCompleted: 6, totalFailed: 1, successRate: 86,
+    });
   });
 
   it("rolls up totals across the trailing N buckets", () => {

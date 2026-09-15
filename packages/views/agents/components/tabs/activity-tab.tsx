@@ -240,7 +240,7 @@ export function AgentPerformanceSummary({ agent }: { agent: Agent }) {
               destructive={summary.totalFailed > 0}
             />
           </div>
-          {summary.totalCancelled !== null && summary.totalCancelled > 0 && (
+          {summary.totalCancelled > 0 && (
             <p className="mt-2 text-caption text-muted-foreground">
               {t(($) => $.tab_body.activity.cancelled_count, {
                 count: summary.totalCancelled,
@@ -388,7 +388,7 @@ function Last30dSection({
                   </span>
                 </>
               )}
-              {summary.totalCancelled !== null && summary.totalCancelled > 0 && (
+              {summary.totalCancelled > 0 && (
                 <>
                   <Sep />
                   <span>

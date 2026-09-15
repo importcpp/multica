@@ -26,26 +26,18 @@ describe("agent activity API outcomes", () => {
     ]);
   });
 
-  it("preserves older activity without inventing completed or cancelled counts", async () => {
-    const [row] = await read([bucket]);
-    expect(row).toMatchObject(bucket);
-    expect(row?.completed_count).toBeUndefined();
-    expect(row?.cancelled_count).toBeUndefined();
-  });
-
-  it.each([null, "1", -1, 1.5])("treats malformed outcome %s as unknown", async (bad) => {
-    const [row] = await read([{ ...bucket, completed_count: bad, cancelled_count: bad }]);
-    expect(row).toMatchObject(bucket);
-    expect(row?.completed_count).toBeUndefined();
-    expect(row?.cancelled_count).toBeUndefined();
-  });
-
-  it("rejects contradictory outcome totals without discarding activity", async () => {
-    const [row] = await read([{ ...bucket, completed_count: 10, cancelled_count: 8 }]);
-    expect(row).toMatchObject(bucket);
-    expect(row?.completed_count).toBeUndefined();
-    expect(row?.cancelled_count).toBeUndefined();
-  });
+  // Outcome counts are part of the contract, so a bucket without usable
+  // ones is drift, not an older peer to accommodate. Degrading the whole
+  // response is the intended failure mode: an empty activity panel is
+  // honest, a half-populated one silently misreports success.
+  it.each([undefined, null, "1", -1, 1.5])(
+    "drops the response when an outcome count is %s",
+    async (bad) => {
+      expect(
+        await read([{ ...bucket, completed_count: bad, cancelled_count: bad }]),
+      ).toEqual([]);
+    },
+  );
 
   it("falls back for a malformed list", async () => {
     expect(await read({ buckets: [] })).toEqual([]);

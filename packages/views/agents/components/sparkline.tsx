@@ -3,7 +3,7 @@
 interface ActivityBucketLike {
   total: number;
   failed: number;
-  completed: number | null;
+  completed: number;
 }
 
 interface SparklineProps {
@@ -27,7 +27,7 @@ const BASELINE_FILL = "var(--color-muted-foreground)";
 const BASELINE_OPACITY = 0.25;
 
 /**
- * Stacked bar sparkline — completed bottom, failed top, other outcomes neutral.
+ * Stacked bar sparkline — completed bottom, failed top, cancelled neutral.
  * Two dimensions:
  *
  *   - **Column height** = total throughput that day (per-component scaled
@@ -120,10 +120,11 @@ export function Sparkline({
                 Math.max(1, Math.round((usableH * b.failed) / scaleDenominator)),
               )
             : 0;
-        // Only an explicit completed count earns a success segment. Cancelled
-        // runs and unknown outcomes from older servers remain neutral.
+        // Only completed runs earn a success segment. Whatever is left over
+        // — cancellations — is neither success nor failure, so it reads
+        // neutral rather than inflating the brand-coloured share.
         const completedH =
-          b.completed !== null && b.completed > 0
+          b.completed > 0
             ? Math.min(
                 totalH - failedH,
                 Math.max(1, Math.round((usableH * b.completed) / scaleDenominator)),

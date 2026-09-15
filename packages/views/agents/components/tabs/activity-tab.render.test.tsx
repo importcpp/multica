@@ -103,13 +103,14 @@ describe("agent outcome presentation", () => {
     expect(screen.queryByText("90%")).not.toBeInTheDocument();
   });
 
-  it.each(["cancelled", "legacy"])("does not claim success for %s-only data", (kind) => {
+  it("does not claim success for cancelled-only data", () => {
     activityRef.current = [{
       agent_id: "agent-1",
       bucket_at: new Date().toISOString(),
       task_count: 8,
       failed_count: 0,
-      ...(kind === "cancelled" ? { completed_count: 0, cancelled_count: 8 } : {}),
+      completed_count: 0,
+      cancelled_count: 8,
     }];
     const { container } = renderTab(true);
     expect(screen.queryByText("100%")).not.toBeInTheDocument();
