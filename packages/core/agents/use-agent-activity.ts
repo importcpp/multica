@@ -13,6 +13,8 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export interface ActivityBucket {
   total: number;
   failed: number;
+  completed: number | null;
+  cancelled: number | null;
 }
 
 export interface AgentActivity {
@@ -46,12 +48,21 @@ export interface ActivityWindowSummary {
   totalRuns: number;
   /** Sum of `bucket.failed` across the window. */
   totalFailed: number;
+  totalCompleted: number | null;
+  totalCancelled: number | null;
+  /** Completed / (completed + failed), or null without known outcomes. */
+  successRate: number | null;
   /** Echo of the input window — the renderer uses it for copy. */
   windowDays: number;
 }
 
 const EMPTY: AgentActivity = {
-  buckets: Array.from({ length: DAYS }, () => ({ total: 0, failed: 0 })),
+  buckets: Array.from({ length: DAYS }, () => ({
+    total: 0,
+    failed: 0,
+    completed: 0,
+    cancelled: 0,
+  })),
   daysSinceCreated: DAYS,
 };
 
@@ -59,6 +70,9 @@ const EMPTY_SUMMARY: ActivityWindowSummary = {
   buckets: [],
   totalRuns: 0,
   totalFailed: 0,
+  totalCompleted: 0,
+  totalCancelled: 0,
+  successRate: null,
   windowDays: 0,
 };
 
@@ -131,6 +145,8 @@ export function deriveAgentActivity(
   const series: ActivityBucket[] = Array.from({ length: DAYS }, () => ({
     total: 0,
     failed: 0,
+    completed: 0,
+    cancelled: 0,
   }));
 
   // Newest slot is the start of "today" in local time; we walk back DAYS
@@ -143,8 +159,17 @@ export function deriveAgentActivity(
     const daysAgo = Math.floor((today - startOfDay(ts)) / DAY_MS);
     if (daysAgo < 0 || daysAgo >= DAYS) continue;
     const slot = DAYS - 1 - daysAgo;
-    series[slot]!.total += b.task_count;
-    series[slot]!.failed += b.failed_count;
+    const target = series[slot]!;
+    target.total += b.task_count;
+    target.failed += b.failed_count;
+    target.completed =
+      target.completed === null || b.completed_count === undefined
+        ? null
+        : target.completed + b.completed_count;
+    target.cancelled =
+      target.cancelled === null || b.cancelled_count === undefined
+        ? null
+        : target.cancelled + b.cancelled_count;
   }
 
   const createdAt = new Date(agentCreatedAt).getTime();
@@ -184,11 +209,34 @@ export function summarizeActivityWindow(
     safeWindow === 0 ? [] : activity.buckets.slice(-safeWindow);
   let totalRuns = 0;
   let totalFailed = 0;
+  let totalCompleted: number | null = 0;
+  let totalCancelled: number | null = 0;
   for (const b of slice) {
     totalRuns += b.total;
     totalFailed += b.failed;
+    totalCompleted =
+      totalCompleted === null || b.completed === null
+        ? null
+        : totalCompleted + b.completed;
+    totalCancelled =
+      totalCancelled === null || b.cancelled === null
+        ? null
+        : totalCancelled + b.cancelled;
   }
-  return { buckets: slice, totalRuns, totalFailed, windowDays };
+  const outcomes = (totalCompleted ?? 0) + totalFailed;
+  const successRate =
+    totalCompleted !== null && outcomes > 0
+      ? Math.round((totalCompleted / outcomes) * 100)
+      : null;
+  return {
+    buckets: slice,
+    totalRuns,
+    totalFailed,
+    totalCompleted,
+    totalCancelled,
+    successRate,
+    windowDays,
+  };
 }
 
 function startOfDay(ts: number): number {

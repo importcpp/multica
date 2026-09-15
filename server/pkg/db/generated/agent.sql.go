@@ -4613,7 +4613,9 @@ SELECT
     atq.agent_id,
     DATE_TRUNC('day', atq.completed_at)::timestamptz AS bucket,
     COUNT(*)::int AS task_count,
-    COUNT(*) FILTER (WHERE atq.status = 'failed')::int AS failed_count
+    COUNT(*) FILTER (WHERE atq.status = 'failed')::int AS failed_count,
+    COUNT(*) FILTER (WHERE atq.status = 'completed')::int AS completed_count,
+    COUNT(*) FILTER (WHERE atq.status = 'cancelled')::int AS cancelled_count
 FROM agent_task_queue atq
 JOIN agent a ON a.id = atq.agent_id
 WHERE a.workspace_id = $1
@@ -4624,10 +4626,12 @@ ORDER BY atq.agent_id, bucket
 `
 
 type GetWorkspaceAgentActivity30dRow struct {
-	AgentID     pgtype.UUID        `json:"agent_id"`
-	Bucket      pgtype.Timestamptz `json:"bucket"`
-	TaskCount   int32              `json:"task_count"`
-	FailedCount int32              `json:"failed_count"`
+	AgentID        pgtype.UUID        `json:"agent_id"`
+	Bucket         pgtype.Timestamptz `json:"bucket"`
+	TaskCount      int32              `json:"task_count"`
+	FailedCount    int32              `json:"failed_count"`
+	CompletedCount int32              `json:"completed_count"`
+	CancelledCount int32              `json:"cancelled_count"`
 }
 
 // Returns per-agent daily activity buckets for the last 30 days. Single
@@ -4644,6 +4648,8 @@ type GetWorkspaceAgentActivity30dRow struct {
 // still in flight has no completed_at and contributes nothing here — that's
 // correct: in-flight tasks are surfaced via the live presence indicator,
 // not the historical trend.
+// Keep total activity separate from outcomes: cancelled runs belong in the
+// history, but success rate is completed / (completed + failed).
 func (q *Queries) GetWorkspaceAgentActivity30d(ctx context.Context, workspaceID pgtype.UUID) ([]GetWorkspaceAgentActivity30dRow, error) {
 	rows, err := q.db.Query(ctx, getWorkspaceAgentActivity30d, workspaceID)
 	if err != nil {
@@ -4658,6 +4664,8 @@ func (q *Queries) GetWorkspaceAgentActivity30d(ctx context.Context, workspaceID 
 			&i.Bucket,
 			&i.TaskCount,
 			&i.FailedCount,
+			&i.CompletedCount,
+			&i.CancelledCount,
 		); err != nil {
 			return nil, err
 		}

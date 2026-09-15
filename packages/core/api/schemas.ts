@@ -1802,6 +1802,23 @@ export const AgentTaskSchema = z.object({
   usage: z.array(TaskUsageSchema).optional().catch(undefined),
 }).loose();
 
+export const AgentActivityBucketListSchema = z.array(z.object({
+  agent_id: z.string(),
+  bucket_at: z.string(),
+  task_count: z.number().int().nonnegative(),
+  failed_count: z.number().int().nonnegative(),
+  completed_count: z.number().int().nonnegative().optional().catch(undefined),
+  cancelled_count: z.number().int().nonnegative().optional().catch(undefined),
+}).loose().transform((row) => {
+  // Preserve activity from older/malformed peers without inventing outcomes.
+  const outcomes =
+    (row.completed_count ?? 0) + row.failed_count + (row.cancelled_count ?? 0);
+  if (outcomes > row.task_count) {
+    return { ...row, completed_count: undefined, cancelled_count: undefined };
+  }
+  return row;
+}));
+
 export const AgentTaskListSchema = z.array(AgentTaskSchema);
 
 // One row of a run transcript. `output_truncated` gates a completeness claim

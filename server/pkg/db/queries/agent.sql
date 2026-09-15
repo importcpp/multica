@@ -2539,11 +2539,15 @@ GROUP BY atq.agent_id;
 -- still in flight has no completed_at and contributes nothing here — that's
 -- correct: in-flight tasks are surfaced via the live presence indicator,
 -- not the historical trend.
+-- Keep total activity separate from outcomes: cancelled runs belong in the
+-- history, but success rate is completed / (completed + failed).
 SELECT
     atq.agent_id,
     DATE_TRUNC('day', atq.completed_at)::timestamptz AS bucket,
     COUNT(*)::int AS task_count,
-    COUNT(*) FILTER (WHERE atq.status = 'failed')::int AS failed_count
+    COUNT(*) FILTER (WHERE atq.status = 'failed')::int AS failed_count,
+    COUNT(*) FILTER (WHERE atq.status = 'completed')::int AS completed_count,
+    COUNT(*) FILTER (WHERE atq.status = 'cancelled')::int AS cancelled_count
 FROM agent_task_queue atq
 JOIN agent a ON a.id = atq.agent_id
 WHERE a.workspace_id = $1
