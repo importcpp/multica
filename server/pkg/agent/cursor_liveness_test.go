@@ -181,6 +181,14 @@ func runFakeCursorStream(mode string) {
 	}
 	fmt.Println(`{"type":"system","subtype":"task_notification"}`)
 	fmt.Println(`{"type":"result","subtype":"success","session_id":"background-session","result":"background work finished"}`)
+	if mode == "finish" {
+		// Keep Cursor alive while the backend consumes the launch and result.
+		// This case tests terminal cleanup of owned work; exiting first can
+		// orphan the shell before its ancestry is captured on Linux.
+		for _, child := range children {
+			_ = child.Wait()
+		}
+	}
 }
 
 func TestCursorResultWithoutMessageConsumer(t *testing.T) {
