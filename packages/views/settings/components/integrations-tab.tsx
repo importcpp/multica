@@ -249,7 +249,6 @@ export function IntegrationsTab() {
   return (
     <SettingsTab
       title={t(($) => $.page.tabs.integrations)}
-      description={t(($) => $.integrations.description)}
     >
       {groups.map((group) => (
         <SettingsSection

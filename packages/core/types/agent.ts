@@ -1,4 +1,5 @@
 import type { ChatSession } from "./chat";
+import type { Label } from "./label";
 
 export type AgentStatus = "idle" | "working" | "blocked" | "error" | "offline";
 
@@ -849,8 +850,10 @@ export interface SkillSummary {
   created_by: string | null;
   created_at: string;
   updated_at: string;
-	/** Present only when returned from an agent-scoped assignment endpoint. */
-	enabled?: boolean;
+  /** Present only when returned from an agent-scoped assignment endpoint. */
+  enabled?: boolean;
+  /** Present on workspace skill lists after a backend that bulk-attaches labels. */
+  labels?: Label[];
 }
 
 export interface Skill extends SkillSummary {

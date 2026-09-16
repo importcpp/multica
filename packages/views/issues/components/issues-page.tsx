@@ -79,7 +79,6 @@ export function IssuesPage() {
           <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-2 text-muted-foreground">
             <ListTodo className="h-10 w-10 text-faint-foreground" />
             <p className="text-body">{t(($) => $.page.empty_title)}</p>
-            <p className="text-caption">{t(($) => $.page.empty_hint)}</p>
           </div>
         )}
       />

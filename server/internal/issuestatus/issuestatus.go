@@ -8,8 +8,6 @@
 // to done/cancelled; nonterminal custom keys remain distinct. Category resolves
 // lifecycle independently. WireCategory adapts response enums for installed
 // clients without persisting or granting legacy behavior.
-//
-// One key is reserved and belongs to no category: Triage — see Triage.
 package issuestatus
 
 import (
@@ -35,19 +33,6 @@ const (
 	Blocked    = "blocked"
 	Cancelled  = "cancelled"
 )
-
-// Triage is a RESERVED status key, and nothing more (MUL-7189).
-//
-// Triage itself is NOT a status — an issue in Triage is marked by
-// issue.triage_state, because "is this work at all" is a different question
-// from "how far along is this work", and answering the first inside the second
-// field makes every reader of status re-answer it.
-//
-// What survives here is the name: no workspace may mint a custom status keyed
-// `triage`, so the word means one thing. The catalog carries the same rule as a
-// CHECK (migration 475), and Resolve refuses the key so a write is turned away
-// by the resolver rather than by the database.
-const Triage = "triage"
 
 // The four stored lifecycle categories.
 const (
@@ -97,10 +82,6 @@ var categoryRank = func() map[string]int {
 // catalog, or present but archived.
 var ErrUnknownStatus = errors.New("unknown issue status")
 
-// ErrReservedStatus is returned by Resolve for Triage: the name is reserved, so
-// no status write may name it.
-var ErrReservedStatus = errors.New("issue status is reserved for triage")
-
 // keyPattern mirrors the issue_status.key CHECK constraint. Keys are lowercase
 // so `multica issue status <id> human_review` is unambiguous to type.
 var keyPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_]{0,31}$`)
@@ -114,19 +95,18 @@ type Querier interface {
 	ListIssueStatusKeysByCategories(ctx context.Context, arg db.ListIssueStatusKeysByCategoriesParams) ([]string, error)
 }
 
-// Canonical returns the 7 canonical status keys in display order. Triage is
-// not among them: it is not a board column and not a settings row.
+// Canonical returns the 7 canonical status keys in display order.
 func Canonical() []string {
 	out := make([]string, len(canonicalOrder))
 	copy(out, canonicalOrder)
 	return out
 }
 
-// IsBuiltIn reports whether key is platform-owned: one of the 7 canonical
-// statuses, or the reserved Triage name. None can be reused as a custom key.
+// IsBuiltIn reports whether key is one of the 7 canonical, platform-owned
+// statuses. None of them can be reused as a custom key.
 func IsBuiltIn(key string) bool {
 	_, ok := canonicalRank[key]
-	return ok || key == Triage
+	return ok
 }
 
 // Categories returns the four lifecycle categories in display order.
@@ -185,7 +165,7 @@ func BehaviorsForCategory(category string) []string {
 	}
 }
 
-// ParseCategory normalizes API spellings and pre-backfill stored categories.
+// ParseCategory normalizes API spellings from installed and current clients.
 func ParseCategory(value string) (string, bool) {
 	if IsCategory(value) {
 		return value, true
@@ -227,7 +207,6 @@ func WireCategory(status, category string) string {
 // Custom statuses inherit only terminal lifecycle semantics, not parked, review,
 // blocked or active-agent recovery behavior. Nonterminal keys stay distinct.
 func customBehavior(status, category string) string {
-	category, _ = ParseCategory(category)
 	switch category {
 	case CategoryDone:
 		return Done
@@ -338,22 +317,18 @@ func DeriveKey(name, category string, taken map[string]bool) (string, error) {
 //
 // The scan is bounded by the CATALOG, not by a policy number. Every candidate
 // it tests is distinct, and only len(taken) plus the reserved names (the 7
-// canonical keys, the 4 category names and Triage) can be occupied, so by the
-// pigeonhole
-// principle a free one has to turn up within that many attempts plus one.
+// canonical keys and the 4 category names) can be occupied, so by the
+// pigeonhole principle a free one has to turn up within that many attempts
+// plus one.
 // Picking a round constant instead would invent a cap on custom statuses that
 // exists nowhere else in the product, and would fail with "provide one
 // explicitly" — the very error this package was changed to stop showing a UI
 // that has no key field.
-//
-// Migration 476 applies this same rule in SQL to rename a pre-existing custom
-// `triage` key; keep the two in step.
 func firstFreeKey(base string, taken map[string]bool) (string, error) {
 	if !keyOccupied(base, taken) {
 		return ValidateKey(base)
 	}
-	// +1 for Triage, which keyOccupied also treats as taken.
-	limit := len(taken) + len(canonicalOrder) + len(categoryOrder) + 1 + 2
+	limit := len(taken) + len(canonicalOrder) + len(categoryOrder) + 2
 	for n := 2; n <= limit; n++ {
 		suffix := "_" + strconv.Itoa(n)
 		candidate := truncateForSuffix(base, len(suffix)) + suffix
@@ -400,8 +375,7 @@ func Ensure(ctx context.Context, q Querier, workspaceID pgtype.UUID) error {
 // carries. This is THE function that keeps existing logic correct:
 //
 //   - a built-in key returns itself, unchanged, WITHOUT touching the database,
-//     so no existing code path gains a query or changes behavior. Triage
-//     takes that path too: it has no catalog row to read;
+//     so no existing code path gains a query or changes behavior;
 //   - a custom terminal key returns done/cancelled; other custom keys stay raw.
 //
 // On an unresolvable key it returns the key unchanged. That is the fail-safe
@@ -456,7 +430,7 @@ func Category(ctx context.Context, q Querier, workspaceID pgtype.UUID, status st
 
 // CategoryWithError resolves lifecycle for side-effect decisions. Unlike
 // Category, it preserves catalog failures so a caller can defer work and retry.
-// Built-ins, including Triage, still resolve without reading the catalog.
+// Built-ins still resolve without reading the catalog.
 func CategoryWithError(ctx context.Context, q Querier, workspaceID pgtype.UUID, status string) (string, error) {
 	category, _, err := categoryAndName(ctx, q, workspaceID, status)
 	return category, err
@@ -478,8 +452,8 @@ func categoryAndName(ctx context.Context, q Querier, workspaceID pgtype.UUID, st
 	if err != nil {
 		return "", "", fmt.Errorf("resolve issue status %q category: %w", status, err)
 	}
-	category, ok := ParseCategory(entry.Category)
-	if !ok {
+	category := entry.Category
+	if !IsCategory(category) {
 		return "", entry.Name, fmt.Errorf("invalid category %q for issue status %q", entry.Category, status)
 	}
 	return category, entry.Name, nil
@@ -496,17 +470,10 @@ func categoryAndName(ctx context.Context, q Querier, workspaceID pgtype.UUID, st
 // feature, or mid-rollout before migration 339 runs — could not create or
 // update an issue at all. Failing open here is limited precisely to the set
 // that was valid before this feature existed; anything else still needs a row.
-//
-// Triage never reaches the catalog: it resolves to ErrReservedStatus, so every
-// write path that validates through here refuses it without having to know
-// about it.
 func Resolve(ctx context.Context, q Querier, workspaceID pgtype.UUID, status string) (db.IssueStatus, error) {
 	key := strings.ToLower(strings.TrimSpace(status))
 	if key == "" {
 		return db.IssueStatus{}, ErrUnknownStatus
-	}
-	if key == Triage {
-		return db.IssueStatus{}, ErrReservedStatus
 	}
 	entry, err := q.GetIssueStatusEntryByKey(ctx, db.GetIssueStatusEntryByKeyParams{
 		WorkspaceID: workspaceID,
@@ -649,7 +616,7 @@ func (r *Resolver) load(ctx context.Context, q Querier) {
 	r.categories = make(map[string]string, len(entries))
 	r.names = make(map[string]string, len(entries))
 	for _, e := range entries {
-		r.categories[e.Key], _ = ParseCategory(e.Category)
+		r.categories[e.Key] = e.Category
 		r.names[e.Key] = e.Name
 	}
 }
@@ -800,8 +767,8 @@ func CustomKeyCategories(ctx context.Context, q Querier, workspaceID pgtype.UUID
 	}
 	out := make(map[string]string, len(entries))
 	for _, e := range entries {
-		category, ok := ParseCategory(e.Category)
-		if IsBuiltIn(e.Key) || !ok {
+		category := e.Category
+		if IsBuiltIn(e.Key) || !IsCategory(category) {
 			continue
 		}
 		out[e.Key] = category

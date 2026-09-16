@@ -857,11 +857,6 @@ function LarkInstallDialog({
                   network image dependency, prints at any DPI. */}
                 <QRCode value={session.qrCodeURL} size={192} />
               </div>
-              <p className="text-center text-caption text-muted-foreground">
-                {region === "lark"
-                  ? t(($) => $.lark.install_scan_hint_lark)
-                  : t(($) => $.lark.install_scan_hint_feishu)}
-              </p>
               <a
                 href={session.qrCodeURL}
                 target="_blank"

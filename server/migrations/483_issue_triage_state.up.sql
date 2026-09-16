@@ -14,6 +14,21 @@
 -- records (declined, merged into another issue) are their own sub-issue and
 -- extend this CHECK when they land; keeping the constraint narrow now is what
 -- makes that a deliberate change rather than a silent typo.
+--
+-- The CHECK is added NOT VALID: a validated CHECK scans every existing issue
+-- while holding the ALTER's ACCESS EXCLUSIVE lock, which stops all issue reads
+-- and writes for the length of that scan even though the new column needs no
+-- backfill. NOT VALID enforces the constraint on every write from this point
+-- on and skips the scan; migration 489 validates the rows already on disk under
+-- SHARE UPDATE EXCLUSIVE, which readers and writers run straight through.
+--
+-- The runner sends this file as one implicit transaction. Bound lock
+-- acquisition and execution so this catalog-only change fails fast and retries
+-- on the next run rather than parking a pending ACCESS EXCLUSIVE lock in front
+-- of every issue query.
+SET LOCAL lock_timeout = '2s';
+SET LOCAL statement_timeout = '10s';
+
 ALTER TABLE issue
     ADD COLUMN triage_state TEXT,
-    ADD CONSTRAINT issue_triage_state_known CHECK (triage_state IS NULL OR triage_state IN ('pending'));
+    ADD CONSTRAINT issue_triage_state_known CHECK (triage_state IS NULL OR triage_state IN ('pending')) NOT VALID;

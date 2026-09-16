@@ -132,9 +132,7 @@ var validIssueStatusCategories = issuestatus.Categories()
 // issueTableStatusOrder is the same "board order" the status GROUPING path
 // already builds, so sorting and grouping now share one source of truth instead
 // of drifting apart. Archived statuses are included because issues stay on them
-// after archival and still have to rank somewhere real. Triage leads: it has no
-// catalog row and no board column, matching the rank statusOrderExpression
-// gives it.
+// after archival and still have to rank somewhere real.
 //
 // Keeping the indexed column bare avoids the per-row issue_effective_status()
 // call that would otherwise turn a bounded page into a workspace scan.
@@ -150,10 +148,9 @@ func (h *Handler) issueStatusSortExpression(
 	if err != nil {
 		return "", err
 	}
-	order := append([]string{issuestatus.Triage}, issueTableStatusOrder(entries)...)
 	return fmt.Sprintf(
 		"COALESCE(array_position(%s::text[], i.status), 100000)",
-		addArg(order),
+		addArg(issueTableStatusOrder(entries)),
 	), nil
 }
 
@@ -179,10 +176,6 @@ func (h *Handler) resolveIssueStatusKey(w http.ResponseWriter, r *http.Request, 
 func (h *Handler) resolveIssueStatusKeyKind(w http.ResponseWriter, r *http.Request, workspaceID pgtype.UUID, status string) (string, bool, bool) {
 	entry, err := issuestatus.Resolve(r.Context(), h.Queries, workspaceID, status)
 	if err != nil {
-		if errors.Is(err, issuestatus.ErrReservedStatus) {
-			writeStatusReservedForTriage(w)
-			return "", false, false
-		}
 		if errors.Is(err, issuestatus.ErrUnknownStatus) {
 			// Labels, not bare keys: a derived key says nothing about what the
 			// status means, so listing `in_review_2` alone leaves the caller no
@@ -3180,10 +3173,6 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, service.ErrIssueStatusUnavailable) {
 		writeError(w, http.StatusConflict,
 			"the target status was archived while this request was in flight; reload the status list and retry")
-		return
-	}
-	if errors.Is(err, service.ErrStatusReservedForTriage) {
-		writeStatusReservedForTriage(w)
 		return
 	}
 	if writeIssueLimitReached(w, err) {

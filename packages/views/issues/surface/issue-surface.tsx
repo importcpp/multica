@@ -428,7 +428,6 @@ function FilteredEmptyState() {
     <div className="flex flex-1 min-h-0 flex-col items-center justify-center gap-3 text-muted-foreground">
       <FilterX className="h-10 w-10 text-faint-foreground" />
       <p className="text-body">{t(($) => $.filtered_empty.title)}</p>
-      <p className="text-caption">{t(($) => $.filtered_empty.hint)}</p>
       <Button variant="outline" size="sm" className="mt-1" onClick={handleClear}>
         {t(($) => $.filtered_empty.clear_button)}
       </Button>

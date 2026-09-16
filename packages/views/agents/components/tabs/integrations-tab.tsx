@@ -164,9 +164,6 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
   ) {
     return (
       <div className="space-y-6">
-        <p className="text-caption text-muted-foreground">
-          {t(($) => $.tab_body.integrations.intro)}
-        </p>
         {dingtalkInstallation ? (
           <section className="rounded-lg border">
             <div className="flex items-start gap-3 p-4">
@@ -218,9 +215,6 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
 
   return (
     <div className="space-y-6">
-      <p className="text-caption text-muted-foreground">
-        {t(($) => $.tab_body.integrations.intro)}
-      </p>
 
       <section className="rounded-lg border">
         <div className="flex items-start gap-3 p-4">

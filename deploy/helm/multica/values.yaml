@@ -110,6 +110,8 @@ backend:
         - ReadWriteOnce
   # All non-secret backend env. Secret values come from `existingSecret`.
   config:
+    # Optional container-loopback maintenance API; empty disables it. Never expose via Service/Ingress.
+    maintenancePort: ""
     # The migrator and API server retry transient PostgreSQL startup failures
     # within this budget. Set to 0 to restore fail-fast startup behavior.
     databaseStartupTimeout: 3m

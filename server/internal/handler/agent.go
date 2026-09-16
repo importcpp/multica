@@ -1456,6 +1456,15 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// An effort with no pinned model is not storable for runtimes that resolve
+	// their own default model out of sight — it would save cleanly, show as set,
+	// and then run at a different level. Reject it here instead of letting the
+	// daemon drop it silently at launch (MUL-7412).
+	if agent.ThinkingLevelRejectedWithoutModel(runtime.Provider) &&
+		req.ThinkingLevel != "" && strings.TrimSpace(req.Model) == "" {
+		writeError(w, http.StatusBadRequest, thinkingNeedsExplicitModelRejection(runtime.Provider))
+		return
+	}
 	if !agent.IsKnownServiceTier(runtime.Provider, req.ServiceTier) {
 		writeError(w, http.StatusBadRequest, fmt.Sprintf("service_tier %q is not a recognised value for runtime %q", req.ServiceTier, runtime.Provider))
 		return
@@ -2100,6 +2109,28 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Same combination check as CreateAgent, but against the state the request
+	// actually lands on: a cleared model with a carried-over effort, or a new
+	// effort on an agent that never had a model, are both the invalid pair. The
+	// caller can always recover by pinning a model or clearing the level, so
+	// this cannot lock an agent out of editing (MUL-7412).
+	if effectiveThinking := effectiveThinkingLevel(params, existing, shouldClearThinkingLevel); effectiveThinking != "" &&
+		strings.TrimSpace(effectiveModelValue(params, existing)) == "" {
+		provider := targetProvider
+		if provider == "" {
+			var ok bool
+			provider, ok = h.resolveAgentProvider(r, existing.WorkspaceID, targetRuntimeID)
+			if !ok {
+				writeError(w, http.StatusInternalServerError, "failed to resolve runtime for thinking_level validation")
+				return
+			}
+		}
+		if agent.ThinkingLevelRejectedWithoutModel(provider) {
+			writeError(w, http.StatusBadRequest, thinkingNeedsExplicitModelRejection(provider))
+			return
+		}
+	}
+
 	shouldClearServiceTier := false
 	if req.ServiceTier != nil {
 		value := *req.ServiceTier
@@ -2317,6 +2348,42 @@ func (h *Handler) resolveAgentProvider(r *http.Request, workspaceID pgtype.UUID,
 		return "", false
 	}
 	return rt.Provider, true
+}
+
+// thinkingNeedsExplicitModelRejection is the copy for a level that is valid for
+// the runtime but cannot be stored without a model. It names both ways out so
+// the caller does not have to guess that clearing is allowed.
+func thinkingNeedsExplicitModelRejection(provider string) string {
+	return fmt.Sprintf(
+		"runtime %q resolves its own default model, so a reasoning effort needs an explicit model; set model or pass thinking_level=\"\" to clear",
+		provider,
+	)
+}
+
+// effectiveModelValue is the model the update lands on: the requested value
+// when this request sets one (including an explicit clear), otherwise what the
+// agent already holds.
+func effectiveModelValue(params db.UpdateAgentParams, existing db.Agent) string {
+	if params.Model.Valid {
+		return params.Model.String
+	}
+	return existing.Model.String
+}
+
+// effectiveThinkingLevel is the effort the update lands on. An explicit clear
+// wins over everything; otherwise a value set by this request wins over the
+// stored one, which is carried when the field was omitted.
+func effectiveThinkingLevel(params db.UpdateAgentParams, existing db.Agent, cleared bool) string {
+	if cleared {
+		return ""
+	}
+	if params.ThinkingLevel.Valid {
+		return params.ThinkingLevel.String
+	}
+	if existing.ThinkingLevel.Valid {
+		return existing.ThinkingLevel.String
+	}
+	return ""
 }
 
 // thinkingLevelRejection explains why the target runtime will not take this

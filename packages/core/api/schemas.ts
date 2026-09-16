@@ -82,6 +82,7 @@ import type {
   ShareLinkInfo,
   Skill,
   SkillImportResult,
+  SkillSummary,
   Squad,
   TimelineEntry,
   User,
@@ -2487,6 +2488,24 @@ export const InboxItemListSchema = z.array(
     .loose(),
 );
 
+export const ArchivedInboxPageSchema = z.object({
+  items: InboxItemListSchema,
+  next_cursor: z.string().min(1).nullable(),
+  has_more: z.boolean(),
+}).refine((page) => page.has_more === (page.next_cursor !== null) &&
+  (!page.has_more || page.items.length > 0))
+  .transform((page) => ({ items: page.items, nextCursor: page.next_cursor, hasMore: page.has_more }));
+
+export const ArchivedInboxFacetsSchema = z.object({
+  statuses: z.record(z.string(), z.number().int().nonnegative()),
+  priorities: z.record(z.string(), z.number().int().nonnegative()),
+  actors: z.record(z.string(), z.number().int().nonnegative()),
+  unread_count: z.number().int().nonnegative(),
+}).transform((facets) => ({
+  statuses: facets.statuses, priorities: facets.priorities,
+  actors: facets.actors, unreadCount: facets.unread_count,
+}));
+
 export const EMPTY_INBOX_ITEMS: InboxItem[] = [];
 
 // ---------------------------------------------------------------------------
@@ -3231,31 +3250,51 @@ export const SkillFileSchema = z.object({
   updated_at: z.string().optional().default(""),
 }).loose();
 
-export const SkillSchema = z.object({
+// Workspace list shape (`GET /api/skills`). Intentionally no `content` /
+// `files`: those belong on the detail endpoint. Defaulting them here used
+// to invent empty bodies on every list row (GH #2174).
+export const SkillSummarySchema = z.object({
   id: z.string(),
   workspace_id: z.string(),
   name: z.string(),
   description: z.string().optional().default(""),
-  content: z.string().optional().default(""),
   config: z.record(z.string(), z.unknown()).optional().default({}),
   created_by: z.string().nullable().optional().default(null),
   created_at: z.string().optional().default(""),
   updated_at: z.string().optional().default(""),
-  files: z.array(SkillFileSchema).optional().default([]),
+  enabled: z.boolean().optional(),
+  // Catch-to-empty so a missing/malformed labels field cannot fail the
+  // whole skill (or the list it lives in). Older backends omit it; the
+  // filter treats an empty array as "no labels".
+  labels: z.array(LabelSchema).catch([]),
 }).loose();
 
-export const EMPTY_SKILL: Skill = {
+export const EMPTY_SKILL_SUMMARY: SkillSummary = {
   id: "",
   workspace_id: "",
   name: "",
   description: "",
-  content: "",
   config: {},
   created_by: null,
   created_at: "",
   updated_at: "",
+  labels: [],
+};
+
+export const SkillSchema = SkillSummarySchema.extend({
+  content: z.string().optional().default(""),
+  files: z.array(SkillFileSchema).optional().default([]),
+}).loose();
+
+export const EMPTY_SKILL: Skill = {
+  ...EMPTY_SKILL_SUMMARY,
+  content: "",
   files: [],
 };
+
+export const SkillSummaryListSchema = z.array(SkillSummarySchema).default([]);
+
+export const EMPTY_SKILL_SUMMARY_LIST: SkillSummary[] = [];
 
 export const SkillImportExistingSkillSchema = z.object({
   id: z.string(),

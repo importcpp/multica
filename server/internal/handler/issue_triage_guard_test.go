@@ -2,22 +2,19 @@ package handler
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/multica-ai/multica/server/internal/issuestatus"
-	"github.com/multica-ai/multica/server/internal/service"
 	"github.com/multica-ai/multica/server/internal/testutil"
 )
 
-// The reserved `triage` status key (MUL-7212, narrowed by MUL-7213).
+// Write protection for an issue in Triage (MUL-7189 §2.2).
 //
-// Triage itself lives in issue.triage_state, so there is no "issue in Triage is
-// read-only" rule left here — what remains is that no status may be named
-// `triage`. A Triage entry can only be made by Triage intake, which does not
-// exist yet, so these tests set the column directly.
+// Triage lives in issue.triage_state, not in the status, so the only rule left
+// here is the one parent field a triager may not set. A Triage entry can only
+// be made by Triage intake, which does not exist yet, so these tests set the
+// column directly.
 
 // The number comes from the workspace counter, not the fixture's MAX+1, so an
 // HTTP create later in the same test cannot be handed the same number.
@@ -50,76 +47,36 @@ func wantErrorCode(t *testing.T, resp *testutil.Response, code string) {
 	}
 }
 
-func TestIssueWritesRefuseTheReservedTriageStatus(t *testing.T) {
+// `triage` is an ordinary status key again (MUL-7400). It was reserved while
+// the server read `status = 'triage'` as "in Triage"; since Triage moved to its
+// own column nothing reads the key that way, so a workspace may name a custom
+// status with it and issues may be moved onto it like any other.
+func TestTriageIsAnOrdinaryCustomStatusKey(t *testing.T) {
 	seedTestCatalog(t)
 
-	t.Run("create", func(t *testing.T) {
-		for _, status := range []string{"triage", "  TRIAGE "} {
-			resp := testutil.Call(t, testHandler.CreateIssue, newRequest(http.MethodPost, "/api/issues", map[string]any{
-				"title": "create into triage", "status": status,
-			}))
-			wantErrorCode(t, resp, "status_reserved_for_triage")
-		}
-	})
-
-	t.Run("update", func(t *testing.T) {
-		issueID := dbfx.Issue(t, "update into triage")
-		resp := testutil.Call(t, testHandler.UpdateIssue, withURLParam(
-			newRequest(http.MethodPut, "/api/issues/"+issueID, map[string]any{"status": "triage"}),
-			"id", issueID))
-		wantErrorCode(t, resp, "status_reserved_for_triage")
-		if got := issueStatusOf(t, issueID); got != "todo" {
-			t.Errorf("status after refused update = %q, want todo", got)
-		}
-	})
-
-	t.Run("batch", func(t *testing.T) {
-		issueID := dbfx.Issue(t, "batch into triage")
-		resp := testutil.Call(t, testHandler.BatchUpdateIssues, newRequest(http.MethodPatch,
-			"/api/issues/batch?workspace_id="+testWorkspaceID, map[string]any{
-				"issue_ids": []string{issueID},
-				"updates":   map[string]any{"status": "triage"},
-			}))
-		wantErrorCode(t, resp, "status_reserved_for_triage")
-		if got := issueStatusOf(t, issueID); got != "todo" {
-			t.Errorf("status after refused batch = %q, want todo", got)
-		}
-	})
-
-	// Every create entry shares the rule, not only the HTTP handler that
-	// resolves the status first.
-	t.Run("service create", func(t *testing.T) {
-		_, err := testHandler.IssueService.Create(context.Background(), service.IssueCreateParams{
-			WorkspaceID: parseUUID(testWorkspaceID),
-			Title:       "service create into triage",
-			Status:      issuestatus.Triage,
-			Priority:    "none",
-			CreatorType: "member",
-			CreatorID:   parseUUID(testUserID),
-		}, service.IssueCreateOpts{})
-		if !errors.Is(err, service.ErrStatusReservedForTriage) {
-			t.Fatalf("IssueService.Create(triage) = %v, want ErrStatusReservedForTriage", err)
-		}
-	})
-}
-
-// A custom status can neither take the key nor claim Triage as its category:
-// either would give the catalog a row that resolves to the reserved status.
-func TestCustomStatusCannotClaimTriage(t *testing.T) {
-	seedTestCatalog(t)
-	cases := map[string]map[string]any{
-		"triage category":           {"name": "Foo", "key": "foo", "category": "triage", "color": "#123456"},
-		"triage key":                {"name": "Mine", "key": "triage", "category": "todo", "color": "#123456"},
-		"name slugging onto triage": {"name": "Triage", "category": "backlog", "color": "#123456"},
+	var created IssueStatusResponse
+	testutil.Call(t, testHandler.CreateIssueStatus, newRequest(http.MethodPost, "/api/issue-statuses", map[string]any{
+		"name": "Triage", "category": "unstarted", "color": "#123456",
+	})).Want(http.StatusCreated).JSON(&created)
+	if created.Key != "triage" {
+		t.Fatalf("custom status key = %q, want triage — the name no longer needs disambiguating", created.Key)
 	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			testutil.Call(t, testHandler.CreateIssueStatus,
-				newRequest(http.MethodPost, "/api/issue-statuses", body)).Want(http.StatusBadRequest)
-		})
+	dbfx.Cleanup(t, `DELETE FROM issue_status WHERE id = $1`, parseUUID(created.ID))
+
+	issueID := dbfx.Issue(t, "moved onto the custom triage status")
+	var updated IssueResponse
+	testutil.Call(t, testHandler.UpdateIssue, withURLParam(
+		newRequest(http.MethodPut, "/api/issues/"+issueID, map[string]any{"status": "triage"}),
+		"id", issueID)).Want(http.StatusOK).JSON(&updated)
+	if updated.Status != "triage" {
+		t.Fatalf("status after update = %q, want triage", updated.Status)
 	}
-	if n := dbfx.Count(t, `SELECT count(*) FROM issue_status WHERE workspace_id = $1 AND (key IN ('foo', 'triage') OR category = 'triage')`, testWorkspaceID); n != 0 {
-		t.Fatalf("%d catalog row(s) claimed triage", n)
+	if got := issueStatusOf(t, issueID); got != "triage" {
+		t.Fatalf("stored status = %q, want triage", got)
+	}
+	// The status write is not Triage intake: the marker stays untouched.
+	if got := triageStateOf(t, issueID); got != "" {
+		t.Fatalf("triage_state after a status write = %q, want empty", got)
 	}
 }
 

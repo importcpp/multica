@@ -22,7 +22,7 @@
   },
   "status_catalog_error": {
     "title": "상태 목록을 불러오지 못했습니다",
-    "hint": "이것 없이는 상태 필터를 적용할 수 없어 태스크를 표시하지 않습니다.",
+    "hint": "상태를 불러와야 태스크를 표시할 수 있습니다.",
     "retry": "다시 시도"
   },
   "source_context": {
@@ -99,7 +99,6 @@
     "breadcrumb_title": "태스크",
     "breadcrumb_workspace_fallback": "워크스페이스",
     "empty_title": "아직 태스크가 없습니다",
-    "empty_hint": "태스크를 만들어 시작하세요.",
     "move_failed": "태스크를 이동하지 못했습니다"
   },
   "status": {
@@ -319,12 +318,10 @@
     },
     "empty": {
       "assigned": {
-        "title": "할당된 태스크가 없습니다",
-        "description": "여기에 할당된 태스크가 이 보기로 표시됩니다."
+        "title": "할당된 태스크가 없습니다"
       },
       "created": {
-        "title": "생성한 태스크가 없습니다",
-        "description": "여기에서 만든 태스크가 이 보기로 표시됩니다."
+        "title": "생성한 태스크가 없습니다"
       }
     },
     "search_placeholder": "태스크 검색...",
@@ -385,7 +382,6 @@
     "quick_action_blocked_body": "“{{name}}”은(는) 트리거 권한이 없는 에이전트로 실행됩니다. 워크스페이스 관리자에게 해당 에이전트를 팀에 공개하거나 공유 에이전트로 변경해 달라고 요청하세요.",
     "quick_action_blocked_ok": "확인",
     "pull_requests_loading": "불러오는 중...",
-    "pull_requests_empty": "아직 연결된 Pull request가 없습니다. 이 태스크 식별자를 PR 브랜치 이름이나 제목에 넣거나, 본문에서 Closes 바로 뒤에 적으면 자동으로 연결됩니다.",
     "pull_request_state_open": "열림",
     "pull_request_state_draft": "초안",
     "pull_request_state_merged": "병합됨",
@@ -456,7 +452,8 @@
     "project_directory_path_copied": "프로젝트 디렉터리 경로를 복사했습니다",
     "project_directory_path_copied_with_branch": "프로젝트 디렉터리 경로를 복사했습니다 — 작업은 {{branch}} 브랜치에 있습니다",
     "workdir_path_copy_failed": "작업 디렉터리 경로를 복사하지 못했습니다",
-    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 태스크를 실행하지 않았습니다"
+    "workdir_path_unavailable": "아직 로컬 작업 디렉터리가 없습니다. 로컬 에이전트가 이 태스크를 실행하지 않았습니다",
+    "pull_requests_empty_title": "연결된 PR이 없습니다."
   },
   "timeline": {
     "loading": "불러오는 중..."
@@ -600,7 +597,6 @@
   },
   "filtered_empty": {
     "title": "필터 조건에 맞는 태스크가 없습니다",
-    "hint": "필터를 조정하거나 해제하면 이 보기의 태스크가 표시됩니다.",
     "clear_button": "필터 해제"
   },
   "agent_live": {
