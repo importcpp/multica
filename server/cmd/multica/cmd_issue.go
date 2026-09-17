@@ -2157,9 +2157,10 @@ func runIssueCommentList(cmd *cobra.Command, args []string) error {
 	if respHeaders.Get(headerCommentsTruncated) == "true" {
 		// --since drops newer rows at the cap; other reads may drop older
 		// ones. Do not imply that either end of this response is complete.
+		// --recent limits threads, not replies, so it is not a bounded recovery path.
 		fmt.Fprintln(os.Stderr, "warning: comments truncated by the server cap; this response is incomplete. "+
-			"Browse with --recent 10, or read a thread with --thread <id> --tail 30 (without --since); "+
-			"follow returned --before / --before-id cursors for older pages.")
+			"Browse with --roots-only --summary --compact, then read a thread with --thread <id> --tail 30 (without --since); "+
+			"follow returned --before / --before-id reply cursors for older replies.")
 	}
 	// The server emits the next-page cursor in headers when there is likely
 	// an older page. Surface it on stderr so an operator (and the agent

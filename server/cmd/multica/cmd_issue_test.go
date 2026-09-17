@@ -2522,10 +2522,11 @@ func newIssueCommentListTestCmd() *cobra.Command {
 func TestRunIssueCommentListWarnsOnTruncation(t *testing.T) {
 	const issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
 	for _, tc := range []struct {
-		name   string
-		flags  []string
-		header string
-		cursor bool
+		name        string
+		flags       []string
+		header      string
+		cursor      bool
+		taskWorkdir bool
 	}{
 		{name: "default", header: "true"},
 		{name: "since", flags: []string{"--since", "2026-09-01T00:00:00Z"}, header: "true"},
@@ -2534,10 +2535,14 @@ func TestRunIssueCommentListWarnsOnTruncation(t *testing.T) {
 		{name: "compact", flags: []string{"--compact"}, header: "true"},
 		{name: "table", flags: []string{"--output", "table"}, header: "true"},
 		{name: "cursor", flags: []string{"--recent", "10"}, header: "true", cursor: true},
+		{name: "task workdir", header: "true", taskWorkdir: true},
 		{name: "explicit false", header: "false"},
 		{name: "absent header"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.taskWorkdir {
+				seedDaemonTaskMarker(t)
+			}
 			requests := 0
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
@@ -2559,7 +2564,7 @@ func TestRunIssueCommentListWarnsOnTruncation(t *testing.T) {
 			defer srv.Close()
 			t.Setenv("MULTICA_SERVER_URL", srv.URL)
 			t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
-			t.Setenv("MULTICA_TOKEN", "test-token")
+			t.Setenv("MULTICA_TOKEN", "mat_test-token")
 			cmd := newIssueCommentListTestCmd()
 			if err := cmd.ParseFlags(tc.flags); err != nil {
 				t.Fatal(err)
@@ -2572,13 +2577,16 @@ func TestRunIssueCommentListWarnsOnTruncation(t *testing.T) {
 				t.Fatal(err)
 			}
 			if requests != 1 {
-				t.Fatalf("comment requests = %d, want one bounded read", requests)
+				t.Fatalf("comment requests = %d, want one request without automatic history fetches", requests)
 			}
 			if tc.header == "true" {
-				for _, want := range []string{"comments truncated", "incomplete", "--thread <id> --tail 30", "--before", "--before-id"} {
+				for _, want := range []string{"comments truncated", "incomplete", "--roots-only --summary --compact", "--thread <id> --tail 30", "--before", "--before-id"} {
 					if !strings.Contains(stderr, want) {
 						t.Errorf("stderr = %q, want %q", stderr, want)
 					}
+				}
+				if strings.Contains(stderr, "--recent") {
+					t.Errorf("truncation warning must not recommend unbounded thread expansion: %q", stderr)
 				}
 			} else if stderr != "" {
 				t.Errorf("complete read should stay quiet, stderr = %q", stderr)
