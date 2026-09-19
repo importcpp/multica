@@ -1363,6 +1363,7 @@ type TaskMessage struct {
 	Output          pgtype.Text        `json:"output"`
 	CreatedAt       pgtype.Timestamptz `json:"created_at"`
 	OutputTruncated pgtype.Bool        `json:"output_truncated"`
+	CallID          pgtype.Text        `json:"call_id"`
 }
 
 type TaskToken struct {
