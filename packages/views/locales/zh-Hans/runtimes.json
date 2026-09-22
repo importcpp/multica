@@ -335,7 +335,7 @@
       "read_only": "只读"
     },
     "detail": {
-      "base_family": "基础协议类型",
+      "base_family": "基础运行时",
       "command": "命令",
       "description": "描述",
       "no_description": "无描述",
@@ -347,12 +347,12 @@
     "form": {
       "create_title": "新建自定义运行时",
       "edit_title": "编辑自定义运行时",
-      "step_family_label": "选择基础协议类型",
-      "step_family_hint": "此运行时使用的底层 CLI 协议。",
+      "step_family_label": "选择基础运行时",
+      "step_family_hint": "选择此命令兼容的 CLI。",
       "step_details_label": "配置运行时",
       "step_progress": "第 {{current}} / {{total}} 步",
-      "family_label": "基础协议类型",
-      "family_locked_hint": "创建后无法更改基础协议类型。",
+      "family_label": "基础运行时",
+      "family_locked_hint": "创建后无法更改基础运行时。",
       "display_name_label": "显示名称",
       "display_name_placeholder": "例如：我的自定义 Claude...",
       "command_name_label": "命令",
@@ -386,7 +386,7 @@
       "cancel": "取消",
       "deleting": "正在删除...",
       "toast_deleted": "已从工作区删除自定义运行时",
-      "error_bound": "仍有智能体在使用此运行时，无法删除。",
+      "error_bound": "仍有智能体在使用此自定义运行时，无法删除；这些智能体可能位于注册了该运行时的其他机器上。",
       "error_generic": "删除运行时失败。"
     }
   },

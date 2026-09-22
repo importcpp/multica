@@ -135,7 +135,7 @@ func respond(w http.ResponseWriter, j Job, err error) {
 		case errors.Is(err, ErrThrottled):
 			status = http.StatusTooManyRequests
 		default:
-			status = http.StatusServiceUnavailable
+			status = http.StatusInternalServerError
 		}
 		slog.Warn("maintenance request failed", "job_id", j.ID, "revision", j.Revision, "error", err)
 	}

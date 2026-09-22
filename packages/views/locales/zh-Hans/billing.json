@@ -103,6 +103,7 @@
     "errors": {
       "action_title": "账单操作失败",
       "temporarily_unavailable": "账单服务暂时不可用，请稍后重试。",
+      "not_enabled": "此部署未启用工作区订阅，请联系管理员。",
       "permission_changed": "你的工作区角色已不允许执行此操作。刷新页面可查看当前权限。",
       "checkout_response": "服务端响应无法读取，无法打开 Checkout。请保留当前周期并重试。",
       "already_subscribed": "这个工作区已经有订阅，当前套餐已刷新。",

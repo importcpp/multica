@@ -289,8 +289,8 @@ export function IntegrationsTab({ agent }: { agent: Agent }) {
             </p>
           ) : !slackInstallSupported && !slackHasActiveInstall ? (
             // Secret key is set but the OAuth client credentials aren't, so a
-            // fresh "Connect Slack" would 503. Surface the "coming soon" notice
-            // instead of a broken CTA; an already-bound agent still renders.
+            // fresh "Connect Slack" would be rejected. Surface the "coming soon"
+            // notice instead of a broken CTA; an already-bound agent still renders.
             <div className="space-y-1">
               <p className="text-caption font-medium">{ts(($) => $.slack.preview_title)}</p>
               <p className="text-caption text-muted-foreground">

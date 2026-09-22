@@ -1134,7 +1134,7 @@ describe("parseWithFallback", () => {
 
 // Workspace subscription reads carry a specific hazard the wallet schemas do
 // not: the fallback for a paid workspace must never be a shape that reads as
-// Free. An older cloud, a 503, or a renamed field has to surface as "unknown"
+// Free. An older/disabled cloud, an upstream 503, or a renamed field has to surface as "unknown"
 // so the UI shows "unavailable" instead of quietly downgrading a paying team.
 describe("workspace subscription contract", () => {
   const entitlement = {
@@ -1289,7 +1289,7 @@ describe("workspace subscription contract", () => {
     // parsing: fetch rejects first and a React Query caller sees isError. What
     // matters for both paths is the same — no snapshot is produced, so nothing
     // can be mistaken for a Free workspace.
-    for (const status of [404, 503]) {
+    for (const status of [403, 404, 503]) {
       stubFetchJson({ error: "unavailable" }, status);
       const client = new ApiClient("https://api.example.test");
       await expect(client.getWorkspaceSubscriptionSummary()).rejects.toThrow();

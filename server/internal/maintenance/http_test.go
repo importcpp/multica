@@ -31,6 +31,24 @@ func TestInternalListenerConfiguration(t *testing.T) {
 		t.Fatalf("listener=%+v err=%v", server, err)
 	}
 }
+
+func TestInternalHTTPUnexpectedErrorIsNotRetryable(t *testing.T) {
+	w := httptest.NewRecorder()
+	respond(w, Job{}, errors.New("unexpected failure"))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s, want 500", w.Code, w.Body.String())
+	}
+	var body struct {
+		Retryable bool `json:"retryable"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body.Retryable {
+		t.Fatal("unexpected internal errors must not be labeled retryable")
+	}
+}
+
 func TestInternalHTTPRejectsMalformedRequestsWithoutDatabase(t *testing.T) {
 	h := NewHandler(NewService(nil, StatusCategory{}))
 	for _, body := range []string{"null", "[]", "{} {}", "{} garbage", `{"unknown":true}`, string(bytes.Repeat([]byte("x"), 17000))} {

@@ -103,6 +103,7 @@
     "errors": {
       "action_title": "Billing action failed",
       "temporarily_unavailable": "Billing is temporarily unavailable. Retry in a moment.",
+      "not_enabled": "Workspace subscriptions are not enabled for this deployment. Contact your administrator.",
       "permission_changed": "Your workspace role no longer allows this action. Refresh the page to see your current access.",
       "checkout_response": "Checkout could not open because the server response was unreadable. Retry without changing your selected interval.",
       "already_subscribed": "This workspace already has a subscription. The current plan has been refreshed.",

@@ -103,6 +103,7 @@
     "errors": {
       "action_title": "Échec de l'action de facturation",
       "temporarily_unavailable": "La facturation est temporairement indisponible. Réessayez dans un instant.",
+      "not_enabled": "Les abonnements d’espace de travail ne sont pas activés pour ce déploiement. Contactez votre administrateur.",
       "permission_changed": "Votre rôle dans l'espace de travail n'autorise plus cette action. Actualisez la page pour voir vos droits actuels.",
       "checkout_response": "Le paiement n'a pas pu s'ouvrir car la réponse du serveur était illisible. Réessayez sans changer l'intervalle sélectionné.",
       "already_subscribed": "Cet espace de travail a déjà un abonnement. Le forfait actuel a été actualisé.",

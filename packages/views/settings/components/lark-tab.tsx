@@ -125,7 +125,7 @@ export function LarkTab() {
         // Device-flow install path is not wired (HTTP client is the stub
         // or RegistrationService didn't initialize). We deliberately do
         // NOT direct users to the agent-detail "Bind" button because the
-        // backend would 503 anyway. Existing installations still render
+        // backend would reject it anyway. Existing installations still render
         // via the branch below; this only hides the empty-state CTA
         // when there is nothing to manage.
         <Card>
