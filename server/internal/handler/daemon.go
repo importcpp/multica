@@ -2778,7 +2778,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		if commentErr != nil {
 			slog.Error("task claim: comment input load failed; preserving task for redelivery",
 				"task_id", uuidToString(task.ID), "error", commentErr)
-			return resp, nil, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+			return resp, nil, issueSnapshot, agentSkillCount, builtinSkillCount, &claimBuildFailure{
 				outcome: "error_comment_load",
 				status:  http.StatusInternalServerError,
 				message: "failed to load task comment input",
