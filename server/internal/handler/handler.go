@@ -76,6 +76,13 @@ type Config struct {
 	// invitation only. The public /api/config endpoint mirrors this flag so
 	// the UI can hide every "Create workspace" affordance — see #3433.
 	DisableWorkspaceCreation bool
+	// WorkspaceCreationAllowedEmails, when non-empty, restricts
+	// POST /api/workspaces to callers whose account email matches one of
+	// the entries (case-insensitive). Empty means every signed-in user may
+	// create workspaces. DisableWorkspaceCreation takes precedence. This only
+	// decides who may create a workspace; it grants no cross-workspace
+	// visibility or admin rights (#9400).
+	WorkspaceCreationAllowedEmails []string
 	// VCSIntegrationEnabled gates the self-hosted Git provider integration
 	// (Forgejo / Gitea / GitLab) at the deployment level, independent of whether
 	// MULTICA_VCS_SECRET_KEY is set. It is the product boundary: the feature is
@@ -135,6 +142,8 @@ type Config struct {
 	//   - LLMBaseURL       -> MULTICA_LLM_BASE_URL (OpenAI or any compatible gateway)
 	//   - LLMDefaultModel  -> MULTICA_LLM_DEFAULT_MODEL (used when a request omits `model`)
 	//   - LLMMaxRetries    -> MULTICA_LLM_MAX_RETRIES (transport retry budget)
+	//   - LLMDisableThinking -> MULTICA_LLM_DISABLE_THINKING (gateway hint to
+	//     turn model reasoning off; see llm.Config.DisableThinking)
 	LLMAPIKey       string
 	LLMBaseURL      string
 	LLMDefaultModel string
@@ -144,11 +153,20 @@ type Config struct {
 	// and cmd/server additionally fails the boot on an out-of-range value before
 	// one reaches this struct. See llm.Config.MaxRetries for the full semantics.
 	LLMMaxRetries *llm.RetryOverride
+	// LLMDisableThinking is the parsed MULTICA_LLM_DISABLE_THINKING switch.
+	// cmd/server validates the raw value before the boot continues, so a
+	// non-boolean never reaches this struct.
+	LLMDisableThinking bool
 	// ServerVersion is the build version of the running API binary (the same
 	// value main.go stamps via -X main.version and reports on /metrics).
 	// Surfaced through /api/config so self-hosted operators can confirm which
 	// server build is deployed. Empty in dev builds.
 	ServerVersion string
+	// GitExtraCACerts is the PEM of the private CAs the operator added to the
+	// backend's trust store through SSL_CERT_DIR (see internal/gitca). It is
+	// handed to daemons with the workspace repos so their git can reach a
+	// repository host the backend already trusts. Empty when none are set.
+	GitExtraCACerts []byte
 }
 
 type cloudRuntimeProxy interface {
@@ -172,6 +190,12 @@ type WorkspaceSetRefreshNotifier interface {
 // (multi-node, fans out through Redis).
 type DaemonPendingWorkNotifier interface {
 	NotifyPendingWork(runtimeID, kind string)
+}
+
+// DaemonTaskSupplementNotifier sends a content-free wakeup for one exact run.
+// The daemon still pulls and authenticates the durable supplement over HTTP.
+type DaemonTaskSupplementNotifier interface {
+	NotifyTaskSupplementAvailable(runtimeID, taskID string)
 }
 
 // RuntimeGoneNotifier invalidates a runtime that was deleted while its daemon
@@ -232,7 +256,8 @@ type Handler struct {
 	// heartbeat-carried requests (MUL-5444). Optional: when nil,
 	// requestDaemonPendingWork falls back to the local DaemonHub, which is the
 	// correct delivery scope for a single-node deployment.
-	DaemonPendingWork DaemonPendingWorkNotifier
+	DaemonPendingWork    DaemonPendingWorkNotifier
+	DaemonTaskSupplement DaemonTaskSupplementNotifier
 	// ModelCatalogCache serves the last known good model list for a runtime so
 	// the picker can render without waiting for a daemon round trip
 	// (stale-while-revalidate, MUL-5444). Nil-safe: every call site treats a nil
@@ -246,6 +271,7 @@ type Handler struct {
 	PATCache                     *auth.PATCache
 	DaemonTokenCache             *auth.DaemonTokenCache
 	MembershipCache              *auth.MembershipCache
+	QoderRateLimiter             WebhookRateLimiter
 	WebhookRateLimiter           WebhookRateLimiter
 	WebhookIPRateLimiter         WebhookRateLimiter
 	WebhookAbsoluteIPRateLimiter WebhookRateLimiter
@@ -305,6 +331,8 @@ type Handler struct {
 	// where the storage backend exists; main.go starts it as an independent
 	// worker goroutine. Nil when no storage backend is configured.
 	ChannelMediaReconciler *service.ChannelMediaReconciler
+	// LarkTyping owns the durable reaction cleanup worker, started under sweepCtx.
+	LarkTyping *lark.TypingIndicatorManager
 	// SlackInstall owns the bring-your-own-app Slack install lifecycle (register
 	// pasted tokens / list / revoke) and the at-rest encryption of each app's bot
 	// + app tokens (MUL-3666). Nil unless MULTICA_SLACK_SECRET_KEY is set.
@@ -437,23 +465,27 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	}
 
 	llmClient := llm.New(llm.Config{
-		APIKey:       cfg.LLMAPIKey,
-		BaseURL:      cfg.LLMBaseURL,
-		DefaultModel: cfg.LLMDefaultModel,
-		MaxRetries:   cfg.LLMMaxRetries,
+		APIKey:          cfg.LLMAPIKey,
+		BaseURL:         cfg.LLMBaseURL,
+		DefaultModel:    cfg.LLMDefaultModel,
+		MaxRetries:      cfg.LLMMaxRetries,
+		DisableThinking: cfg.LLMDisableThinking,
 	})
 	// Report the effective retry policy so an operator can confirm from the
 	// boot log alone what a misbehaving upstream will cost, instead of inferring
 	// it from an env var whose semantics used to be unguessable (MUL-6364).
 	// Read off the client, not off cfg, so the line cannot drift from what the
 	// SDK actually enforces. Counts and an enum only — never the key or the base
-	// URL, since a self-hosted gateway URL routinely embeds a token.
+	// URL, since a self-hosted gateway URL routinely embeds a token. The
+	// disable_thinking field rides along so the effective request shape is on
+	// the same line.
 	llmRetry := llmClient.RetryBudget()
 	slog.Info("llm retry policy",
 		"max_retries", llmRetry.MaxRetries,
 		"source", llmRetry.Source,
 		"request_timeout", llmRetry.RequestTimeout,
 		"enabled", llmClient.Enabled(),
+		"disable_thinking", llmClient.DisableThinking(),
 	)
 
 	taskSvc := service.NewTaskService(queries, txStarter, hub, bus, daemonHub)
@@ -489,6 +521,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		Storage:                      store,
 		CFSigner:                     cfSigner,
 		Analytics:                    analyticsClient,
+		QoderRateLimiter:             NewMemoryWebhookRateLimiter(WebhookRateLimit{Limit: 6, Window: time.Minute}),
 		WebhookRateLimiter:           NewMemoryWebhookRateLimiter(DefaultWebhookRateLimit()),
 		WebhookIPRateLimiter:         NewMemoryWebhookIPRateLimiter(DefaultWebhookIPRateLimit()),
 		WebhookAbsoluteIPRateLimiter: NewMemoryWebhookAbsoluteIPRateLimiter(DefaultWebhookAbsoluteIPRateLimit()),
@@ -517,6 +550,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		slog.Warn("github: PR snapshot pipeline disabled (invalid App private key)", "err", err)
 	}
 	h.PRRefresh = ghsnapshot.NewManager(ghClient, queries, txStarter, h.broadcastPRSnapshotApplied)
+	taskSvc.PRSnapshotsEnabled = h.PRRefresh.Enabled()
 
 	return h
 }

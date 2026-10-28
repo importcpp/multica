@@ -1,7 +1,7 @@
 // Package agent provides a unified interface for executing prompts via
 // coding agents (Claude Code, CodeBuddy, Codex, Copilot, OpenCode, DevEco Code,
 // OpenClaw, Hermes, Pi, Oh-My-Pi, Cursor, Kimi, Reasonix, Kiro, Antigravity, Qoder,
-// Trae, Grok, Qwen Code, QwenPaw, MiniMax Code). It
+// Trae, Grok, Qwen Code, QwenPaw, MiniMax Code, Meta Muse Code). It
 // mirrors the happy-cli AgentBackend pattern, translated to idiomatic Go.
 package agent
 
@@ -24,8 +24,11 @@ type Backend interface {
 
 // ExecOptions configures a single execution.
 type ExecOptions struct {
-	Cwd   string
-	Model string
+	// EnableTaskSupplement installs provider hooks only for runs whose daemon/server
+	// capability handshake enabled additional messages.
+	EnableTaskSupplement bool
+	Cwd                  string
+	Model                string
 	// SystemPrompt carries the Multica runtime brief for the few providers
 	// that cannot pick it up from disk. The daemon leaves it empty for every
 	// other provider (see daemon.providerNeedsInlineSystemPrompt), because the
@@ -56,7 +59,7 @@ type ExecOptions struct {
 	// tool continues to use the separate tool watchdog budget.
 	IdleWatchdogTimeout time.Duration
 	// HandshakeTimeout bounds startup RPCs for providers with a long-lived
-	// protocol transport. It is currently consumed by Codex app-server;
+	// protocol transport, including Codex app-server and Claude SDK hooks;
 	// zero uses the provider default rather than disabling the bound.
 	HandshakeTimeout time.Duration
 	// TurnInterruptTimeout bounds how long the Codex backend waits for the
@@ -126,10 +129,24 @@ type ExecOptions struct {
 	// ignore this field, mirroring ThinkingLevel's renderer-side fall-through
 	// pattern. See issue #3260.
 	OpenclawMode string
+	// OpenclawModelOverride is the claim-time snapshot of the agent's persistent
+	// underlying-model override. The setting applies to all newly claimed runs
+	// until changed or cleared. OpenClaw receives it as `--model <id>` alongside
+	// `--agent <id>`, preserving the identity, workspace, sessions, and memory
+	// selected by Model. Other backends ignore this field.
+	OpenclawModelOverride string
 	// ClaudeSettingsPath is a daemon-owned, task-local settings file passed
 	// through Claude Code's --settings flag. It currently carries restrictive
 	// runtime-skill overrides only; other providers ignore it.
 	ClaudeSettingsPath string
+	// CursorHookCommand is the argv of the multica hook relay (the daemon's own
+	// binary followed by CursorHookHelperArg). The cursor backend needs it, with
+	// EnableTaskSupplement, to accept additional messages; other providers
+	// ignore it.
+	CursorHookCommand []string
+	// piMcpExtensionPath is set by piBackend.Execute after it writes the
+	// temporary MCP extension. The daemon does not fill it.
+	piMcpExtensionPath string
 }
 
 // runContext derives the execution context for an agent subprocess from the
@@ -147,11 +164,28 @@ func runContext(ctx context.Context, timeout time.Duration) (context.Context, co
 
 // Session represents a running agent execution.
 type Session struct {
+	// CleanupRequired means Result is also the acknowledgement that the
+	// backend's bounded process cleanup finished. A missing acknowledgement
+	// must prevent automatic continuation, even after upstream cancellation.
+	CleanupRequired bool
+	// Supplement delivers an additional human instruction to the currently
+	// active provider turn. Nil means the backend cannot safely do so.
+	// Adapters bound their own transport calls; a hook-based adapter may wait
+	// for the next provider boundary until ctx or the execution is cancelled.
+	Supplement func(context.Context, string) error
+	// SupplementReady reports whether Supplement currently targets a live,
+	// provider-confirmed turn. The daemon must not claim durable input before
+	// this becomes true: claiming during provider initialization would convert
+	// a transient startup window into a user-visible delivery failure. Nil is
+	// fail-closed and means no run-scoped input may be claimed.
+	SupplementReady func() bool
 	// ToolActivity optionally reports backend-owned tool accounting and its last
 	// transition time, independent of the best-effort transcript. Nil uses the
 	// daemon's message-based accounting. The timestamp gives completed tools a
 	// fresh idle budget even when their transcript message has not drained yet.
-	ToolActivity func() (int32, time.Time)
+	// The timestamp is an awakeclock reading (see package awakeclock), the same
+	// clock the idle watchdog measures, so host sleep never counts as silence.
+	ToolActivity func() (int32, time.Duration)
 	// InterruptBackgroundTools stops owned background tools at the daemon's
 	// tool watchdog boundary without cancelling the agent. True means at least
 	// one tool completed/was stopped and released from accounting; the watchdog
@@ -293,7 +327,7 @@ type Result struct {
 
 // Config configures a Backend instance.
 type Config struct {
-	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, codearts, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, dim, zeroclaw)
+	ExecutablePath string            // path to CLI binary (claude, codebuddy, codex, copilot, opencode, codearts, openclaw, hermes, pi, cursor, kimi, reasonix, dsh, kiro-cli, agy, qodercli, qoderclicn, traecli, grok, qwen, qwenpaw, mcode, muse, dim, zeroclaw)
 	CLIVersion     string            // detected version paired with ExecutablePath; vendor-specific usage semantics also require BuiltinRuntime
 	Env            map[string]string // extra environment variables
 	Logger         *slog.Logger
@@ -328,7 +362,7 @@ type Config struct {
 }
 
 // New creates a Backend for the given agent type.
-// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "codearts", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode".
+// Supported types: "claude", "codebuddy", "codex", "copilot", "opencode", "codearts", "deveco", "openclaw", "hermes", "pi", "cursor", "kimi", "reasonix", "dsh", "kiro", "antigravity", "qoder", "qoderclicn", "traecli", "grok", "qwen", "qwenpaw", "mcode", "muse".
 //
 // SupportedTypes is the canonical whitelist of agent types eligible to back a
 // custom runtime profile. It MUST stay in lockstep with the
@@ -371,7 +405,9 @@ var SupportedTypes = []string{
 	"qwen",
 	"qwenpaw",
 	"mcode",
+	"muse",
 	"dim",
+	"devin",
 	"zeroclaw",
 }
 
@@ -476,6 +512,10 @@ func New(agentType string, cfg Config) (Backend, error) {
 		return &qwenpawBackend{cfg: cfg}, nil
 	case "mcode":
 		return &mcodeBackend{cfg: cfg}, nil
+	case "devin":
+		return &devinBackend{cfg: cfg}, nil
+	case "muse":
+		return &museBackend{cfg: cfg}, nil
 	case "zeroclaw":
 		return &zeroclawBackend{cfg: cfg}, nil
 	default:
@@ -523,7 +563,9 @@ var launchHeaders = map[string]string{
 	"qwen":        "qwen -p (stream-json)",
 	"qwenpaw":     "qwenpaw acp",
 	"dim":         "dim acp",
+	"devin":       "devin acp",
 	"mcode":       "mcode acp",
+	"muse":        "muse serve (msp)",
 	"zeroclaw":    "zeroclaw acp",
 }
 

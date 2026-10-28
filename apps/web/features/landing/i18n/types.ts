@@ -9,6 +9,9 @@ export const locales: Locale[] = ["en", "zh-Hans", "ko", "ja"];
 export const localeLabels: Record<Locale, string> = {
   en: "EN",
   "zh-Hans": "\u4e2d\u6587",
+  // The landing dictionary has no Traditional Chinese variant yet, so
+  // `locales` above does not offer it and it reads the Simplified copy.
+  "zh-Hant": "\u7e41\u9ad4\u4e2d\u6587",
   ko: "\ud55c\uad6d\uc5b4",
   ja: "\u65e5\u672c\u8a9e",
   // The landing dictionary has no French variant yet, so `locales` above still
@@ -21,11 +24,11 @@ export function toLandingDictionaryLocale(
 ): LandingDictionaryLocale {
   if (locale === "ko") return "ko";
   if (locale === "ja") return "ja";
-  return locale === "zh-Hans" ? "zh" : "en";
+  return isZhLocale(locale) ? "zh" : "en";
 }
 
 export function isZhLocale(locale: Locale): boolean {
-  return locale === "zh-Hans";
+  return locale === "zh-Hans" || locale === "zh-Hant";
 }
 
 type FeatureSection = {
@@ -33,6 +36,14 @@ type FeatureSection = {
   title: string;
   description: string;
   cards: { title: string; description: string }[];
+};
+
+// Long-form page copy. Paragraphs and bullets may embed `[label](href)`
+// links, rendered by InlineLinks.
+export type DocumentSection = {
+  heading: string;
+  paragraphs?: string[];
+  bullets?: string[];
 };
 
 type FooterGroup = {
@@ -85,6 +96,7 @@ export type LandingDict = {
     headlineLine2: string;
     description: string;
     cta: string;
+    licensingCta: string;
     highlights: { title: string; description: string }[];
   };
   faq: {
@@ -117,6 +129,31 @@ export type LandingDict = {
     };
     paragraphs: string[];
     cta: string;
+    team: {
+      title: string;
+      paragraphs: string[];
+      contacts: { label: string; linkLabel: string; href: string }[];
+    };
+  };
+  licensing: {
+    title: string;
+    intro: string[];
+    rule: { title: string; text: string };
+    scenarios: {
+      title: string;
+      scenarioColumn: string;
+      licenseColumn: string;
+      required: string;
+      notRequired: string;
+      items: { scenario: string; example?: string; required: boolean }[];
+    };
+    sections: DocumentSection[];
+  };
+  privacy: {
+    title: string;
+    lastUpdated: string;
+    intro: string[];
+    sections: DocumentSection[];
   };
   changelog: {
     title: string;
@@ -183,6 +220,9 @@ export type LandingDict = {
       title: string;
       sub: string;
       installLabel: string;
+      platformGroup: string;
+      platformMacosLinux: string;
+      platformWindows: string;
       startLabel: string;
       sshNote: string;
       copyLabel: string;

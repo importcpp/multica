@@ -111,6 +111,7 @@ services:
       ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
       ALLOWED_EMAIL_DOMAINS: ${ALLOWED_EMAIL_DOMAINS:-}
       DISABLE_WORKSPACE_CREATION: ${DISABLE_WORKSPACE_CREATION:-}
+      WORKSPACE_CREATION_ALLOWED_EMAILS: ${WORKSPACE_CREATION_ALLOWED_EMAILS:-}
       DO_NOT_TRACK: ${DO_NOT_TRACK:-}
       # Managed Cloud stays off for self-hosting. All managed Cloud clients use
       # this single URL when it is configured.
@@ -156,10 +157,13 @@ services:
       # and callers fall back silently rather than failing. MULTICA_LLM_MAX_RETRIES
       # is the retry budget: unset = 2, 0 = disabled, 1-5 = an exact ceiling.
       # Anything else fails the boot instead of being silently corrected.
+      # MULTICA_LLM_DISABLE_THINKING asks gateways that honor the field to
+      # turn model reasoning off; see .env.example for the contract.
       MULTICA_LLM_API_KEY: ${MULTICA_LLM_API_KEY:-}
       MULTICA_LLM_BASE_URL: ${MULTICA_LLM_BASE_URL:-}
       MULTICA_LLM_DEFAULT_MODEL: ${MULTICA_LLM_DEFAULT_MODEL:-}
       MULTICA_LLM_MAX_RETRIES: ${MULTICA_LLM_MAX_RETRIES:-}
+      MULTICA_LLM_DISABLE_THINKING: ${MULTICA_LLM_DISABLE_THINKING:-}
       # Lark / Feishu bot integration. MULTICA_LARK_SECRET_KEY is the
       # opt-in: unset = integration disabled. Mainland 飞书 and international
       # Lark are auto-detected per installation and served side by side, so
@@ -227,6 +231,7 @@ services:
       DOCS_URL: ${DOCS_URL:-}
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-}
       NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-}
+      GOOGLE_ANALYTICS_ID: ${GOOGLE_ANALYTICS_ID:-}
     restart: unless-stopped
 
 volumes:

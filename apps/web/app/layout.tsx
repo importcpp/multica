@@ -13,6 +13,8 @@ import {
   resolveBrowserApiBaseUrl,
   resolveBrowserWsUrl,
 } from "@/config/runtime-urls";
+import { resolveGoogleAnalyticsId } from "@/config/google-analytics";
+import { GoogleAnalytics } from "@/components/google-analytics";
 import "./globals.css";
 
 // Inter is the Latin UI face. next/font produces a hashed family (`__Inter_xxx`)
@@ -79,7 +81,7 @@ export const metadata: Metadata = {
     template: TITLE_TEMPLATE,
   },
   description:
-    "Open-source platform that turns coding agents into real teammates. Assign tasks, track progress, compound skills.",
+    "Source-available platform that turns coding agents into real teammates. Assign tasks, track progress, compound skills.",
   icons: {
     icon: [{ url: "/favicon.svg", type: "image/svg+xml" }],
     shortcut: ["/favicon.svg"],
@@ -128,6 +130,8 @@ export default async function RootLayout({
   const resources = { [locale]: RESOURCES[locale] };
   const apiBaseUrl = resolveBrowserApiBaseUrl(process.env);
   const wsUrl = resolveBrowserWsUrl(process.env);
+  // Opt-in Google Analytics: omitted entirely unless GOOGLE_ANALYTICS_ID is set.
+  const googleAnalyticsId = resolveGoogleAnalyticsId(process.env);
 
   return (
     <html
@@ -165,6 +169,7 @@ export default async function RootLayout({
           </WebProviders>
           <Toaster />
         </ThemeProvider>
+        {googleAnalyticsId && <GoogleAnalytics measurementId={googleAnalyticsId} />}
       </body>
     </html>
   );

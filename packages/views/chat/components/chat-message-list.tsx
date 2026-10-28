@@ -33,8 +33,7 @@ import { RichContent } from "../../rich-content";
 import { RichContentScrollRootProvider } from "../../rich-content/scroll-root";
 import { copyText } from "@multica/ui/lib/clipboard";
 import { AttachmentList } from "../../issues/components/comment-card";
-import { ImageSequenceProvider } from "../../editor";
-import { collectImageSequence } from "@multica/core/attachments/image-sequence";
+import { PreviewSequenceProvider, collectPreviewSequence } from "../../editor";
 import type { AgentAvailability } from "@multica/core/agents";
 import { resolveFailureReasonKey } from "@multica/core/agents";
 import type {
@@ -45,6 +44,7 @@ import type {
 } from "@multica/core/types";
 import type { ChatTimelineItem } from "@multica/core/chat";
 import { buildTimeline } from "../../common/task-transcript";
+import { traceToolArgSummary } from "../../common/task-transcript/trace-event-presenter";
 import { OnboardingStarterCards } from "./onboarding-starter-cards";
 import { TaskStatusPill } from "./task-status-pill";
 import { CHAT_COLUMN, CHAT_GUTTER } from "./chat-column";
@@ -62,6 +62,8 @@ import { useT } from "../../i18n";
 // ─── Public component ────────────────────────────────────────────────────
 
 interface ChatMessageListProps {
+  /** Pause bottom-stick effects while a closing floating window fades out. */
+  active?: boolean;
   messages: ChatMessage[];
   /**
    * Server-authoritative pending-task snapshot. `null` / undefined means
@@ -176,6 +178,7 @@ const LIST_COMPONENTS: Components<ChatRenderItem, ChatListContext> = {
 };
 
 export function ChatMessageList({
+  active = true,
   messages,
   pendingTask,
   availability,
@@ -205,6 +208,7 @@ export function ChatMessageList({
   const { isFollowing, onContentHeightChanged, hasReachedLiveEnd } = useStickToBottom(
     scrollContainerEl,
     pinToLiveEnd,
+    active,
   );
   // Soft edge fade hinting more content above/below. Kept small so it barely
   // grazes full-bleed previews (image / HTML) at the edges.
@@ -288,17 +292,17 @@ export function ChatMessageList({
     availability,
   };
 
-  // Every image in this session, in message order, so opening one lets the
-  // reader page through the rest (MUL-5752). Built from the message data, not
-  // from what Virtuoso currently has mounted.
+  // Every previewable file in this session, in message order, so opening one
+  // lets the reader page through the rest (MUL-5752). Built from the message
+  // data, not from what Virtuoso currently has mounted.
   //
   // Persisted messages only: a task transcript's own attachments live behind a
-  // separate query and its blocks are collapsed by default, so an image in
-  // there keeps its standalone preview instead of entering a sequence the
-  // reader can't see the rest of.
-  const imageSequence = useMemo(
+  // separate query and its blocks are collapsed by default, so a file in there
+  // keeps its standalone preview instead of entering a sequence the reader
+  // can't see the rest of.
+  const previewSequence = useMemo(
     () =>
-      collectImageSequence(
+      collectPreviewSequence(
         messages.map((message) => ({
           content: message.content,
           attachments: message.attachments,
@@ -308,7 +312,7 @@ export function ChatMessageList({
   );
 
   return (
-    <ImageSequenceProvider items={imageSequence}>
+    <PreviewSequenceProvider items={previewSequence}>
     <div
       ref={setScrollContainerRef}
       data-tab-scroll-root
@@ -394,7 +398,7 @@ export function ChatMessageList({
       </RichContentScrollRootProvider>
       )}
     </div>
-    </ImageSequenceProvider>
+    </PreviewSequenceProvider>
   );
 }
 
@@ -996,6 +1000,7 @@ function FailureBubble({
     codex_semantic_inactivity: t(($) => $.message_list.failure.codex_semantic_inactivity),
     runtime_offline: t(($) => $.message_list.failure.runtime_offline),
     runtime_access_denied: t(($) => $.message_list.failure.runtime_access_denied),
+    runtime_access_revoked: t(($) => $.message_list.failure.runtime_access_revoked),
     runtime_recovery: t(($) => $.message_list.failure.runtime_recovery),
     manual: t(($) => $.message_list.failure.manual),
     cancelled: t(($) => $.message_list.failure.manual),
@@ -1244,38 +1249,15 @@ function ItemRow({ item }: { item: ChatTimelineItem }) {
   }
 }
 
-function shortenPath(p: string): string {
-  const parts = p.split("/");
-  if (parts.length <= 3) return p;
-  return ".../" + parts.slice(-2).join("/");
-}
-
-function getToolSummary(item: ChatTimelineItem): string {
-  if (!item.input) return "";
-  const inp = item.input as Record<string, string>;
-  if (inp.query) return inp.query;
-  if (inp.file_path) return shortenPath(inp.file_path);
-  if (inp.path) return shortenPath(inp.path);
-  if (inp.pattern) return inp.pattern;
-  if (inp.description) return String(inp.description);
-  if (inp.command) {
-    const cmd = String(inp.command);
-    return cmd.length > 100 ? cmd.slice(0, 100) + "..." : cmd;
-  }
-  if (inp.prompt) {
-    const p = String(inp.prompt);
-    return p.length > 100 ? p.slice(0, 100) + "..." : p;
-  }
-  if (inp.skill) return String(inp.skill);
-  for (const v of Object.values(inp)) {
-    if (typeof v === "string" && v.length > 0 && v.length < 120) return v;
-  }
-  return "";
-}
-
 function ToolCallRow({ item }: { item: ChatTimelineItem }) {
+  const { t } = useT("agents");
   const [open, setOpen] = useState(false);
-  const summary = getToolSummary(item);
+  // Tool input is arbitrary JSON: an MCP tool can pass `query` or `path` as an
+  // object (#8835), so the summary must come from the type-checked presenter.
+  const summary = traceToolArgSummary(item.input, {
+    morePaths: (path, extraCount) =>
+      t(($) => $.transcript.patch_summary_more, { path, extra: extraCount }),
+  });
   const hasInput = item.input && Object.keys(item.input).length > 0;
 
   return (

@@ -219,7 +219,53 @@ describe("ApiClient pull-request response schema", () => {
 
     await expect(
       new ApiClient("https://api.example.test").listIssuePullRequests("issue-1"),
-    ).resolves.toEqual({ pull_requests: [] });
+    ).resolves.toEqual({ pull_requests: [], auto_complete: null });
+  });
+
+  function stubPullRequests(body: unknown) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+  }
+
+  it("parses the auto-complete decision and link source", async () => {
+    stubPullRequests({
+      pull_requests: [{ ...validPR, link_source: "title" }],
+      auto_complete: { state: "waiting", pull_request_ids: ["pr-1"], issue_disabled: false, workspace_enabled: true, target_status: "in_review" },
+    });
+    const result = await new ApiClient("https://api.example.test").listIssuePullRequests("issue-1");
+    expect(result.pull_requests[0]?.link_source).toBe("title");
+    expect(result.auto_complete).toEqual({
+      state: "waiting",
+      pull_request_ids: ["pr-1"],
+      issue_disabled: false,
+      workspace_enabled: true,
+      target_status: "in_review",
+    });
+  });
+
+  it("treats a missing auto-complete block (older backend) as null", async () => {
+    stubPullRequests({ pull_requests: [validPR] });
+    const result = await new ApiClient("https://api.example.test").listIssuePullRequests("issue-1");
+    expect(result.auto_complete).toBeNull();
+    expect(result.pull_requests).toHaveLength(1);
+  });
+
+  it("keeps the PR list when only the auto-complete block or link source is malformed", async () => {
+    stubPullRequests({
+      pull_requests: [{ ...validPR, link_source: "psychic" }],
+      auto_complete: { state: 42 },
+    });
+    const result = await new ApiClient("https://api.example.test").listIssuePullRequests("issue-1");
+    expect(result.auto_complete).toBeNull();
+    expect(result.pull_requests).toHaveLength(1);
+    expect(result.pull_requests[0]?.link_source).toBeUndefined();
   });
 });
 
@@ -1102,13 +1148,41 @@ describe("ApiClient", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = new ApiClient("https://api.example.test");
-    const tasks = await client.listAgentTasks("agent-1");
+    const { tasks, nextCursor } = await client.listAgentTasksPage("agent-1");
 
     expect(tasks.map((task) => task.id)).toEqual(["task-1", "task-2"]);
+    expect(nextCursor).toBeNull();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      "https://api.example.test/api/agents/agent-1/tasks",
+      "https://api.example.test/api/agents/agent-1/tasks?limit=200",
     );
+  });
+
+  it("reads a lossless task cursor and passes it to the next bounded request", async () => {
+    const cursor = "2026-09-24T01:02:03.123456Z|00000000-0000-0000-0000-000000000001";
+    const fetchMock = vi.fn().mockImplementation(() => Promise.resolve(new Response(
+      JSON.stringify([{ id: "task-1", status: "completed" }]),
+      { headers: { "X-Agent-Tasks-Next-Cursor": cursor } },
+    )));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ApiClient("https://api.example.test");
+    const page = await client.listAgentTasksPage("agent-1", { limit: 7 });
+    expect(page.nextCursor).toBe(cursor);
+    const controller = new AbortController();
+    await client.listAgentTasksPage("agent-1", { limit: 7, before: page.nextCursor!, signal: controller.signal });
+    const request = new URL(fetchMock.mock.calls[1]![0]);
+    expect(request.searchParams.get("limit")).toBe("7");
+    expect(request.searchParams.get("before")).toBe(cursor);
+    expect(fetchMock.mock.calls[1]![1].signal).toBe(controller.signal);
+  });
+
+  it("drops the continuation when the task page is malformed", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ tasks: "not-an-array" }),
+      { headers: { "X-Agent-Tasks-Next-Cursor": "cursor" } },
+    )));
+    const client = new ApiClient("https://api.example.test");
+    await expect(client.listAgentTasksPage("agent-1")).resolves.toEqual({ tasks: [], nextCursor: null });
   });
 
   it("falls back to an empty agent task history for a malformed response", async () => {
@@ -1121,7 +1195,7 @@ describe("ApiClient", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const client = new ApiClient("https://api.example.test");
-    await expect(client.listAgentTasks("agent-1")).resolves.toEqual([]);
+    await expect(client.listAgentTasksPage("agent-1")).resolves.toEqual({ tasks: [], nextCursor: null });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -1515,6 +1589,36 @@ describe("ApiClient", () => {
   });
 
   describe("getAttachment", () => {
+    it("uses the attachment-owned workspace endpoint for Markdown downloads", async () => {
+      const fetchMock = vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            id: "att-1",
+            workspace_id: "ws-b",
+            uploader_type: "member",
+            uploader_id: "u-1",
+            filename: "report.md",
+            url: "https://static.example.test/report.md",
+            download_url: "/api/attachments/att-1/signed-download?sig=abc",
+            attachment_download_url: "/api/attachments/att-1/signed-download?sig=def&dl=1",
+            content_type: "text/markdown",
+            size_bytes: 123,
+            created_at: "2026-05-11T00:00:00Z",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const client = new ApiClient("https://api.example.test");
+
+      const att = await client.getAttachmentForDownload("att-1");
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "https://api.example.test/api/attachments/att-1/download-metadata",
+      );
+      expect(att.attachment_download_url).toContain("dl=1");
+    });
+
     it("returns the parsed attachment for a well-formed response", async () => {
       vi.stubGlobal(
         "fetch",
@@ -2503,6 +2607,19 @@ describe("ApiClient workspace MCP servers", () => {
 
     expect(result).toHaveLength(1);
     expect(result[0]?.transport).toBe("websocket");
+  });
+
+  it("keeps the agent count and degrades a malformed one to unknown", async () => {
+    stubJSON([
+      { ...server, id: "srv-1", agent_count: 3 },
+      { ...server, id: "srv-2", agent_count: "many" },
+      { ...server, id: "srv-3" },
+    ]);
+
+    const result = await new ApiClient("https://api.example.test")
+      .listWorkspaceMcpServers("ws-1");
+
+    expect(result.map((item) => item.agent_count)).toEqual([3, undefined, undefined]);
   });
 
   it("POSTs a name and entry when creating a library server", async () => {

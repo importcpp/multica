@@ -159,6 +159,14 @@ export interface IssueSourceContext {
   snapshot: SourceContextSnapshot;
 }
 
+/** The original a duplicate points at: enough to link it and show its status. */
+export interface IssueDuplicateOf {
+  id: string;
+  identifier: string;
+  title: string;
+  status: IssueStatus;
+}
+
 export interface Issue {
   id: string;
   workspace_id: string;
@@ -188,11 +196,17 @@ export interface Issue {
   creator_type: IssueAssigneeType;
   creator_id: string;
   parent_issue_id: string | null;
+  /**
+   * The original this issue duplicates (MUL-7349): present only while the
+   * issue is cancelled and the original still exists, resolved by the server.
+   * Absent when connected to an older backend.
+   */
+  duplicate_of?: IssueDuplicateOf | null;
   project_id: string | null;
   position: number;
   // Ordered barrier group among sibling sub-issues (null = unstaged). The
-  // parent assignee is notified/woken only when every sub-issue in a stage
-  // finishes; see server/internal/handler/issue_child_done.go.
+  // parent assignee is woken when a stage closes while a later one waits;
+  // see server/internal/service/issue_wakeup_system.go.
   stage: number | null;
   // Calendar days as date-only "YYYY-MM-DD" (no time, no timezone). Use the
   // helpers in @multica/core/issues/date to format/compare — never `new Date()`

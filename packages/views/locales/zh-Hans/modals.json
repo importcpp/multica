@@ -19,6 +19,16 @@
     "toast_deleted": "已删除任务",
     "toast_delete_failed": "删除任务失败"
   },
+  "rename_issue": {
+    "title": "重命名任务",
+    "placeholder": "任务标题",
+    "input_aria_label": "重命名 {{identifier}}",
+    "submit": "保存",
+    "saving": "保存中...",
+    "title_required": "请输入标题",
+    "toast_renamed": "任务名称已更新",
+    "toast_failed": "重命名任务失败"
+  },
   "feedback": {
     "title": "反馈",
     "placeholder": "聊聊你的体验、遇到的 bug，或想看到的功能...",
@@ -35,7 +45,9 @@
     "search_placeholder": "搜索任务...",
     "searching": "搜索中...",
     "no_results": "未找到任务。",
-    "prompt_to_search": "输入关键词搜索任务"
+    "prompt_to_search": "输入关键词搜索任务",
+    "suggested_similar": "标题相似",
+    "suggested_recent": "最近查看"
   },
   "set_parent": {
     "title": "设置父任务",
@@ -184,6 +196,7 @@
     "toast_link_subissues_partial": "{{total}} 个子任务中有 {{failed}} 个关联失败",
     "toast_link_labels_failed": "关联标签失败",
     "toast_set_properties_failed": "有 {{count}} 个自定义属性设置失败",
+    "unavailable_property_removed": "一个已不可用的自定义属性已从草稿移除，请确认后重新提交。",
     "switch_to_agent": "切换到智能体",
     "switch_to_agent_tooltip": "切换到通过智能体创建——一句话描述，让它替你建",
     "switch_to_manual": "切换到手动",
@@ -243,5 +256,13 @@
       "error_unknown": "提交失败，请重试。",
       "sub_issue_of": "作为 {{identifier}} 的子任务"
     }
+  },
+  "mark_duplicate": {
+    "title": "标记为重复",
+    "description": "搜索原始任务。当前任务会被取消，并关联到它。",
+    "toast_success": "已标记为 {{identifier}} 的重复",
+    "toast_failed": "无法标记为重复",
+    "error_target_is_duplicate": "{{identifier}} 本身是重复任务，请选择它的原始任务",
+    "error_has_duplicates": "已有任务被标记为此任务的重复，请先解除这些标记"
   }
 }

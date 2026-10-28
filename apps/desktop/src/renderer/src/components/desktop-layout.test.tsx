@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { I18nProvider } from "@multica/core/i18n/react";
@@ -84,9 +84,21 @@ vi.mock("./window-overlay", () => ({ WindowOverlay: () => null }));
 // a `PageHeader` reads before deciding to render its own fallback trigger.
 vi.mock("./tab-content", () => ({
   TabContent: () => {
-    const { hasExternalTrigger } = useSidebar();
+    const { hasExternalTrigger, isCompact, setOpen, state } = useSidebar();
     return (
-      <div data-testid="page-content" data-external-trigger={hasExternalTrigger} />
+      <div
+        data-compact={isCompact}
+        data-external-trigger={hasExternalTrigger}
+        data-sidebar-state={state}
+        data-testid="page-content"
+      >
+        <button type="button" onClick={() => setOpen(false)}>
+          Collapse sidebar
+        </button>
+        <button type="button" onClick={() => setOpen(true)}>
+          Expand sidebar
+        </button>
+      </div>
     );
   },
 }));
@@ -115,6 +127,14 @@ function renderShell() {
   );
 }
 
+beforeEach(() => {
+  Object.defineProperty(window, "innerWidth", {
+    configurable: true,
+    value: 1280,
+  });
+  localStorage.clear();
+});
+
 describe("DesktopShell sidebar trigger", () => {
   // The window toolbar parks a trigger beside the traffic lights that never
   // scrolls away, so nothing inside the canvas may add a second one. Desktop
@@ -123,7 +143,7 @@ describe("DesktopShell sidebar trigger", () => {
   // this one — and a third when a list/detail surface brought its own header
   // along (MUL-6218).
   it("keeps exactly one trigger and tells page headers not to add another", () => {
-    const { container, getByTestId } = renderShell();
+    const { container, getByTestId, queryByRole } = renderShell();
 
     expect(container.querySelectorAll("[data-slot='sidebar-trigger']")).toHaveLength(1);
     expect(getByTestId("page-content")).toHaveAttribute(
@@ -135,12 +155,44 @@ describe("DesktopShell sidebar trigger", () => {
     expect(mainTopBar).toHaveClass("transition-[padding-left]");
     expect(mainTopBar).toHaveStyle({
       paddingLeft:
-        "max(0px, calc(256px - var(--sidebar-live-width, var(--sidebar-width))))",
+        "max(0px, calc(200px - var(--sidebar-live-width, var(--sidebar-width))))",
     });
 
     fireEvent.click(
       container.querySelector('[data-slot="sidebar-trigger"]')!,
     );
-    expect(mainTopBar).toHaveStyle({ paddingLeft: "256px" });
+    expect(mainTopBar).toHaveStyle({ paddingLeft: "200px" });
+    expect(queryByRole("status", { name: /loading workspace/i })).toBeNull();
+  });
+
+  it("keeps full clearance for compact layouts in either sidebar state", () => {
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 700,
+    });
+
+    const { container, getByRole, getByTestId } = renderShell();
+    const mainTopBar = container.querySelector('[data-slot="main-top-bar"]');
+
+    expect(getByTestId("page-content")).toHaveAttribute("data-compact", "true");
+    expect(getByTestId("page-content")).toHaveAttribute(
+      "data-sidebar-state",
+      "expanded",
+    );
+    expect(mainTopBar).toHaveStyle({ paddingLeft: "200px" });
+
+    fireEvent.click(getByRole("button", { name: "Collapse sidebar" }));
+    expect(getByTestId("page-content")).toHaveAttribute(
+      "data-sidebar-state",
+      "collapsed",
+    );
+    expect(mainTopBar).toHaveStyle({ paddingLeft: "200px" });
+
+    fireEvent.click(getByRole("button", { name: "Expand sidebar" }));
+    expect(getByTestId("page-content")).toHaveAttribute(
+      "data-sidebar-state",
+      "expanded",
+    );
+    expect(mainTopBar).toHaveStyle({ paddingLeft: "200px" });
   });
 });

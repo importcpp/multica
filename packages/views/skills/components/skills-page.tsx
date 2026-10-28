@@ -77,6 +77,7 @@ import {
   type SkillActionsContext,
 } from "./skill-list-actions";
 import { useT, useTimeAgo } from "../../i18n";
+import { docsLocalePrefix } from "../../common/docs-locale";
 
 // Column template — single source of truth for header, rows, and skeletons.
 // Tracks: [edge 0.75rem] [checkbox 1rem] [name, only fr track]
@@ -155,10 +156,8 @@ function columnTrackVars(
 export type SortField = SkillSortField;
 export { rowMatchesFilters, type SkillRow } from "./skill-list-filter";
 
-// ---------------------------------------------------------------------------
 // Page header bar — uses shared PageHeader so the mobile sidebar trigger and
 // h-12 chrome stay consistent with every other dashboard list page.
-// ---------------------------------------------------------------------------
 
 function PageHeaderBar({
   totalCount,
@@ -167,15 +166,14 @@ function PageHeaderBar({
   totalCount: number;
   onCreate: () => void;
 }) {
-  const { t } = useT("skills");
+  const { t, i18n } = useT("skills");
   return (
     <CollectionPageHeader
       icon={SkillIcon}
       title={t(($) => $.page.title)}
       count={totalCount}
-      description={t(($) => $.page.tagline)}
       learnMore={{
-        href: "https://multica.ai/docs/skills",
+        href: `https://multica.ai/docs${docsLocalePrefix(i18n.language)}/skills`,
         label: t(($) => $.page.learn_more),
       }}
       actions={
@@ -189,9 +187,7 @@ function PageHeaderBar({
   );
 }
 
-// ---------------------------------------------------------------------------
 // Cells
-// ---------------------------------------------------------------------------
 
 // Hover-revealed multi-select checkbox. Same pattern as SkillPickerList:
 // the shadcn Checkbox is presentational only (`pointer-events-none`, so the
@@ -396,9 +392,7 @@ function CreatorCell({ creator }: { creator: MemberWithUser | null }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Empty state
-// ---------------------------------------------------------------------------
 
 function EmptyState({ onCreate }: { onCreate: () => void }) {
   const { t } = useT("skills");
@@ -417,9 +411,7 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
   );
 }
 
-// ---------------------------------------------------------------------------
 // List
-// ---------------------------------------------------------------------------
 
 function SkillListHeader({
   sortField,
@@ -572,9 +564,7 @@ function LoadingSkeleton() {
   );
 }
 
-// ---------------------------------------------------------------------------
 // Page
-// ---------------------------------------------------------------------------
 
 export default function SkillsPage() {
   const { t } = useT("skills");

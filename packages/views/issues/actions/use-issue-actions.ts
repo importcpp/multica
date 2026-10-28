@@ -30,9 +30,11 @@ export interface UseIssueActionsResult {
   copyLink: () => Promise<void>;
   copyCommentLink: (commentId: string) => Promise<void>;
   openCreateSubIssue: () => void;
+  openRename: () => void;
   openSetParent: () => void;
   removeParent: () => void;
   openAddChild: () => void;
+  openMarkDuplicate: () => void;
   openDeleteConfirm: (opts?: { onDeletedFallbackPath?: string }) => void;
 }
 
@@ -68,6 +70,7 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
 
   const issueId = issue?.id ?? null;
   const issueIdentifier = issue?.identifier ?? null;
+  const issueTitle = issue?.title ?? "";
   const issueProjectId = issue?.project_id ?? null;
   const issueAssigneeType = issue?.assignee_type ?? null;
   const issueAssigneeId = issue?.assignee_id ?? null;
@@ -220,6 +223,24 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
     openModal("issue-set-parent", { issueId });
   }, [openModal, issueId]);
 
+  // Rename entry point for every surface that renders the actions menu. The
+  // issue detail page can also activate its inline title editor by clicking the
+  // title, but list, board, gantt and sub-issue rows have no such affordance —
+  // one shared modal keeps the write path identical everywhere.
+  const openRename = useCallback(() => {
+    if (!issueId) return;
+    openModal("issue-rename", {
+      issueId,
+      identifier: issueIdentifier,
+      title: issueTitle,
+    });
+  }, [openModal, issueId, issueIdentifier, issueTitle]);
+
+  const openMarkDuplicate = useCallback(() => {
+    if (!issueId) return;
+    openModal("issue-mark-duplicate", { issueId });
+  }, [openModal, issueId]);
+
   // Detach from the parent and promote to a standalone issue. Reversible
   // (Set parent re-links it), non-destructive, and mirrors the clear-date
   // actions — so it applies directly instead of a confirm modal. `stage`
@@ -289,9 +310,11 @@ export function useIssueActions(issue: Issue | null): UseIssueActionsResult {
     copyLink,
     copyCommentLink,
     openCreateSubIssue,
+    openRename,
     openSetParent,
     removeParent,
     openAddChild,
+    openMarkDuplicate,
     openDeleteConfirm,
   };
 }

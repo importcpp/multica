@@ -41,7 +41,9 @@ import { larkInstallationsOptions, larkKeys } from "@multica/core/lark";
 import { api, ApiError } from "@multica/core/api";
 import type { LarkInstallation, LarkInstallStatusResponse } from "@multica/core/types";
 import { ActorAvatar } from "../../common/actor-avatar";
+import { docsLocalePrefix } from "../../common/docs-locale";
 import { useLocale, useT } from "../../i18n";
+import { TooltipHint } from "@multica/ui/components/common/tooltip-hint";
 
 // MUL-3083: the Lark (international, open.larksuite.com) "connect a Bot"
 // entry is temporarily hidden while its install → inbound pipeline is
@@ -393,40 +395,46 @@ export function LarkAgentBindButton({
         className={cn("flex flex-wrap items-center gap-2", className)}
         data-testid="lark-agent-bind-buttons"
       >
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => setDialogRegion("feishu")}
-          disabled={!agentId}
-          title={
+        <TooltipHint
+          label={
             agentName
               ? t(($) => $.lark.bind_button_feishu_title, { agent: agentName })
               : undefined
           }
-          data-testid="lark-agent-bind-feishu"
         >
-          <ExternalLink className="h-3 w-3" />
-          {t(($) => $.lark.bind_button_feishu)}
-        </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setDialogRegion("feishu")}
+            disabled={!agentId}
+            data-testid="lark-agent-bind-feishu"
+          >
+            <ExternalLink className="h-3 w-3" />
+            {t(($) => $.lark.bind_button_feishu)}
+          </Button>
+        </TooltipHint>
         {/* MUL-3083: Lark (international) bind entry is temporarily hidden —
             see LARK_INTL_CONNECT_ENABLED. Mainland Feishu (above) is
             unaffected. */}
         {LARK_INTL_CONNECT_ENABLED && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setDialogRegion("lark")}
-            disabled={!agentId}
-            title={
+          <TooltipHint
+            label={
               agentName
                 ? t(($) => $.lark.bind_button_lark_title, { agent: agentName })
                 : undefined
             }
-            data-testid="lark-agent-bind-lark"
           >
-            <ExternalLink className="h-3 w-3" />
-            {t(($) => $.lark.bind_button_lark)}
-          </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setDialogRegion("lark")}
+              disabled={!agentId}
+              data-testid="lark-agent-bind-lark"
+            >
+              <ExternalLink className="h-3 w-3" />
+              {t(($) => $.lark.bind_button_lark)}
+            </Button>
+          </TooltipHint>
         )}
       </div>
       {dialogRegion && (
@@ -507,6 +515,12 @@ function larkDevConsoleHost(region?: string): string {
     : "https://open.feishu.cn";
 }
 
+// larkDocsUrl points at the Lark/Feishu integration guide, localized the
+// same way as the Telegram and Slack docs links.
+function larkDocsUrl(lang: string | undefined): string {
+  return `https://multica.ai/docs${docsLocalePrefix(lang)}/lark-bot-integration`;
+}
+
 function LarkAgentBotConnectedBadge({
   installation,
   className,
@@ -514,7 +528,7 @@ function LarkAgentBotConnectedBadge({
   installation: LarkInstallation;
   className?: string;
 }) {
-  const { t } = useT("settings");
+  const { t, i18n } = useT("settings");
   const wsId = useWorkspaceId();
   const qc = useQueryClient();
   const manageHref = `${larkDevConsoleHost(installation.region)}/app/${encodeURIComponent(installation.app_id)}`;
@@ -567,20 +581,21 @@ function LarkAgentBotConnectedBadge({
           </span>
           <span className="truncate">{t(($) => $.lark.agent_bot_connected_label)}</span>
         </span>
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={() => setConfirmOpen(true)}
-          disabled={disconnecting}
-          title={t(($) => $.lark.agent_bot_disconnect_tooltip)}
-          aria-label={t(($) => $.lark.disconnect)}
-          data-testid="lark-agent-bot-disconnect"
-        >
-          <Trash2 className="h-3 w-3" />
-          {disconnecting
-            ? t(($) => $.lark.disconnecting)
-            : t(($) => $.lark.disconnect)}
-        </Button>
+        <TooltipHint label={t(($) => $.lark.agent_bot_disconnect_tooltip)}>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setConfirmOpen(true)}
+            disabled={disconnecting}
+            aria-label={t(($) => $.lark.disconnect)}
+            data-testid="lark-agent-bot-disconnect"
+          >
+            <Trash2 className="h-3 w-3" />
+            {disconnecting
+              ? t(($) => $.lark.disconnecting)
+              : t(($) => $.lark.disconnect)}
+          </Button>
+        </TooltipHint>
       </div>
 
       {/* Row 2: secondary "Manage in Lark" link to the Bot's dev-console
@@ -603,6 +618,23 @@ function LarkAgentBotConnectedBadge({
           ? t(($) => $.lark.agent_bot_manage_link_lark)
           : t(($) => $.lark.agent_bot_manage_link_feishu)}
       </a>
+
+      {/* Row 3: the check a silent Bot almost always needs (#8496). An app
+          whose events go to a request URL instead of the long connection
+          binds fine and shows exactly this badge while receiving nothing,
+          and this row is where someone looks when the Bot stays quiet —
+          the install dialog closes itself a beat after success. */}
+      <p className="text-caption text-muted-foreground">
+        {t(($) => $.lark.agent_bot_silent_hint)}{" "}
+        <a
+          href={larkDocsUrl(i18n.language)}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="underline underline-offset-2 transition-colors hover:text-foreground"
+        >
+          {t(($) => $.lark.agent_bot_silent_hint_link)}
+        </a>
+      </p>
 
       <AlertDialog
         open={confirmOpen}

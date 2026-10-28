@@ -19,6 +19,16 @@
     "toast_deleted": "Issue deleted",
     "toast_delete_failed": "Failed to delete issue"
   },
+  "rename_issue": {
+    "title": "Rename issue",
+    "placeholder": "Issue title",
+    "input_aria_label": "Rename {{identifier}}",
+    "submit": "Save",
+    "saving": "Saving...",
+    "title_required": "Enter a title",
+    "toast_renamed": "Issue renamed",
+    "toast_failed": "Failed to rename issue"
+  },
   "feedback": {
     "title": "Feedback",
     "placeholder": "Tell us about your experience, bugs you've found, or features you'd like to see…",
@@ -35,7 +45,9 @@
     "search_placeholder": "Search issues...",
     "searching": "Searching...",
     "no_results": "No issues found.",
-    "prompt_to_search": "Type to search issues"
+    "prompt_to_search": "Type to search issues",
+    "suggested_similar": "Similar titles",
+    "suggested_recent": "Recently viewed"
   },
   "set_parent": {
     "title": "Set parent issue",
@@ -186,6 +198,7 @@
     "toast_link_subissues_partial": "Failed to link {{failed}} of {{total}} sub-issues",
     "toast_link_labels_failed": "Failed to attach labels",
     "toast_set_properties_failed": "Could not set {{count}} custom property values",
+    "unavailable_property_removed": "An unavailable custom property was removed from the draft. Review it before submitting again.",
     "switch_to_agent": "Switch to Agent",
     "switch_to_agent_tooltip": "Switch to create with agent — describe in one line and let the agent file it",
     "switch_to_manual": "Switch to Manual",
@@ -245,5 +258,13 @@
       "error_unknown": "Failed to submit. Try again.",
       "sub_issue_of": "Sub-issue of {{identifier}}"
     }
+  },
+  "mark_duplicate": {
+    "title": "Mark as duplicate",
+    "description": "Search for the original issue. This issue will be cancelled and linked to it.",
+    "toast_success": "Marked as a duplicate of {{identifier}}",
+    "toast_failed": "Failed to mark as duplicate",
+    "error_target_is_duplicate": "{{identifier}} is itself a duplicate. Pick its original instead.",
+    "error_has_duplicates": "Other issues are marked as duplicates of this one. Remove those marks first."
   }
 }
